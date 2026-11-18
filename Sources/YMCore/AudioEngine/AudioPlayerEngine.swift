@@ -28,7 +28,7 @@ public final class AudioPlayerEngine {
     public var activeWaveContext: YMWaveContext = .myWaveDefault
     public var activeWaveVibe: YMWaveVibePreset = .defaultWave
     public private(set) var isShuffleEnabled: Bool = false
-    private var unshuffledQueue: [YMTrack] = []
+    @ObservationIgnored private var unshuffledQueue: [YMTrack] = []
     public var onStartCustomWaveRequested: (@Sendable (YMWaveContext, YMWaveVibePreset?) -> Void)?
 
     /// Hardware audio track format details (sample rate, channel layout) from AVPlayerItem
@@ -74,44 +74,46 @@ public final class AudioPlayerEngine {
 
     // MARK: - Internal Player Resources & Crossfade Engine
 
-    private var player = AVPlayer()
-    private var outgoingPlayer: AVPlayer?
-    private var crossfadeTimer: Timer?
-    private var isCrossfading: Bool = false
-    private var currentFadeGain: Float = 1.0
-    private var outgoingFadeGain: Float = 0.0
-    private var crossfadeElapsedSeconds: Double = 0.0
-    private var crossfadeTotalDuration: Double = 0.0
+    @ObservationIgnored private var player = AVPlayer()
+    @ObservationIgnored private var outgoingPlayer: AVPlayer?
+    @ObservationIgnored private var crossfadeTimer: Timer?
+    @ObservationIgnored private var isCrossfading: Bool = false
+    @ObservationIgnored private var currentFadeGain: Float = 1.0
+    @ObservationIgnored private var outgoingFadeGain: Float = 0.0
+    @ObservationIgnored private var crossfadeElapsedSeconds: Double = 0.0
+    @ObservationIgnored private var crossfadeTotalDuration: Double = 0.0
 
-    private var timeObserverToken: Any?
-    private var itemEndObserver: (any NSObjectProtocol)?
-    private var itemFailedObserver: (any NSObjectProtocol)?
-    private var itemStatusObserver: NSKeyValueObservation?
-    private var sleepObserver: (any NSObjectProtocol)?
-    private var wakeObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var timeObserverToken: Any?
+    @ObservationIgnored private var itemEndObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var itemFailedObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var itemStatusObserver: NSKeyValueObservation?
+    @ObservationIgnored private var sleepObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var appObservers: [any NSObjectProtocol] = []
 
-    private var wasPlayingBeforeSleep: Bool = false
-    private var hasPrefetchedNextTrack: Bool = false
-    private var prefetchTask: Task<Void, Never>?
-    private var loadTask: Task<Void, Never>?
-    private var nextPreloadedStream: (trackId: String, stream: YMNetworkClient.YMResolvedAudioStream)?
-    private var currentStreamRetryCount = 0
-    private let maxStreamRetries = 2
+    @ObservationIgnored private var wasPlayingBeforeSleep: Bool = false
+    @ObservationIgnored private var hasPrefetchedNextTrack: Bool = false
+    @ObservationIgnored private var prefetchTask: Task<Void, Never>?
+    @ObservationIgnored private var loadTask: Task<Void, Never>?
+    @ObservationIgnored private var nextPreloadedStream: (trackId: String, stream: YMNetworkClient.YMResolvedAudioStream)?
+    @ObservationIgnored private var currentStreamRetryCount = 0
+    @ObservationIgnored private let maxStreamRetries = 2
 
     // Track played seconds for Rotor telemetry
-    private var trackStartTimestamp: Date = Date()
-    private var accumulatedPlayedSeconds: Double = 0
-    private var lastObservedPlaybackTime: Double = 0
-    private var suppressNextSkipTelemetry: Bool = false
-    private var pendingWaveAdvance: Bool = false
+    @ObservationIgnored private var trackStartTimestamp: Date = Date()
+    @ObservationIgnored private var accumulatedPlayedSeconds: Double = 0
+    @ObservationIgnored private var lastObservedPlaybackTime: Double = 0
+    @ObservationIgnored private var lastPublishedProgressTime: Double = 0
+    @ObservationIgnored private var suppressNextSkipTelemetry: Bool = false
+    @ObservationIgnored private var pendingWaveAdvance: Bool = false
 
     // Paginated non-wave queue continuation (Favorites, Search, etc.)
     public typealias QueueContinuationProvider = @MainActor (_ existingTrackIds: Set<String>) async -> [YMTrack]
-    private var queueContinuationProvider: QueueContinuationProvider? = nil
-    private var queueContinuationTask: Task<Void, Never>? = nil
-    private var isFetchingQueueContinuation: Bool = false
-    private var pendingContinuationAdvance: Bool = false
-    private var queueGeneration: UInt64 = 0
+    @ObservationIgnored private var queueContinuationProvider: QueueContinuationProvider? = nil
+    @ObservationIgnored private var queueContinuationTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var isFetchingQueueContinuation: Bool = false
+    @ObservationIgnored private var pendingContinuationAdvance: Bool = false
+    @ObservationIgnored private var queueGeneration: UInt64 = 0
 
     private var currentCollectionIdentifier: String {
         if isWaveMode {
@@ -684,11 +686,13 @@ public final class AudioPlayerEngine {
 
         player.replaceCurrentItem(with: item)
 
-        Task { [weak self, weak item] in
-            guard let self = self, let item = item else { return }
-            if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
-                guard self.player.currentItem === item else { return }
-                item.audioMix = mix
+        if EqualizerSettings.shared.isEnabled {
+            Task { [weak self, weak item] in
+                guard let self = self, let item = item else { return }
+                if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
+                    guard self.player.currentItem === item else { return }
+                    item.audioMix = mix
+                }
             }
         }
 
@@ -842,10 +846,18 @@ public final class AudioPlayerEngine {
 
     // MARK: - Periodic Time & Preload Observer
 
+    private var isHostWindowVisible: Bool {
+        guard !NSApp.isHidden else { return false }
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && !$0.isMiniaturized }) else {
+            return false
+        }
+        return !window.isMiniaturized && window.occlusionState.contains(.visible)
+    }
+
     private func setupTimeObserver() {
-        let interval = CMTime(seconds: 0.15, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self = self, self.isPlaying else { return }
 
                 let currentTime = CMTimeGetSeconds(time)
@@ -854,8 +866,16 @@ public final class AudioPlayerEngine {
                 let duration = self.player.currentItem?.duration.seconds ?? 0
                 let validDuration = (!duration.isNaN && !duration.isInfinite && duration > 0) ? duration : (Double(self.currentTrack?.durationMs ?? 0) / 1000.0)
 
-                self.progressTracker.update(currentTime: currentTime, duration: validDuration)
                 self.lastObservedPlaybackTime = currentTime
+
+                // UI Progress Tracker: publish only when the host window is visible and active
+                if self.isHostWindowVisible {
+                    let isLyricsPresented = NavigationCoordinator.shared.isLyricsPresented
+                    if isLyricsPresented || abs(currentTime - self.lastPublishedProgressTime) >= 0.35 {
+                        self.progressTracker.update(currentTime: currentTime, duration: validDuration)
+                        self.lastPublishedProgressTime = currentTime
+                    }
+                }
 
                 let remaining = validDuration - currentTime
                 let crossfadeSec = self.qualitySettings.crossfadeDuration
@@ -1083,6 +1103,73 @@ public final class AudioPlayerEngine {
                 }
             }
         }
+
+        let center = NotificationCenter.default
+        let occlusionObs = center.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.resyncPlaybackProgressIfNeeded()
+            }
+        }
+        let deminiaturizeObs = center.addObserver(
+            forName: NSWindow.didDeminiaturizeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.resyncPlaybackProgressIfNeeded()
+            }
+        }
+        let unhideObs = center.addObserver(
+            forName: NSApplication.didUnhideNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.resyncPlaybackProgressIfNeeded()
+            }
+        }
+        let eqObs = center.addObserver(
+            forName: .ymEqualizerEnabledDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleEqualizerEnabledChange()
+            }
+        }
+        appObservers = [occlusionObs, deminiaturizeObs, unhideObs, eqObs]
+    }
+
+    private func resyncPlaybackProgressIfNeeded() {
+        guard isPlaying, isHostWindowVisible, let currentItem = player.currentItem else { return }
+        let currentTime = CMTimeGetSeconds(player.currentTime())
+        guard !currentTime.isNaN && !currentTime.isInfinite else { return }
+        let duration = currentItem.duration.seconds
+        let validDuration = (!duration.isNaN && !duration.isInfinite && duration > 0) ? duration : (Double(currentTrack?.durationMs ?? 0) / 1000.0)
+        progressTracker.update(currentTime: currentTime, duration: validDuration)
+        lastPublishedProgressTime = currentTime
+    }
+
+    private func handleEqualizerEnabledChange() {
+        guard let currentItem = player.currentItem else { return }
+        if EqualizerSettings.shared.isEnabled {
+            if currentItem.audioMix == nil {
+                let asset = currentItem.asset
+                Task { [weak self, weak currentItem] in
+                    guard let self = self, let currentItem = currentItem else { return }
+                    if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
+                        guard self.player.currentItem === currentItem else { return }
+                        currentItem.audioMix = mix
+                    }
+                }
+            }
+        } else {
+            currentItem.audioMix = nil
+        }
     }
 
     private func detachItemObservers(cancelAssetLoading: Bool = true) {
@@ -1116,5 +1203,9 @@ public final class AudioPlayerEngine {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObs)
             wakeObserver = nil
         }
+        for obs in appObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        appObservers.removeAll()
     }
 }

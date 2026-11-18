@@ -322,8 +322,7 @@ public struct MainSplitView: View {
     private var detailContent: some View {
         ZStack(alignment: .bottom) {
             // Main Navigation Content (with dynamic bottom inset for docked bottom bars)
-            GeometryReader { geo in
-                ZStack(alignment: .topLeading) {
+            ZStack(alignment: .topLeading) {
                     // Custom zero-chrome route stack avoids macOS NavigationStack's ghost titlebar safe-area inset
                     // and preserves underlying section state (e.g., search query & scroll position) on back navigation.
                     ZStack {
@@ -390,8 +389,7 @@ public struct MainSplitView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .safeAreaInset(edge: .bottom) {
+                .safeAreaInset(edge: .bottom) {
                 let isAbovePlayer = coordinator.isLyricsPresented && coordinator.lyricsPosition == .abovePlayer
                 Color.clear.frame(height: 76 + (isAbovePlayer ? 74 : 0))
             }

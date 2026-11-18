@@ -235,6 +235,27 @@ public struct ChartView: View {
 
 // MARK: - Chart Track Row
 
+private struct ChartPlayingCoverOverlay: View {
+    let isPlaying: Bool
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.black.opacity(0.6))
+                .frame(width: 40, height: 40)
+
+            YMPlayingEqualizerView(color: YMTheme.accent, barWidth: 2.5, maxHeight: 15, isPlaying: isPlaying)
+        }
+        .frame(width: 40, height: 40)
+    }
+}
+
+extension ChartPlayingCoverOverlay: @preconcurrency Equatable {
+    static func == (lhs: ChartPlayingCoverOverlay, rhs: ChartPlayingCoverOverlay) -> Bool {
+        lhs.isPlaying == rhs.isPlaying
+    }
+}
+
 private struct ChartTrackRow: View {
     let item: YMChartItem
     let track: YMTrack
@@ -350,11 +371,7 @@ private struct ChartTrackRow: View {
                         .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
                         .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
                 } else if isCurrentTrack {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.black.opacity(0.6))
-                        .frame(width: 40, height: 40)
-
-                    YMPlayingEqualizerView(color: YMTheme.accent, barWidth: 2.5, maxHeight: 15, isPlaying: isPlaying)
+                    ChartPlayingCoverOverlay(isPlaying: isPlaying)
                 }
             }
             .frame(width: 40, height: 40)
@@ -453,7 +470,7 @@ private struct ChartTrackRow: View {
         Button("Запустить Мою волну по треку") {
             AudioPlayerEngine.shared.startWave(forTrack: track)
         }
-        if let artist = track.artists.first {
+        ForEach(track.artists) { artist in
             Button("Перейти к исполнителю: \(artist.name)") {
                 onArtistSelect(artist)
             }
@@ -498,5 +515,17 @@ private struct ChartTrackRow: View {
                     .foregroundStyle(YMTheme.fg40)
             }
         }
+    }
+}
+
+extension ChartTrackRow: @preconcurrency Equatable {
+    static func == (lhs: ChartTrackRow, rhs: ChartTrackRow) -> Bool {
+        lhs.track.id == rhs.track.id &&
+        lhs.index == rhs.index &&
+        lhs.isCurrentTrack == rhs.isCurrentTrack &&
+        lhs.isPlaying == rhs.isPlaying &&
+        lhs.isSelected == rhs.isSelected &&
+        lhs.isCompactWidth == rhs.isCompactWidth &&
+        lhs.isMiniWidth == rhs.isMiniWidth
     }
 }

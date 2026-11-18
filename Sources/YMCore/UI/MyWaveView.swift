@@ -28,7 +28,6 @@ public struct MyWaveView: View {
     @UIState private var waveStartTask: Task<Void, Never>? = nil
 
     @UIState private var isFlameActive: Bool = false
-    @UIState private var wavePulse: CGFloat = 1.0
     @UIState private var isScrolled: Bool = false
 
     public init() {}
@@ -145,9 +144,6 @@ public struct MyWaveView: View {
                 waveTracks = audioEngine.queue
             }
             setupWaveChangeHooks()
-            withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) {
-                wavePulse = 1.08
-            }
         }
     }
 
@@ -336,16 +332,19 @@ public struct MyWaveView: View {
                 )
 
                 if audioEngine.isPlaying {
-                    RoundedRectangle(cornerRadius: cornerRadius)
-                        .fill(Color.black.opacity(0.50))
-                        .frame(width: size, height: size)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: cornerRadius)
+                            .fill(Color.black.opacity(0.50))
+                            .frame(width: size, height: size)
 
-                    YMPlayingEqualizerView(
-                        color: YMTheme.accent,
-                        barWidth: 3,
-                        maxHeight: eqMaxHeight,
-                        isPlaying: true
-                    )
+                        YMPlayingEqualizerView(
+                            color: YMTheme.accent,
+                            barWidth: 3,
+                            maxHeight: eqMaxHeight,
+                            isPlaying: true
+                        )
+                    }
+                    .frame(width: size, height: size)
                 }
             }
             .frame(width: size, height: size)
@@ -364,18 +363,26 @@ public struct MyWaveView: View {
                 .foregroundStyle(YMTheme.fg)
                 .lineLimit(1)
 
-            Button {
-                if let firstArtist = track.artists.first {
-                    coordinator.navigate(to: .artist(id: firstArtist.id, name: firstArtist.name))
+            if !track.artists.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(track.artists) { artist in
+                        MyWaveHeroArtistButton(artist: artist) {
+                            coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
+                        }
+
+                        if artist.id != track.artists.last?.id {
+                            Text("•")
+                                .font(.system(size: 8))
+                                .foregroundStyle(YMTheme.fg40)
+                        }
+                    }
                 }
-            } label: {
+            } else {
                 Text(track.artistsString)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(YMTheme.fg60)
                     .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            .help("Перейти к исполнителю")
 
             HStack(spacing: 5) {
                 Image(systemName: "sparkles")
@@ -578,16 +585,7 @@ public struct MyWaveView: View {
 
     @ViewBuilder
     private func idleWaveEmblem(size: CGFloat, iconSize: CGFloat) -> some View {
-        ZStack {
-            Circle()
-                .fill(YMTheme.accent.opacity(0.14))
-                .frame(width: size, height: size)
-
-            Image(systemName: "waveform.path.ecg")
-                .font(.system(size: iconSize, weight: .semibold))
-                .foregroundStyle(YMTheme.accent)
-                .scaleEffect(wavePulse)
-        }
+        YMPulsingWaveEmblem(size: size, iconSize: iconSize)
     }
 
     @ViewBuilder
@@ -1280,5 +1278,49 @@ private struct AllCatalogWavesSheet: View {
                 self.isLoading = false
             }
         }
+    }
+}
+
+// MARK: - Individual Artist Button for My Wave Hero Stage
+
+private struct MyWaveHeroArtistButton: View {
+    let artist: YMArtist
+    let onSelect: () -> Void
+
+    @UIState private var isHovered = false
+
+    var body: some View {
+        Button(action: onSelect) {
+            Text(artist.name)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isHovered ? YMTheme.fg : YMTheme.fg60)
+                .underline(isHovered)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help("Перейти к исполнителю: \(artist.name)")
+    }
+}
+
+/// Isolated emblem for idle state — static in idle for zero CPU load with responsive hover effect.
+private struct YMPulsingWaveEmblem: View {
+    let size: CGFloat
+    let iconSize: CGFloat
+    @UIState private var isHovered: Bool = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(YMTheme.accent.opacity(isHovered ? 0.22 : 0.14))
+                .frame(width: size, height: size)
+
+            Image(systemName: "waveform.path.ecg")
+                .font(.system(size: iconSize, weight: .semibold))
+                .foregroundStyle(YMTheme.accent)
+                .scaleEffect(isHovered ? 1.06 : 1.0)
+        }
+        .animation(.easeInOut(duration: 0.2), value: isHovered)
+        .onHover { isHovered = $0 }
     }
 }

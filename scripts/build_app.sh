@@ -7,7 +7,7 @@ cd "${PROJECT_ROOT}"
 
 TARGET_ARCH="${1:-universal}"
 OUTPUT_DIR="${2:-}"
-APP_VERSION="${APP_VERSION:-2.0.0}"
+APP_VERSION="${APP_VERSION:-2.0.1}"
 if [ -n "$OUTPUT_DIR" ]; then
     mkdir -p "$OUTPUT_DIR"
     APP_NAME="${OUTPUT_DIR%/}/flow~.app"

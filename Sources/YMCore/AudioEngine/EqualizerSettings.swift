@@ -88,6 +88,14 @@ public final class EqualizerParameterBridge: @unchecked Sendable {
         return enabled
     }
 
+    public func isFlatAndNeutral() -> Bool {
+        os_unfair_lock_lock(&lock)
+        let isZeroPreamp = abs(self.preampDb) < 0.001
+        let isZeroBands = self.bandGains.allSatisfy { abs($0) < 0.001 }
+        os_unfair_lock_unlock(&lock)
+        return isZeroPreamp && isZeroBands
+    }
+
     public func readSnapshot() -> Snapshot {
         os_unfair_lock_lock(&lock)
         let snap = Snapshot(
@@ -121,6 +129,7 @@ public final class EqualizerSettings {
         didSet {
             UserDefaults.standard.set(isEnabled, forKey: enabledKey)
             syncBridge()
+            NotificationCenter.default.post(name: .ymEqualizerEnabledDidChange, object: nil)
         }
     }
 
@@ -211,4 +220,8 @@ public final class EqualizerSettings {
             bandGains: bandGains
         )
     }
+}
+
+extension Notification.Name {
+    public static let ymEqualizerEnabledDidChange = Notification.Name("ymEqualizerEnabledDidChange")
 }

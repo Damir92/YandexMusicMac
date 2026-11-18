@@ -17,7 +17,7 @@ public struct YMWindowDragHandle: NSViewRepresentable {
 }
 
 public final class YMWindowDragNSView: NSView {
-    public override var mouseDownCanMoveWindow: Bool { true }
+    public override var mouseDownCanMoveWindow: Bool { false }
 
     public override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
@@ -59,9 +59,7 @@ public struct YMScrollTopSentinel: View {
             Color.clear
                 .onChange(of: nextScrolled) { _, newValue in
                     if isScrolled != newValue {
-                        withAnimation(.easeOut(duration: 0.22)) {
-                            isScrolled = newValue
-                        }
+                        isScrolled = newValue
                     }
                 }
                 .onAppear {
@@ -95,12 +93,10 @@ public struct YMStickyTopBar: View {
 
     public var body: some View {
         ZStack(alignment: .top) {
-            // Subtle top-edge drag strip when scrolled to top (does not block buttons lower down)
-            if !isVisible {
-                YMWindowDragHandle()
-                    .frame(maxWidth: .infinity)
-                    .frame(height: windowState.needsTopChromeClearance ? 44 : 24)
-            }
+            // Stable drag handle that stays in place without being destroyed/recreated on scroll
+            YMWindowDragHandle()
+                .frame(maxWidth: .infinity)
+                .frame(height: isVisible ? 42 : (windowState.needsTopChromeClearance ? 44 : 24))
 
             // Compact frosted glass sticky bar when scrolled past hero
             HStack(spacing: 8) {
@@ -132,10 +128,15 @@ public struct YMStickyTopBar: View {
             .frame(maxWidth: .infinity)
             .background {
                 ZStack(alignment: .bottom) {
-                    VisualEffectBlur(material: .headerView, blendingMode: .withinWindow)
-                    YMTheme.bg.opacity(YMTheme.isLight ? 0.78 : 0.74)
-                    YMWindowDragHandle()
+                    VisualEffectBlur(
+                        material: .headerView,
+                        blendingMode: .withinWindow,
+                        state: isVisible ? .followsWindowActiveState : .inactive
+                    )
+                        .opacity(isVisible ? 1 : 0)
+                    YMTheme.bg.opacity(isVisible ? (YMTheme.isLight ? 0.78 : 0.74) : 0)
                     YMTheme.border.frame(height: 1)
+                        .opacity(isVisible ? 1 : 0)
                 }
                 .ignoresSafeArea(.container, edges: .top)
             }
@@ -209,18 +210,17 @@ public struct YMStickyDetailTopBar: View {
         .frame(maxWidth: .infinity)
         .background {
             ZStack(alignment: .bottom) {
-                if isScrolled {
-                    VisualEffectBlur(material: .headerView, blendingMode: .withinWindow)
-                        .transition(.opacity)
-                    YMTheme.bg.opacity(YMTheme.isLight ? 0.78 : 0.74)
-                        .transition(.opacity)
-                }
+                VisualEffectBlur(
+                    material: .headerView,
+                    blendingMode: .withinWindow,
+                    state: isScrolled ? .followsWindowActiveState : .inactive
+                )
+                    .opacity(isScrolled ? 1 : 0)
+                YMTheme.bg.opacity(isScrolled ? (YMTheme.isLight ? 0.78 : 0.74) : 0)
                 YMWindowDragHandle()
-                if isScrolled {
-                    YMTheme.border
-                        .frame(height: 1)
-                        .transition(.opacity)
-                }
+                YMTheme.border
+                    .frame(height: 1)
+                    .opacity(isScrolled ? 1 : 0)
             }
             .ignoresSafeArea(.container, edges: .top)
             .animation(.easeOut(duration: 0.20), value: isScrolled)

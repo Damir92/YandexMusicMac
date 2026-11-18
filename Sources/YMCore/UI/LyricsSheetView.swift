@@ -2,34 +2,7 @@ import SwiftUI
 import AppKit
 import CoreImage
 
-// MARK: - Off-Main-Thread Pre-Blur Processor (Zero Live GPU Blur During Scroll)
-
-private final class SendableCIContextBox: @unchecked Sendable {
-    let context = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .cacheIntermediates: false
-    ])
-}
-
-private enum BackdropBlurProcessor {
-    private static let ciBox = SendableCIContextBox()
-
-    /// Applies `CIGaussianBlur` once to a small 100x100 cover CGImage (~40 KB, <1 ms)
-    /// so SwiftUI draws a static pre-blurred image with zero per-frame GPU blur cost.
-    static func makeBlurredCGImage(from cgImage: CGImage, radius: Double = 14.0) -> CGImage? {
-        let input = CIImage(cgImage: cgImage)
-        let extent = input.extent
-        guard !extent.isEmpty else { return nil }
-
-        let clamped = input.clampedToExtent()
-        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
-        filter.setValue(clamped, forKey: kCIInputImageKey)
-        filter.setValue(radius, forKey: kCIInputRadiusKey)
-
-        guard let output = filter.outputImage?.cropped(to: extent) else { return nil }
-        return ciBox.context.createCGImage(output, from: extent)
-    }
-}
+// MARK: - Fullscreen Synced Lyrics View (Apple Music Style)
 
 /// Fullscreen "Now Playing" synchronized lyrics experience inspired by Apple Music.
 /// Features an opaque pre-blurred atmospheric cover backdrop, adaptive two-column layout,
@@ -364,17 +337,28 @@ public struct LyricsSheetView: View {
                             .foregroundStyle(YMTheme.fg)
                             .lineLimit(1)
 
-                        if let firstArtist = track.artists.first {
-                            Button {
-                                navigateAndDismiss(to: .artist(id: firstArtist.id, name: firstArtist.name))
-                            } label: {
-                                Text(track.artistsString)
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(YMTheme.fg60)
-                                    .lineLimit(1)
+                        if !track.artists.isEmpty {
+                            HStack(spacing: 4) {
+                                ForEach(track.artists) { artist in
+                                    Button {
+                                        navigateAndDismiss(to: .artist(id: artist.id, name: artist.name))
+                                    } label: {
+                                        Text(artist.name)
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(YMTheme.fg60)
+                                            .lineLimit(1)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Перейти к исполнителю: \(artist.name)")
+
+                                    if artist.id != track.artists.last?.id {
+                                        Text("•")
+                                            .font(.system(size: 8))
+                                            .foregroundStyle(YMTheme.fg40)
+                                    }
+                                }
                             }
-                            .buttonStyle(.plain)
-                        } else {
+                        } else if !track.artistsString.isEmpty {
                             Text(track.artistsString)
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(YMTheme.fg60)
@@ -532,29 +516,11 @@ public struct LyricsSheetView: View {
         }
 
         let requestedUri = coverUri
-        guard let smallImage = await ImagePipeline.shared.image(for: requestedUri, size: .small),
-              let cgImage = smallImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return
-        }
+        let blurred = await YMBackdropBlurProcessor.shared.blurredImage(for: requestedUri, radius: 14.0)
         guard !Task.isCancelled, currentTrack?.effectiveCoverUri == requestedUri else { return }
 
-        // Pre-blur the 100x100 bitmap once off the main thread (~40 KB, <1 ms)
-        let blurredCG: CGImage? = await Task.detached(priority: .userInitiated) {
-            BackdropBlurProcessor.makeBlurredCGImage(from: cgImage, radius: 14.0)
-        }.value
-
-        guard !Task.isCancelled, currentTrack?.effectiveCoverUri == requestedUri else { return }
-
-        if let blurredCG {
-            blurredBackdropImage = NSImage(
-                cgImage: blurredCG,
-                size: NSSize(width: blurredCG.width, height: blurredCG.height)
-            )
-            blurredBackdropUri = requestedUri
-        } else {
-            blurredBackdropImage = smallImage
-            blurredBackdropUri = requestedUri
-        }
+        blurredBackdropImage = blurred
+        blurredBackdropUri = requestedUri
     }
 
     private func loadLyricsAsync() async {

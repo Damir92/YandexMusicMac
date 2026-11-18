@@ -209,8 +209,9 @@ private let eqTapProcess: MTAudioProcessingTapProcessCallback = { (
     let storage = MTAudioProcessingTapGetStorage(tap)
     let context = Unmanaged<EqualizerTapContext>.fromOpaque(storage).takeUnretainedValue()
 
-    // Если эквалайзер выключен или AudioUnit не инициализирован — прозрачный bypass без лишней нагрузки
+    // Если эквалайзер выключен, все полосы нейтральны или AudioUnit не инициализирован — прозрачный bypass без вызова AudioUnitRender
     guard EqualizerParameterBridge.shared.currentIsEnabled(),
+          !EqualizerParameterBridge.shared.isFlatAndNeutral(),
           let au = context.audioUnit else {
         MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, nil, numberFramesOut)
         context.sampleCursor += Float64(numberFrames)

@@ -112,19 +112,22 @@ public struct PlayerBarView: View {
                         .foregroundStyle(YMTheme.fg)
                         .lineLimit(1)
 
-                    if let firstArtist = track.artists.first {
-                        Button {
-                            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
-                                coordinator.navigate(to: .artist(id: firstArtist.id, name: firstArtist.name))
+                    if !track.artists.isEmpty {
+                        HStack(spacing: 4) {
+                            ForEach(track.artists) { artist in
+                                PlayerBarArtistButton(artist: artist) {
+                                    withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                        coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
+                                    }
+                                }
+
+                                if artist.id != track.artists.last?.id {
+                                    Text("•")
+                                        .font(.system(size: 8))
+                                        .foregroundStyle(YMTheme.fg40)
+                                }
                             }
-                        } label: {
-                            Text(track.artistsString)
-                                .font(.system(size: 11))
-                                .foregroundStyle(YMTheme.fg60)
-                                .lineLimit(1)
                         }
-                        .buttonStyle(.plain)
-                        .help("Перейти к исполнителю")
                     } else {
                         Text(track.artistsString)
                             .font(.system(size: 11))
@@ -531,6 +534,30 @@ private struct AudioQualityMenu: View {
 
 // MARK: - Isolated Progress Slider
 
+/// Low-frequency integer second time label to eliminate sub-second Text layout invalidations.
+private struct FormattedTimeLabel: View {
+    let totalSeconds: Int
+    let alignment: Alignment
+    let foregroundStyle: Color
+
+    var body: some View {
+        let mins = max(0, totalSeconds) / 60
+        let secs = max(0, totalSeconds) % 60
+        Text(String(format: "%d:%02d", mins, secs))
+            .font(.system(size: 11, weight: .medium).monospacedDigit())
+            .foregroundStyle(foregroundStyle)
+            .frame(width: 36, alignment: alignment)
+    }
+}
+
+extension FormattedTimeLabel: @preconcurrency Equatable {
+    static func == (lhs: FormattedTimeLabel, rhs: FormattedTimeLabel) -> Bool {
+        lhs.totalSeconds == rhs.totalSeconds &&
+        lhs.alignment == rhs.alignment &&
+        lhs.foregroundStyle == rhs.foregroundStyle
+    }
+}
+
 /// Isolated Slider component bound only to `PlaybackProgressTracker`.
 /// High-frequency ticks (up to 4-10 times/sec) do not re-render the parent PlayerBar or Navigation split view.
 private struct IsolatedProgressSlider: View {
@@ -539,10 +566,11 @@ private struct IsolatedProgressSlider: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(progressTracker.currentTimeFormatted)
-                .font(.system(size: 11, weight: .medium).monospacedDigit())
-                .foregroundStyle(YMTheme.fg60)
-                .frame(width: 36, alignment: .trailing)
+            FormattedTimeLabel(
+                totalSeconds: Int(progressTracker.currentTime),
+                alignment: .trailing,
+                foregroundStyle: YMTheme.fg60
+            )
 
             YMSlider(
                 value: Binding(
@@ -561,10 +589,11 @@ private struct IsolatedProgressSlider: View {
                 }
             )
 
-            Text(progressTracker.durationFormatted)
-                .font(.system(size: 11, weight: .medium).monospacedDigit())
-                .foregroundStyle(YMTheme.fg40)
-                .frame(width: 36, alignment: .leading)
+            FormattedTimeLabel(
+                totalSeconds: Int(progressTracker.duration),
+                alignment: .leading,
+                foregroundStyle: YMTheme.fg40
+            )
         }
     }
 }
@@ -608,5 +637,27 @@ private struct PlayerHoverIconButton: View {
         .disabled(isDisabled)
         .onHover { isHovered = $0 }
         .help(helpText)
+    }
+}
+
+// MARK: - Individual Artist Button for Player Bar
+
+private struct PlayerBarArtistButton: View {
+    let artist: YMArtist
+    let onSelect: () -> Void
+
+    @UIState private var isHovered = false
+
+    var body: some View {
+        Button(action: onSelect) {
+            Text(artist.name)
+                .font(.system(size: 11))
+                .foregroundStyle(isHovered ? YMTheme.fg : YMTheme.fg60)
+                .underline(isHovered)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help("Перейти к исполнителю: \(artist.name)")
     }
 }

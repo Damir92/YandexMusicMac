@@ -186,10 +186,11 @@ public enum YMTheme {
     public static let cornerRadiusSmall: CGFloat = 6
 }
 
-// MARK: - Ambient Blurred Cover Glow (RAM-safe .small 100x100)
+// MARK: - Ambient Blurred Cover Glow (Pre-Blurred 120 FPS, RAM-safe .small 100x100)
 
 /// Subtle atmospheric cover-art glow backed strictly by `YMCoverSize.small` (100x100)
-/// to preserve the strict 40–65 MB RAM budget while blending smoothly into `YMTheme.bg`.
+/// and pre-blurred once off the main thread via `YMBackdropBlurProcessor` to preserve
+/// the strict 40–65 MB RAM budget and guarantee 120 FPS scrolling with ZERO live GPU blur shaders.
 public struct YMAmbientCoverGlowModifier: ViewModifier {
     let coverUri: String?
     let opacity: Double
@@ -204,42 +205,36 @@ public struct YMAmbientCoverGlowModifier: ViewModifier {
     public func body(content: Content) -> some View {
         content
             .background {
-                ZStack {
-                    if let image = glowImage {
-                        GeometryReader { geo in
-                            Image(nsImage: image)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: geo.size.width, height: geo.size.height)
-                                .scaleEffect(1.3)
-                                .blur(radius: 56)
-                                .opacity(YMTheme.isLight ? opacity * 0.78 : opacity)
-                                .mask(
-                                    LinearGradient(
-                                        stops: [
-                                            .init(color: .black, location: 0.0),
-                                            .init(color: .black.opacity(0.65), location: 0.50),
-                                            .init(color: .clear, location: 1.0)
-                                        ],
-                                        startPoint: .top,
-                                        endPoint: .bottom
-                                    )
-                                )
-                                .clipped()
-                        }
+                if let image = glowImage {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .scaleEffect(1.28)
+                        .opacity(YMTheme.isLight ? opacity * 0.78 : opacity)
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0.0),
+                                    .init(color: .black.opacity(0.65), location: 0.50),
+                                    .init(color: .clear, location: 1.0)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .clipped()
+                        .allowsHitTesting(false)
                         .animation(.easeInOut(duration: 0.35), value: coverUri)
-                    }
                 }
-                .allowsHitTesting(false)
             }
             .task(id: coverUri ?? "") {
                 guard let uri = coverUri, !uri.isEmpty else {
                     glowImage = nil
                     return
                 }
-                let fetched = await ImagePipeline.shared.image(for: uri, size: .small)
+                let blurred = await YMBackdropBlurProcessor.shared.blurredImage(for: uri, radius: 16.0)
                 guard !Task.isCancelled else { return }
-                glowImage = fetched
+                glowImage = blurred
             }
     }
 }

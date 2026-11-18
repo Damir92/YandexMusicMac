@@ -67,7 +67,6 @@ public struct YMSlider: View {
                         .transition(.scale.combined(with: .opacity))
                 }
             }
-            .animation(.interactiveSpring(response: 0.15, dampingFraction: 0.85), value: normalizedProgress)
             .frame(maxHeight: .infinity, alignment: .center)
             .contentShape(Rectangle())
             .gesture(
