@@ -8,19 +8,29 @@
 
 > **ПРОШУ УЧЕСТЬ:** я не являюсь каким-либо разработчиком (тем более на swift) и данное приложение было написано с помощью ИИ (так что оно попадает под определение AI-slop'а). Делал в своё свободное время для себя и тех, кого не устраивает потребление ресурсов официальной приложухи Яндекса. Сам я не разбираюсь в технических нюансах, я лишь давал установки и обкатывал в daily-use. Это вторая версия с обновлённым дизайном и кучей новых фишек и баг-фиксов разного рода.
 
-**Тёмная тема:**
+**Графитовая тема:**
 
-<img width="1051" height="700" alt="Screenshot 2026-11-07 at 14 10 24" src="https://github.com/user-attachments/assets/0b55729a-8b2c-4036-b64b-212c8d1bb89a" />
+<img width="881" height="584" alt="Screenshot 2026-11-18 at 17 59 42" src="https://github.com/user-attachments/assets/27f3be31-8c1b-4f88-8d5c-02577c700b72" />
 
+
+**Полуночная тема:**
+
+<img width="882" height="586" alt="Screenshot 2026-11-18 at 17 59 57" src="https://github.com/user-attachments/assets/4047c810-1522-48cc-bbfa-9b65fc828114" />
 
 **Светлая тема:**
 
-<img width="1053" height="705" alt="Screenshot 2026-11-07 at 14 10 57" src="https://github.com/user-attachments/assets/2357650b-2f5c-4672-830d-4786ad8e28ba" />
+<img width="1038" height="692" alt="Screenshot 2026-11-18 at 18 03 52" src="https://github.com/user-attachments/assets/75a6254f-88a2-41df-b28d-2837ba702b0b" />
 
-**Пример использования приложения (для демонстрации интерфейса и работы приложения использовал демо-режим, который будет выделен отдельно в Releases:**
+**Тёпло-песочная тема:**
 
-https://github.com/user-attachments/assets/eb01bd98-991d-4975-85bc-22f2cba229ac
+<img width="1045" height="695" alt="Screenshot 2026-11-18 at 18 04 07" src="https://github.com/user-attachments/assets/8b62b021-d33a-46c7-a318-8ad101ff9a55" />
 
+
+**Пример использования приложения 
+(для демонстрации интерфейса и работы приложения использовал демо-режим):**
+
+* YT - youtu.be/ZT5YoA6_Bh8
+* Rutube - rutube.ru/video/private/23f5147750fb1b2ef85442b82ccd6f92/?p=MVH2f_1figfwCZUdZo-eiA
 
 ---
 
