@@ -4,11 +4,15 @@ import CoreImage
 
 // MARK: - Off-Main-Thread Pre-Blur Processor (Zero Live GPU Blur During Scroll)
 
-private enum BackdropBlurProcessor {
-    private static let ciContext = CIContext(options: [
+private final class SendableCIContextBox: @unchecked Sendable {
+    let context = CIContext(options: [
         .useSoftwareRenderer: false,
         .cacheIntermediates: false
     ])
+}
+
+private enum BackdropBlurProcessor {
+    private static let ciBox = SendableCIContextBox()
 
     /// Applies `CIGaussianBlur` once to a small 100x100 cover CGImage (~40 KB, <1 ms)
     /// so SwiftUI draws a static pre-blurred image with zero per-frame GPU blur cost.
@@ -23,7 +27,7 @@ private enum BackdropBlurProcessor {
         filter.setValue(radius, forKey: kCIInputRadiusKey)
 
         guard let output = filter.outputImage?.cropped(to: extent) else { return nil }
-        return ciContext.createCGImage(output, from: extent)
+        return ciBox.context.createCGImage(output, from: extent)
     }
 }
 

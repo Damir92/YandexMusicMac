@@ -353,9 +353,10 @@ func testLikesServiceMembership() {
 // MARK: - Stage 5 ImagePipeline & AuthService Tests
 
 @Test("ImagePipeline cache operations")
+@MainActor
 func testImagePipeline() async {
     let pipeline = ImagePipeline(maxMemoryCost: 10 * 1024 * 1024)
-    await pipeline.clearCache()
+    pipeline.clearCache()
 
     // Querying with nil / empty coverUri immediately returns nil
     let nilResult = await pipeline.image(for: nil)
@@ -804,10 +805,11 @@ func testLikesServiceSearchInLikes() {
 }
 
 @Test("ImagePipeline configurable memory cost and count limit")
-func testImagePipelineConfigurableMemoryCost() async {
+@MainActor
+func testImagePipelineConfigurableMemoryCost() {
     let pipeline = ImagePipeline.shared
-    await pipeline.setMaxMemoryCost(mb: 15)
-    await pipeline.clearMemoryCache()
+    pipeline.setMaxMemoryCost(mb: 15)
+    pipeline.clearMemoryCache()
 }
 
 @Test("AudioPlayerEngine stopAndClear resets all state")

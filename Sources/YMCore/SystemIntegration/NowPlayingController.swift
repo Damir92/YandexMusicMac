@@ -69,12 +69,8 @@ public final class NowPlayingController {
                 guard let image = await ImagePipeline.shared.image(for: coverUri, size: .artwork) else {
                     return
                 }
-                guard !Task.isCancelled else { return }
-
-                await MainActor.run { [weak self] in
-                    guard let self = self, self.currentTrackId == track.id else { return }
-                    self.setArtwork(image: image)
-                }
+                guard !Task.isCancelled, let self = self, self.currentTrackId == track.id else { return }
+                self.setArtwork(image: image)
             }
         }
     }

@@ -724,7 +724,7 @@ public struct SettingsView: View {
         Button {
             Task {
                 await networkClient.clearCache()
-                await ImagePipeline.shared.clearCache()
+                ImagePipeline.shared.clearCache()
                 isCacheCleared = true
             }
         } label: {

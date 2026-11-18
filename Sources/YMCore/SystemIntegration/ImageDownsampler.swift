@@ -38,8 +38,8 @@ public enum ImageDownsampler: Sendable {
         return NSImage(cgImage: downsampledCGImage, size: targetSize)
     }
 
-    /// Downsamples raw image data to target maximum pixel size and returns exact memory byte cost.
-    public static func downsampleWithCost(data: Data, maxPixelSize: CGFloat) -> (NSImage, Int)? {
+    /// Downsamples raw image data to a Sendable `CGImage` and returns exact memory byte cost.
+    public static func downsampleCGImageWithCost(data: Data, maxPixelSize: CGFloat) -> (CGImage, Int)? {
         let imageSourceOptions: [CFString: Any] = [
             kCGImageSourceShouldCache: false
         ]
@@ -58,8 +58,29 @@ public enum ImageDownsampler: Sendable {
         }
 
         let exactByteCost = cgImage.bytesPerRow * cgImage.height
+        return (cgImage, max(exactByteCost, Int(maxPixelSize * maxPixelSize * 4)))
+    }
+
+    /// Downsamples raw image data to target maximum pixel size and returns exact memory byte cost.
+    public static func downsampleWithCost(data: Data, maxPixelSize: CGFloat) -> (NSImage, Int)? {
+        guard let (cgImage, cost) = downsampleCGImageWithCost(data: data, maxPixelSize: maxPixelSize) else {
+            return nil
+        }
         let targetSize = NSSize(width: cgImage.width, height: cgImage.height)
-        return (NSImage(cgImage: cgImage, size: targetSize), max(exactByteCost, Int(maxPixelSize * maxPixelSize * 4)))
+        return (NSImage(cgImage: cgImage, size: targetSize), cost)
+    }
+
+    /// Asynchronously fetches an image from URL and decodes a Sendable downsampled `CGImage` off the main thread.
+    public static func fetchAndDownsampleCGImageWithCost(from url: URL, maxPixelSize: CGFloat) async -> (CGImage, Int)? {
+        do {
+            let (data, response) = try await imageSession.data(from: url)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return nil
+            }
+            return downsampleCGImageWithCost(data: data, maxPixelSize: maxPixelSize)
+        } catch {
+            return nil
+        }
     }
 
     /// Asynchronously fetches an image from URL and decodes a downsampled thumbnail off the main thread.

@@ -23,7 +23,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          swift test
+          swift test --no-parallel
 
       - name: Package release binaries
         run: |

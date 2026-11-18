@@ -41,9 +41,7 @@ public final class AudioQualitySettings {
     public var imageCacheLimitMB: Int {
         didSet {
             UserDefaults.standard.set(imageCacheLimitMB, forKey: imageCacheLimitKey)
-            Task {
-                await ImagePipeline.shared.setMaxMemoryCost(mb: imageCacheLimitMB)
-            }
+            ImagePipeline.shared.setMaxMemoryCost(mb: imageCacheLimitMB)
         }
     }
 
@@ -79,9 +77,7 @@ public final class AudioQualitySettings {
         self.imageCacheLimitMB = resolvedImageLimit
         self.crossfadeDuration = resolvedCrossfade
 
-        Task {
-            await ImagePipeline.shared.setMaxMemoryCost(mb: resolvedImageLimit)
-        }
+        ImagePipeline.shared.setMaxMemoryCost(mb: resolvedImageLimit)
     }
 
     public func setPreset(_ newPreset: YMAudioQualityPreset) {
@@ -107,8 +103,8 @@ public final class AudioQualitySettings {
     /// Drops unnecessary cached data, trims search buffer and clears image/network caches to drop RAM to 40-50 MB
     public func purgeUnusedMemory() {
         LikesService.shared.compressMemory()
+        ImagePipeline.shared.clearMemoryCache()
         Task {
-            await ImagePipeline.shared.clearMemoryCache()
             await YMNetworkClient.shared.clearCache()
         }
     }

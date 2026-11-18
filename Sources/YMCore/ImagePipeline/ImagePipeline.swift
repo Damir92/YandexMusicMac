@@ -1,13 +1,15 @@
 import Foundation
 import AppKit
 
-/// Actor-based image cache pipeline with configurable RAM cost limit (default 15 MB)
-/// and hardware-accelerated downsampling via ImageIO.
-public actor ImagePipeline {
+/// MainActor-isolated image cache pipeline with configurable RAM cost limit (default 15 MB)
+/// and off-main-thread hardware-accelerated downsampling via ImageIO (`CGImage` crosses
+/// concurrency boundaries cleanly across macOS 14/15/27 SDKs without requiring `NSImage: Sendable`).
+@MainActor
+public final class ImagePipeline {
     public static let shared = ImagePipeline()
 
     private let memoryCache: NSCache<NSString, NSImage>
-    private var inFlightTasks: [String: Task<NSImage?, Never>] = [:]
+    private var inFlightTasks: [String: Task<(CGImage, Int)?, Never>] = [:]
 
     public init(maxMemoryCost: Int = 15 * 1024 * 1024) {
         let cache = NSCache<NSString, NSImage>()
@@ -21,17 +23,25 @@ public actor ImagePipeline {
         memoryCache.totalCostLimit = max(5, mb) * 1024 * 1024
     }
 
-    /// Fetches image from cache or downloads and downsamples asynchronously
+    /// Fetches image from cache or downloads and downsamples asynchronously off the main thread
     public func image(for coverUri: String?, size: YMCoverSize = .medium) async -> NSImage? {
         guard let coverUri = coverUri, !coverUri.isEmpty else { return nil }
 
-        let cacheKey = "\(coverUri)_\(size.rawValue)" as NSString
+        let keyString = "\(coverUri)_\(size.rawValue)"
+        let cacheKey = keyString as NSString
         if let cached = memoryCache.object(forKey: cacheKey) {
             return cached
         }
 
-        if let existingTask = inFlightTasks[cacheKey as String] {
-            return await existingTask.value
+        if let existingTask = inFlightTasks[keyString] {
+            if let (cgImage, _) = await existingTask.value {
+                if let cached = memoryCache.object(forKey: cacheKey) {
+                    return cached
+                }
+                let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                return image
+            }
+            return nil
         }
 
         guard let url = YMCoverURLBuilder.buildURL(from: coverUri, size: size) else {
@@ -46,19 +56,25 @@ public actor ImagePipeline {
         case .large: maxPixelSize = 400
         }
 
-        let task = Task<NSImage?, Never> {
-            guard let (image, byteCost) = await ImageDownsampler.fetchAndDownsampleWithCost(from: url, maxPixelSize: maxPixelSize),
+        let task = Task.detached(priority: .userInitiated) { () -> (CGImage, Int)? in
+            guard let result = await ImageDownsampler.fetchAndDownsampleCGImageWithCost(from: url, maxPixelSize: maxPixelSize),
                   !Task.isCancelled else {
                 return nil
             }
-            self.memoryCache.setObject(image, forKey: cacheKey, cost: byteCost)
-            return image
+            return result
         }
 
-        inFlightTasks[cacheKey as String] = task
-        let result = await task.value
-        inFlightTasks.removeValue(forKey: cacheKey as String)
-        return result
+        inFlightTasks[keyString] = task
+        let decoded = await task.value
+        inFlightTasks.removeValue(forKey: keyString)
+
+        guard let (cgImage, byteCost) = decoded else {
+            return nil
+        }
+
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        memoryCache.setObject(image, forKey: cacheKey, cost: byteCost)
+        return image
     }
 
     public func clearCache() {
