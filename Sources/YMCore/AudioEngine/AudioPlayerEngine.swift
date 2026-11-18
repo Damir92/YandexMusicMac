@@ -50,9 +50,20 @@ public final class AudioPlayerEngine {
         return true
     }
 
+    private static let volumeDefaultsKey = "ym_audio_player_volume"
+
+    /// Reactive stored volume property (0.0...1.0) persisted in UserDefaults so keyboard shortcuts (`⌘↑` / `⌘↓`)
+    /// immediately update `PlayerBarView`'s `YMSlider` without requiring pointer hover.
     public var volume: Float {
-        get { player.volume }
-        set { player.volume = max(0, min(1, newValue)) }
+        didSet {
+            let clamped = max(0, min(1, volume))
+            if volume != clamped {
+                volume = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: Self.volumeDefaultsKey)
+            applyEffectiveVolumes()
+        }
     }
 
     // Telemetry and UI event hooks
@@ -61,9 +72,17 @@ public final class AudioPlayerEngine {
     public var onTrackSkipped: (@Sendable (YMTrack, Double) -> Void)?
     public var onQueueNeedsMoreTracks: (@Sendable () -> Void)?
 
-    // MARK: - Internal Player Resources
+    // MARK: - Internal Player Resources & Crossfade Engine
 
     private var player = AVPlayer()
+    private var outgoingPlayer: AVPlayer?
+    private var crossfadeTimer: Timer?
+    private var isCrossfading: Bool = false
+    private var currentFadeGain: Float = 1.0
+    private var outgoingFadeGain: Float = 0.0
+    private var crossfadeElapsedSeconds: Double = 0.0
+    private var crossfadeTotalDuration: Double = 0.0
+
     private var timeObserverToken: Any?
     private var itemEndObserver: (any NSObjectProtocol)?
     private var itemFailedObserver: (any NSObjectProtocol)?
@@ -86,19 +105,77 @@ public final class AudioPlayerEngine {
     private var suppressNextSkipTelemetry: Bool = false
     private var pendingWaveAdvance: Bool = false
 
+    // Paginated non-wave queue continuation (Favorites, Search, etc.)
+    public typealias QueueContinuationProvider = @MainActor (_ existingTrackIds: Set<String>) async -> [YMTrack]
+    private var queueContinuationProvider: QueueContinuationProvider? = nil
+    private var queueContinuationTask: Task<Void, Never>? = nil
+    private var isFetchingQueueContinuation: Bool = false
+    private var pendingContinuationAdvance: Bool = false
+    private var queueGeneration: UInt64 = 0
+
+    private var currentCollectionIdentifier: String {
+        if isWaveMode {
+            return "wave:\(activeWaveContext.fallbackStationId)"
+        }
+        if let albumId = currentTrack?.albums.first?.id, !albumId.isEmpty {
+            return "album:\(albumId)"
+        }
+        return "queue"
+    }
+
     public init() {
+        if UserDefaults.standard.object(forKey: Self.volumeDefaultsKey) != nil {
+            let saved = UserDefaults.standard.float(forKey: Self.volumeDefaultsKey)
+            self.volume = max(0, min(1, saved))
+        } else {
+            self.volume = 1.0
+        }
+        applyEffectiveVolumes()
+        _ = EqualizerSettings.shared
         setupSystemObservers()
         setupTimeObserver()
     }
 
     public func cleanup() {
+        cancelCrossfade(stopOutgoing: true)
         cleanupObservers()
+    }
+
+    private func applyEffectiveVolumes() {
+        player.volume = volume * currentFadeGain
+        outgoingPlayer?.volume = volume * outgoingFadeGain
+    }
+
+    private func cancelCrossfade(stopOutgoing: Bool = true) {
+        crossfadeTimer?.invalidate()
+        crossfadeTimer = nil
+        isCrossfading = false
+        crossfadeElapsedSeconds = 0.0
+        crossfadeTotalDuration = 0.0
+        currentFadeGain = 1.0
+        outgoingFadeGain = 0.0
+        applyEffectiveVolumes()
+
+        if stopOutgoing, let outgoing = outgoingPlayer {
+            outgoing.pause()
+            outgoing.replaceCurrentItem(with: nil)
+            outgoingPlayer = nil
+        }
+    }
+
+    private func syncNowPlayingQueue() {
+        NowPlayingController.shared.updateQueueInfo(
+            currentIndex: currentIndex,
+            queueCount: queue.count,
+            collectionIdentifier: currentCollectionIdentifier
+        )
     }
 
     // MARK: - Queue & Playback Control
 
     public func setQueue(_ newQueue: [YMTrack], startingAt index: Int = 0, keepShuffle: Bool = false) {
         guard checkSubscriptionEligibility() else { return }
+        resetQueueContinuation()
         if !keepShuffle {
             self.isShuffleEnabled = false
             self.unshuffledQueue = [] // Не дублируем память, пока Shuffle не включен
@@ -107,6 +184,94 @@ public final class AudioPlayerEngine {
         self.currentIndex = max(0, min(index, newQueue.count - 1))
         if !newQueue.isEmpty {
             playTrack(at: self.currentIndex)
+        }
+    }
+
+    /// Attaches an async pagination provider for the active non-wave queue (e.g. Favorites or Search),
+    /// allowing seamless playback and hotkey/button skipping beyond the initial loaded batch (50+ tracks).
+    public func attachQueueContinuation(_ provider: @escaping QueueContinuationProvider) {
+        self.queueContinuationProvider = provider
+        self.isFetchingQueueContinuation = false
+        self.pendingContinuationAdvance = false
+        maybePrefetchQueueContinuation()
+    }
+
+    private func resetQueueContinuation() {
+        queueGeneration &+= 1
+        queueContinuationTask?.cancel()
+        queueContinuationTask = nil
+        queueContinuationProvider = nil
+        isFetchingQueueContinuation = false
+        pendingContinuationAdvance = false
+    }
+
+    private func existingQueueTrackIds() -> Set<String> {
+        var ids = Set<String>(minimumCapacity: queue.count * 2)
+        for track in queue {
+            ids.insert(track.id)
+            if let colon = track.id.firstIndex(of: ":") {
+                ids.insert(String(track.id[..<colon]))
+            }
+        }
+        return ids
+    }
+
+    private func maybePrefetchQueueContinuation() {
+        guard !isWaveMode,
+              queueContinuationProvider != nil,
+              !queue.isEmpty,
+              queue.count - currentIndex <= 8 else { return }
+        triggerQueueContinuation(advanceWhenReady: false)
+    }
+
+    private func triggerQueueContinuation(advanceWhenReady: Bool) {
+        guard !isWaveMode, let provider = queueContinuationProvider else { return }
+        if advanceWhenReady {
+            pendingContinuationAdvance = true
+        }
+        guard !isFetchingQueueContinuation else { return }
+
+        isFetchingQueueContinuation = true
+        let generation = queueGeneration
+        let existingIds = existingQueueTrackIds()
+
+        queueContinuationTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let fetched = await provider(existingIds)
+            guard !Task.isCancelled, self.queueGeneration == generation else { return }
+
+            self.isFetchingQueueContinuation = false
+            self.queueContinuationTask = nil
+
+            let currentIds = self.existingQueueTrackIds()
+            let uniqueNew = fetched.filter { track in
+                if track.isPlaceholder || track.isSpacer { return false }
+                if currentIds.contains(track.id) { return false }
+                if let colon = track.id.firstIndex(of: ":") {
+                    return !currentIds.contains(String(track.id[..<colon]))
+                }
+                return true
+            }
+
+            guard !uniqueNew.isEmpty else {
+                // Reached the end of the paginated source
+                self.queueContinuationProvider = nil
+                self.pendingContinuationAdvance = false
+                return
+            }
+
+            let tracksToAppend = self.isShuffleEnabled ? uniqueNew.shuffled() : uniqueNew
+            self.queue.append(contentsOf: tracksToAppend)
+            if self.isShuffleEnabled {
+                self.unshuffledQueue.append(contentsOf: uniqueNew)
+            }
+            self.syncNowPlayingQueue()
+
+            let shouldAdvance = self.pendingContinuationAdvance
+            self.pendingContinuationAdvance = false
+            if shouldAdvance && self.currentIndex + 1 < self.queue.count {
+                self.playTrack(at: self.currentIndex + 1)
+            }
         }
     }
 
@@ -125,6 +290,7 @@ public final class AudioPlayerEngine {
             if !isWaveMode && isShuffleEnabled {
                 self.unshuffledQueue.append(track)
             }
+            syncNowPlayingQueue()
         } else {
             appendToQueue([track])
         }
@@ -147,6 +313,8 @@ public final class AudioPlayerEngine {
             self.unshuffledQueue.append(contentsOf: tracks)
         }
 
+        syncNowPlayingQueue()
+
         if isWaveMode && wasWaitingForWaveAdvance && currentIndex + 1 < queue.count {
             playTrack(at: currentIndex + 1)
         }
@@ -155,6 +323,7 @@ public final class AudioPlayerEngine {
     public func playTrack(at index: Int) {
         guard checkSubscriptionEligibility() else { return }
         guard index >= 0 && index < queue.count else { return }
+        cancelCrossfade(stopOutgoing: true)
         pendingWaveAdvance = false
 
         if timeObserverToken == nil {
@@ -182,9 +351,11 @@ public final class AudioPlayerEngine {
 
         loadAndPlay(track: track, seekTo: nil, isInitialTrackStart: true)
 
-        // Check if queue needs more items from Rotor / Station
+        // Check if queue needs more items from Rotor / Station or paginated non-wave source
         if isWaveMode && queue.count - currentIndex <= 2 {
             onQueueNeedsMoreTracks?()
+        } else {
+            maybePrefetchQueueContinuation()
         }
     }
 
@@ -206,6 +377,9 @@ public final class AudioPlayerEngine {
             trackStartTimestamp = Date()
         }
         player.play()
+        if isCrossfading {
+            outgoingPlayer?.play()
+        }
         isPlaying = true
         NowPlayingController.shared.updatePlaybackState(isPlaying: true, currentTime: progressTracker.currentTime)
     }
@@ -213,11 +387,15 @@ public final class AudioPlayerEngine {
     public func pause() {
         recordPlaybackSession() // Fix: Record played seconds BEFORE setting isPlaying = false!
         player.pause()
+        if isCrossfading {
+            outgoingPlayer?.pause()
+        }
         isPlaying = false
         NowPlayingController.shared.updatePlaybackState(isPlaying: false, currentTime: progressTracker.currentTime)
     }
 
     public func stopAndClear() {
+        cancelCrossfade(stopOutgoing: true)
         loadTask?.cancel()
         prefetchTask?.cancel()
         detachItemObservers()
@@ -235,20 +413,25 @@ public final class AudioPlayerEngine {
         activeWaveVibe = .defaultWave
         suppressNextSkipTelemetry = false
         pendingWaveAdvance = false
+        resetQueueContinuation()
         currentStreamInfo = nil
         availableStreamInfos = []
         currentAudioFormatDetails = nil
         nextPreloadedStream = nil
         progressTracker.reset()
+        NowPlayingController.shared.clearNowPlaying()
     }
 
     public func next() {
         if currentIndex + 1 < queue.count {
             pendingWaveAdvance = false
+            pendingContinuationAdvance = false
             playTrack(at: currentIndex + 1)
         } else if isWaveMode {
             pendingWaveAdvance = true
             onQueueNeedsMoreTracks?()
+        } else if queueContinuationProvider != nil {
+            triggerQueueContinuation(advanceWhenReady: true)
         }
     }
 
@@ -271,6 +454,7 @@ public final class AudioPlayerEngine {
 
     public func seek(to seconds: Double) {
         guard seconds.isFinite && seconds >= 0 else { return }
+        cancelCrossfade(stopOutgoing: true)
         progressTracker.currentTime = seconds
         progressTracker.seekLockUntil = Date().addingTimeInterval(0.4)
         lastObservedPlaybackTime = seconds
@@ -327,6 +511,7 @@ public final class AudioPlayerEngine {
             self.hasPrefetchedNextTrack = false
             self.nextPreloadedStream = nil
         }
+        syncNowPlayingQueue()
     }
 
     public func playShuffled(_ tracks: [YMTrack]) {
@@ -349,6 +534,7 @@ public final class AudioPlayerEngine {
             queue = Array(queue.prefix(maxIndex + 1))
             hasPrefetchedNextTrack = false
             nextPreloadedStream = nil
+            syncNowPlayingQueue()
         }
         onQueueNeedsMoreTracks?()
     }
@@ -498,6 +684,14 @@ public final class AudioPlayerEngine {
 
         player.replaceCurrentItem(with: item)
 
+        Task { [weak self, weak item] in
+            guard let self = self, let item = item else { return }
+            if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
+                guard self.player.currentItem === item else { return }
+                item.audioMix = mix
+            }
+        }
+
         if let seekSeconds = seekSeconds, seekSeconds > 0 {
             let cmTime = CMTime(seconds: seekSeconds, preferredTimescale: 600)
             player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
@@ -512,7 +706,14 @@ public final class AudioPlayerEngine {
                     }
                     self.isLoading = false
                     if isInitialTrackStart {
-                        NowPlayingController.shared.updateTrack(track, isPlaying: autoPlay, currentTime: seekSeconds)
+                        NowPlayingController.shared.updateTrack(
+                            track,
+                            isPlaying: autoPlay,
+                            currentTime: seekSeconds,
+                            queueIndex: self.currentIndex,
+                            queueCount: self.queue.count,
+                            collectionIdentifier: self.currentCollectionIdentifier
+                        )
                         self.onTrackStarted?(track)
                     } else {
                         NowPlayingController.shared.updatePlaybackPosition(currentTime: seekSeconds, isPlaying: autoPlay)
@@ -529,7 +730,13 @@ public final class AudioPlayerEngine {
             }
             isLoading = false
             if isInitialTrackStart {
-                NowPlayingController.shared.updateTrack(track, isPlaying: autoPlay)
+                NowPlayingController.shared.updateTrack(
+                    track,
+                    isPlaying: autoPlay,
+                    queueIndex: currentIndex,
+                    queueCount: queue.count,
+                    collectionIdentifier: currentCollectionIdentifier
+                )
                 onTrackStarted?(track)
             } else {
                 NowPlayingController.shared.updatePlaybackPosition(currentTime: 0, isPlaying: autoPlay)
@@ -650,9 +857,105 @@ public final class AudioPlayerEngine {
                 self.progressTracker.update(currentTime: currentTime, duration: validDuration)
                 self.lastObservedPlaybackTime = currentTime
 
-                // Pre-load next track 15 seconds before the current track ends
-                if validDuration > 15 && (validDuration - currentTime) <= 15 && !self.hasPrefetchedNextTrack {
+                let remaining = validDuration - currentTime
+                let crossfadeSec = self.qualitySettings.crossfadeDuration
+                let prefetchLeadTime = max(15.0, crossfadeSec + 6.0)
+
+                // Pre-load next track well ahead of crossfade/track end
+                if validDuration > prefetchLeadTime && remaining <= prefetchLeadTime && !self.hasPrefetchedNextTrack {
                     self.triggerNextTrackPrefetch()
+                }
+
+                // Trigger dual-player equal-power crossfade when configured and next track is available
+                if crossfadeSec >= 0.5,
+                   !self.isCrossfading,
+                   validDuration > crossfadeSec + 2.0,
+                   remaining <= crossfadeSec,
+                   remaining > 0.25,
+                   self.currentIndex + 1 < self.queue.count {
+                    self.beginCrossfadeToNextTrack(duration: min(crossfadeSec, remaining))
+                }
+            }
+        }
+    }
+
+    private func beginCrossfadeToNextTrack(duration: Double) {
+        guard checkSubscriptionEligibility() else { return }
+        guard !isCrossfading, currentIndex + 1 < queue.count, duration >= 0.25 else { return }
+
+        // Report completion telemetry for the outgoing track
+        if let finishingTrack = currentTrack {
+            recordPlaybackSession()
+            onTrackFinished?(finishingTrack, accumulatedPlayedSeconds)
+        }
+
+        // Release any previous outgoing player before swapping
+        if let staleOutgoing = outgoingPlayer {
+            staleOutgoing.pause()
+            staleOutgoing.replaceCurrentItem(with: nil)
+            outgoingPlayer = nil
+        }
+
+        // Detach observers and time observer from the outgoing player WITHOUT cancelling its remaining buffer
+        if let token = timeObserverToken {
+            player.removeTimeObserver(token)
+            timeObserverToken = nil
+        }
+        detachItemObservers(cancelAssetLoading: false)
+
+        // Move active player to outgoingPlayer and create a fresh AVPlayer for the incoming track
+        outgoingPlayer = player
+        player = AVPlayer()
+
+        isCrossfading = true
+        currentFadeGain = 0.0
+        outgoingFadeGain = 1.0
+        crossfadeElapsedSeconds = 0.0
+        crossfadeTotalDuration = duration
+        applyEffectiveVolumes()
+        setupTimeObserver()
+
+        // Advance queue to the incoming track
+        pendingWaveAdvance = false
+        suppressNextSkipTelemetry = false
+        currentIndex += 1
+        let nextTrack = queue[currentIndex]
+        currentTrack = nextTrack
+        hasPrefetchedNextTrack = false
+        currentStreamRetryCount = 0
+        accumulatedPlayedSeconds = 0
+        lastObservedPlaybackTime = 0
+        trackStartTimestamp = Date()
+        progressTracker.reset()
+
+        loadAndPlay(track: nextTrack, seekTo: nil, autoPlay: true, isInitialTrackStart: true)
+
+        if isWaveMode && queue.count - currentIndex <= 2 {
+            onQueueNeedsMoreTracks?()
+        } else {
+            maybePrefetchQueueContinuation()
+        }
+
+        if isWaveMode && queue.count - currentIndex <= 2 {
+            onQueueNeedsMoreTracks?()
+        }
+
+        // Start 20 Hz equal-power crossfade timer (0.05s step)
+        crossfadeTimer?.invalidate()
+        crossfadeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, self.isCrossfading else { return }
+                guard self.isPlaying else { return }
+
+                self.crossfadeElapsedSeconds += 0.05
+                let progress = min(1.0, self.crossfadeElapsedSeconds / max(0.05, self.crossfadeTotalDuration))
+                let angle = Float(progress * Double.pi * 0.5)
+                self.currentFadeGain = sin(angle)
+                self.outgoingFadeGain = cos(angle)
+                self.applyEffectiveVolumes()
+
+                if progress >= 1.0 {
+                    self.cancelCrossfade(stopOutgoing: true)
                 }
             }
         }
@@ -708,6 +1011,7 @@ public final class AudioPlayerEngine {
 
     public func selectStreamVariant(_ info: YMDownloadInfo) {
         guard let track = currentTrack else { return }
+        cancelCrossfade(stopOutgoing: true)
         self.nextPreloadedStream = nil
         let interruptedPosition = progressTracker.currentTime
         let wasPlaying = self.isPlaying
@@ -735,6 +1039,7 @@ public final class AudioPlayerEngine {
 
     public func reloadCurrentTrackStream() {
         guard let track = currentTrack else { return }
+        cancelCrossfade(stopOutgoing: true)
         self.nextPreloadedStream = nil
         let currentPos = progressTracker.currentTime
         let wasPlaying = self.isPlaying
@@ -780,9 +1085,11 @@ public final class AudioPlayerEngine {
         }
     }
 
-    private func detachItemObservers() {
-        player.currentItem?.cancelPendingSeeks()
-        player.currentItem?.asset.cancelLoading()
+    private func detachItemObservers(cancelAssetLoading: Bool = true) {
+        if cancelAssetLoading {
+            player.currentItem?.cancelPendingSeeks()
+            player.currentItem?.asset.cancelLoading()
+        }
         itemStatusObserver?.invalidate()
         itemStatusObserver = nil
         if let endObs = itemEndObserver {

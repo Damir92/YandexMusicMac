@@ -109,7 +109,8 @@ public struct YMArtistCard: View {
                 .scaleEffect(isHovered ? 1.05 : 1.0)
                 .shadow(color: isHovered ? YMTheme.accent.opacity(0.3) : Color.black.opacity(0.15), radius: isHovered ? 12 : 6, y: 3)
                 .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isHovered)
-                .padding(.vertical, 8)
+                .padding(.top, 18)
+                .padding(.bottom, 10)
 
                 VStack(spacing: 2) {
                     Text(artist.name)

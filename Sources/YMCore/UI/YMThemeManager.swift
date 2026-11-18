@@ -4,23 +4,29 @@ import AppKit
 public enum YMAppTheme: String, CaseIterable, Identifiable, Sendable {
     case system = "system"
     case dark = "dark"
+    case midnight = "midnight"
     case light = "light"
+    case latte = "latte"
 
     public var id: String { rawValue }
 
     public var title: String {
         switch self {
         case .system: return "Системная"
-        case .dark: return "Тёмная"
+        case .dark: return "Графитовая"
+        case .midnight: return "Полночь"
         case .light: return "Светлая"
+        case .latte: return "Тёплый песок"
         }
     }
 
     public var subtitle: String {
         switch self {
         case .system: return "Автоматически повторяет оформление macOS"
-        case .dark: return "Фирменный глубокий тёмный интерфейс"
-        case .light: return "Мягкая нейтральная тема в тёплых тонах"
+        case .dark: return "Мягкая графитовая тёмная палитра с тёплым золотом"
+        case .midnight: return "Глубокий сине-сланцевый вечерний интерфейс"
+        case .light: return "Воздушный тёплый алебастр с янтарным акцентом"
+        case .latte: return "Кремово-песочные тона и терракотовый акцент"
         }
     }
 
@@ -28,15 +34,17 @@ public enum YMAppTheme: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .system: return "circle.righthalf.filled"
         case .dark: return "moon.fill"
+        case .midnight: return "moon.stars.fill"
         case .light: return "sun.max.fill"
+        case .latte: return "cup.and.saucer.fill"
         }
     }
 
     public var colorScheme: ColorScheme? {
         switch self {
         case .system: return nil
-        case .dark: return .dark
-        case .light: return .light
+        case .dark, .midnight: return .dark
+        case .light, .latte: return .light
         }
     }
 }
@@ -76,8 +84,8 @@ public final class YMThemeManager {
     public func updateWindowAppearance() {
         let appKitAppearance: NSAppearance? = switch currentTheme {
         case .system: nil
-        case .dark: NSAppearance(named: .darkAqua)
-        case .light: NSAppearance(named: .aqua)
+        case .dark, .midnight: NSAppearance(named: .darkAqua)
+        case .light, .latte: NSAppearance(named: .aqua)
         }
 
         // Use NSApplication.shared (always safe, avoids implicitly unwrapped NSApp nil during early launch)

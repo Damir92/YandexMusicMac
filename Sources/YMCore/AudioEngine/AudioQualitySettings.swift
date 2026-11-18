@@ -11,6 +11,7 @@ public final class AudioQualitySettings {
     private let codecKey = "ym_audio_codec_pref"
     private let preloadFavoritesKey = "ym_preload_favorites_bg"
     private let imageCacheLimitKey = "ym_image_cache_limit_mb"
+    private let crossfadeDurationKey = "ym_audio_crossfade_seconds"
 
     public var preset: YMAudioQualityPreset {
         didSet {
@@ -46,6 +47,18 @@ public final class AudioQualitySettings {
         }
     }
 
+    /// Smooth crossfade duration between consecutive tracks in seconds (0.0...12.0; 0.0 = disabled)
+    public var crossfadeDuration: Double {
+        didSet {
+            let clamped = max(0.0, min(12.0, crossfadeDuration))
+            if crossfadeDuration != clamped {
+                crossfadeDuration = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: crossfadeDurationKey)
+        }
+    }
+
     public init() {
         let savedPresetStr = UserDefaults.standard.string(forKey: presetKey)
         let resolvedPreset = savedPresetStr.flatMap(YMAudioQualityPreset.init(rawValue:)) ?? .high320
@@ -57,10 +70,14 @@ public final class AudioQualitySettings {
         let savedImageLimit = UserDefaults.standard.integer(forKey: imageCacheLimitKey)
         let resolvedImageLimit = savedImageLimit > 0 ? savedImageLimit : 15
 
+        let savedCrossfade = UserDefaults.standard.double(forKey: crossfadeDurationKey)
+        let resolvedCrossfade = max(0.0, min(12.0, savedCrossfade))
+
         self.preset = resolvedPreset
         self.codecPreference = resolvedCodec
         self.preloadAllFavoritesInBackground = savedPreload
         self.imageCacheLimitMB = resolvedImageLimit
+        self.crossfadeDuration = resolvedCrossfade
 
         Task {
             await ImagePipeline.shared.setMaxMemoryCost(mb: resolvedImageLimit)
@@ -81,6 +98,10 @@ public final class AudioQualitySettings {
 
     public func setImageCacheLimitMB(_ limit: Int) {
         self.imageCacheLimitMB = limit
+    }
+
+    public func setCrossfadeDuration(_ seconds: Double) {
+        self.crossfadeDuration = max(0.0, min(12.0, seconds))
     }
 
     /// Drops unnecessary cached data, trims search buffer and clears image/network caches to drop RAM to 40-50 MB

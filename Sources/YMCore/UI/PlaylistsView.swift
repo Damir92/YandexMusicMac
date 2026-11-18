@@ -2,20 +2,32 @@ import SwiftUI
 
 /// Modern Playlists view supporting responsive grid of playlist cards and deep-dive playlist detail view.
 public struct PlaylistsView: View {
-    @UIState private var playlists: [YMPlaylist] = []
+    @UIState private var playlistsService = PlaylistsService.shared
     @UIState private var selectedPlaylist: YMPlaylist? = nil
     @UIState private var playlistTracks: [YMTrack] = []
-    @UIState private var isLoadingPlaylists = false
     @UIState private var isLoadingTracks = false
-    @UIState private var errorMessage: String? = nil
+    @UIState private var detailErrorMessage: String? = nil
     @UIState private var playlistFilterQuery: String = ""
     @UIState private var playlistDetailTask: Task<Void, Never>? = nil
+    @UIState private var isGridScrolled = false
+    @UIState private var isDetailScrolled = false
+
+    @UIState private var isCreateSheetPresented = false
+    @UIState private var playlistBeingEdited: YMPlaylist? = nil
+    @UIState private var playlistPendingDelete: YMPlaylist? = nil
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var windowState = WindowState.shared
     @UIState private var coordinator = NavigationCoordinator.shared
     private let networkClient = YMNetworkClient.shared
-    private let keychain = KeychainManager.shared
+
+    private var playlists: [YMPlaylist] {
+        playlistsService.playlists
+    }
+
+    private var isLoadingPlaylists: Bool {
+        playlistsService.isLoading
+    }
 
     private var displayedPlaylistTracks: [YMTrack] {
         let q = playlistFilterQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -38,10 +50,53 @@ public struct PlaylistsView: View {
             }
         }
         .ymScreenBackground()
-        .task {
-            if playlists.isEmpty {
-                loadPlaylists()
+        .sheet(isPresented: $isCreateSheetPresented) {
+            PlaylistEditorSheet(
+                editingPlaylist: nil,
+                initialTracks: [],
+                onDismiss: {
+                    isCreateSheetPresented = false
+                },
+                onSaved: { created in
+                    isCreateSheetPresented = false
+                    selectPlaylist(created)
+                }
+            )
+        }
+        .sheet(item: $playlistBeingEdited) { target in
+            PlaylistEditorSheet(
+                editingPlaylist: target,
+                initialTracks: [],
+                onDismiss: {
+                    playlistBeingEdited = nil
+                },
+                onSaved: { updated in
+                    playlistBeingEdited = nil
+                    if selectedPlaylist?.id == updated.id {
+                        selectedPlaylist = updated
+                    }
+                }
+            )
+        }
+        .alert(
+            "Удалить плейлист?",
+            isPresented: Binding(
+                get: { playlistPendingDelete != nil },
+                set: { if !$0 { playlistPendingDelete = nil } }
+            ),
+            presenting: playlistPendingDelete
+        ) { target in
+            Button("Удалить", role: .destructive) {
+                deletePlaylistConfirmed(target)
             }
+            Button("Отмена", role: .cancel) {
+                playlistPendingDelete = nil
+            }
+        } message: { target in
+            Text("Плейлист «\(target.title)» будет безвозвратно удалён из вашего аккаунта Яндекс Музыки.")
+        }
+        .task {
+            await playlistsService.ensureLoaded()
         }
     }
 
@@ -50,38 +105,26 @@ public struct PlaylistsView: View {
     private var playlistsGridView: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 20) {
-                // Header
-                HStack(alignment: .center) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Плейлисты")
-                            .font(.system(size: 28, weight: .bold))
-                            .foregroundStyle(YMTheme.fg)
-
-                        Text("Ваша коллекция плейлистов и подборки")
-                            .font(.subheadline)
-                            .foregroundStyle(YMTheme.fg60)
+                // Header (adaptive for narrow windows)
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: 12) {
+                        playlistsTitleBlock
+                        Spacer(minLength: 12)
+                        playlistsHeaderActions(compact: false)
                     }
 
-                    Spacer()
-
-                    Button {
-                        loadPlaylists()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Обновить")
-                        }
+                    VStack(alignment: .leading, spacing: 12) {
+                        playlistsTitleBlock
+                        playlistsHeaderActions(compact: true)
                     }
-                    .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
-                    .disabled(isLoadingPlaylists)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
+                .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
+                .padding(.top, windowState.topChromeContentPadding)
 
                 Divider()
-                    .padding(.horizontal, 24)
+                    .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
 
-                if let error = errorMessage {
+                if let error = playlistsService.errorMessage {
                     HStack(spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
@@ -116,9 +159,19 @@ public struct PlaylistsView: View {
                         Text("Плейлисты не найдены")
                             .font(.headline)
                             .foregroundStyle(YMTheme.fg)
-                        Text("Созданные вами плейлисты в Яндекс Музыке появятся здесь")
+                        Text("Создайте свой первый плейлист прямо здесь или добавьте подборки в Яндекс Музыке")
                             .font(.subheadline)
                             .foregroundStyle(YMTheme.fg60)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 24)
+
+                        Button {
+                            isCreateSheetPresented = true
+                        } label: {
+                            Label("Создать плейлист", systemImage: "plus")
+                        }
+                        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 34))
+                        .padding(.top, 4)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
                 } else {
@@ -140,14 +193,76 @@ public struct PlaylistsView: View {
                                 },
                                 onWave: {
                                     playPlaylistImmediately(playlist, shuffle: false, startWave: true)
+                                },
+                                onEdit: {
+                                    playlistBeingEdited = playlist
+                                },
+                                onDelete: {
+                                    playlistPendingDelete = playlist
                                 }
                             )
                         }
                     }
-                    .padding(.horizontal, 24)
+                    .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
                 }
             }
             .padding(.bottom, 60)
+            .background(alignment: .top) {
+                YMScrollTopSentinel(
+                    coordinateSpaceName: "playlists_grid_scroll",
+                    threshold: 52,
+                    isScrolled: $isGridScrolled
+                )
+            }
+        }
+        .coordinateSpace(name: "playlists_grid_scroll")
+        .overlay(alignment: .top) {
+            YMStickyTopBar(title: "Плейлисты", isVisible: isGridScrolled)
+        }
+    }
+
+    @ViewBuilder
+    private var playlistsTitleBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Плейлисты")
+                .font(.system(size: windowState.isCompactWidth ? 24 : 28, weight: .bold))
+                .foregroundStyle(YMTheme.fg)
+
+            Text("Ваша коллекция плейлистов и подборки")
+                .font(.subheadline)
+                .foregroundStyle(YMTheme.fg60)
+        }
+    }
+
+    @ViewBuilder
+    private func playlistsHeaderActions(compact: Bool) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                isCreateSheetPresented = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .bold))
+                    Text(compact ? "Создать" : "Создать плейлист")
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 32))
+
+            Button {
+                loadPlaylists()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                    if !compact {
+                        Text("Обновить")
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
+            }
+            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
+            .disabled(isLoadingPlaylists)
+            .help("Обновить список плейлистов")
         }
     }
 
@@ -156,100 +271,94 @@ public struct PlaylistsView: View {
     private func playlistDetailView(playlist: YMPlaylist) -> some View {
         ScrollView(.vertical) {
             VStack(spacing: 0) {
-                // Top Navigation Bar
-                HStack(spacing: 12) {
-                    Button {
-                        playlistDetailTask?.cancel()
-                        selectedPlaylist = nil
-                        playlistTracks = []
-                        playlistFilterQuery = ""
-                        errorMessage = nil
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text("Все плейлисты")
-                                .font(.system(size: 13, weight: .medium))
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(YMTheme.surfaceComponent))
-                        .overlay(Capsule().strokeBorder(YMTheme.border, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-
-                    Text(playlist.title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(YMTheme.fg60)
-
-                    Spacer()
-                }
-                .padding(.top, 16)
-                .padding(.horizontal, 24)
-                .padding(.bottom, 8)
-
-                // Playlist Hero Header
-                HStack(alignment: .bottom, spacing: 24) {
+                // Playlist Hero Header with atmospheric cover glow
+                let coverSize: CGFloat = windowState.isMiniWidth ? 80 : (windowState.isCompactWidth ? 96 : 150)
+                HStack(alignment: .bottom, spacing: windowState.isCompactWidth ? 16 : 24) {
                     CachedCoverImage(
                         coverUri: playlist.coverUri,
                         size: .large,
-                        displaySize: 150,
-                        cornerRadius: YMTheme.cornerRadiusMedium
+                        displaySize: coverSize,
+                        cornerRadius: YMTheme.cornerRadiusLarge
                     )
-                    .frame(width: 150, height: 150)
-                    .shadow(color: .black.opacity(0.4), radius: 18, y: 8)
+                    .frame(width: coverSize, height: coverSize)
+                    .shadow(color: YMTheme.shadowColor, radius: 18, y: 8)
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("ПЛЕЙЛИСТ")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(YMTheme.fg40)
-                            .tracking(1.2)
+                    VStack(alignment: .leading, spacing: windowState.isCompactWidth ? 6 : 8) {
+                        HStack(spacing: 8) {
+                            Text("ПЛЕЙЛИСТ")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(YMTheme.fg40)
+                                .tracking(1.2)
+
+                            if playlist.isPrivate {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "lock.fill")
+                                        .font(.system(size: 9))
+                                    Text("Приватный")
+                                        .font(.system(size: 10, weight: .semibold))
+                                }
+                                .foregroundStyle(YMTheme.fg60)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(YMTheme.surfaceComponent))
+                            }
+                        }
 
                         Text(playlist.title)
-                            .font(.system(size: 28, weight: .bold))
+                            .font(.system(size: windowState.isCompactWidth ? 22 : 28, weight: .bold))
                             .foregroundStyle(YMTheme.fg)
                             .lineLimit(2)
 
-                        if let count = playlist.trackCount {
-                            Text("\(count) треков")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(YMTheme.fg60)
+                        if let desc = playlist.description, !desc.isEmpty {
+                            Text(desc)
+                                .font(.system(size: 13))
+                                .foregroundStyle(YMTheme.fg80)
+                                .lineLimit(3)
                         }
 
-                        // Actions
-                        HStack(spacing: 12) {
-                            Button {
-                                audioEngine.isWaveMode = false
-                                audioEngine.setQueue(displayedPlaylistTracks, startingAt: 0)
-                            } label: {
-                                Label("Слушать всё", systemImage: "play.fill")
-                            }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 34))
-                            .disabled(displayedPlaylistTracks.isEmpty)
+                        let effectiveCount = playlistTracks.isEmpty ? (playlist.trackCount ?? 0) : playlistTracks.count
+                        Text("\(effectiveCount) треков")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(YMTheme.fg60)
+                            .lineLimit(1)
 
-                            Button {
-                                audioEngine.playShuffled(displayedPlaylistTracks)
-                            } label: {
-                                Label("Перемешать", systemImage: "shuffle")
+                        // Adaptive Actions Bar
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 10) {
+                                playlistPlayButton(title: "Слушать всё", height: 34)
+                                playlistShuffleButton(title: "Перемешать", height: 34)
+                                playlistWaveButton(playlist: playlist, title: "Волна по плейлисту", height: 34)
+                                playlistEditButton(playlist: playlist, height: 34)
+                                playlistDeleteButton(playlist: playlist, height: 34)
                             }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 34))
-                            .disabled(displayedPlaylistTracks.isEmpty)
 
-                            Button {
-                                audioEngine.startWave(forPlaylist: playlist, tracks: playlistTracks)
-                            } label: {
-                                Label("Волна по плейлисту", systemImage: "waveform.path.ecg")
+                            HStack(spacing: 8) {
+                                playlistPlayButton(title: "Слушать", height: 30)
+                                playlistShuffleButton(title: "Микс", height: 30)
+                                playlistWaveButton(playlist: playlist, title: "Волна", height: 30)
+                                playlistEditButton(playlist: playlist, height: 30)
+                                playlistDeleteButton(playlist: playlist, height: 30)
                             }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 34))
-                            .disabled(playlistTracks.isEmpty)
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    playlistPlayButton(title: "Слушать", height: 30)
+                                    playlistShuffleButton(title: "Микс", height: 30)
+                                    playlistEditButton(playlist: playlist, height: 30)
+                                    playlistDeleteButton(playlist: playlist, height: 30)
+                                }
+                                playlistWaveButton(playlist: playlist, title: "Волна по плейлисту", height: 30)
+                            }
                         }
                         .padding(.top, 4)
                     }
 
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 14)
+                .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
+                .padding(.top, 52)
+                .padding(.bottom, 16)
+                .ymAmbientCoverGlow(coverUri: playlist.coverUri, opacity: 0.24)
 
                 // Filter Bar inside playlist
                 HStack(spacing: 10) {
@@ -271,12 +380,12 @@ public struct PlaylistsView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
                 .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(YMTheme.surface)
-                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(YMTheme.border, lineWidth: 1))
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(YMTheme.surfaceComponent)
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(YMTheme.border, lineWidth: 1))
                 )
                 .padding(.horizontal, 24)
                 .padding(.bottom, 10)
@@ -284,6 +393,21 @@ public struct PlaylistsView: View {
                 Divider()
                     .overlay(YMTheme.border)
                     .padding(.horizontal, 24)
+
+                if let detailError = detailErrorMessage {
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text(detailError)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.1)))
+                    .padding(.horizontal, 24)
+                    .padding(.top, 10)
+                }
 
                 if isLoadingTracks && playlistTracks.isEmpty {
                     VStack(spacing: 14) {
@@ -298,9 +422,16 @@ public struct PlaylistsView: View {
                         Image(systemName: "music.note")
                             .font(.system(size: 36))
                             .foregroundStyle(YMTheme.fg40)
-                        Text(playlistFilterQuery.isEmpty ? "В плейлисте нет треков" : "Ничего не найдено по запросу")
+                        Text(playlistFilterQuery.isEmpty ? "В плейлисте пока нет треков" : "Ничего не найдено по запросу")
                             .font(.headline)
                             .foregroundStyle(YMTheme.fg)
+                        if playlistFilterQuery.isEmpty {
+                            Text("Нажмите правой кнопкой на любой трек в приложении и выберите «Добавить в плейлист»")
+                                .font(.subheadline)
+                                .foregroundStyle(YMTheme.fg60)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 28)
+                        }
                     }
                     .frame(maxWidth: .infinity, minHeight: 200)
                 } else {
@@ -311,68 +442,169 @@ public struct PlaylistsView: View {
                             if let idx = displayedPlaylistTracks.firstIndex(where: { $0.id == track.id }) {
                                 audioEngine.setQueue(displayedPlaylistTracks, startingAt: idx)
                             }
+                        },
+                        onRemoveFromPlaylist: { track, _ in
+                            removeTrackFromSelectedPlaylist(track: track, playlist: playlist)
                         }
                     )
                     .padding(.horizontal, 14)
                 }
             }
             .padding(.bottom, 80)
+            .background(alignment: .top) {
+                YMScrollTopSentinel(
+                    coordinateSpaceName: "playlist_detail_scroll",
+                    threshold: 84,
+                    isScrolled: $isDetailScrolled
+                )
+            }
         }
+        .coordinateSpace(name: "playlist_detail_scroll")
+        .overlay(alignment: .top) {
+            YMStickyDetailTopBar(
+                backTitle: "Все плейлисты",
+                title: playlist.title,
+                isScrolled: isDetailScrolled
+            ) {
+                playlistDetailTask?.cancel()
+                selectedPlaylist = nil
+                playlistTracks = []
+                playlistFilterQuery = ""
+                detailErrorMessage = nil
+                isDetailScrolled = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func playlistPlayButton(title: String, height: CGFloat) -> some View {
+        Button {
+            audioEngine.isWaveMode = false
+            audioEngine.setQueue(displayedPlaylistTracks, startingAt: 0)
+        } label: {
+            Label(title, systemImage: "play.fill")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: height))
+        .disabled(displayedPlaylistTracks.isEmpty)
+    }
+
+    @ViewBuilder
+    private func playlistShuffleButton(title: String, height: CGFloat) -> some View {
+        Button {
+            audioEngine.playShuffled(displayedPlaylistTracks)
+        } label: {
+            Label(title, systemImage: "shuffle")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .disabled(displayedPlaylistTracks.isEmpty)
+    }
+
+    @ViewBuilder
+    private func playlistWaveButton(playlist: YMPlaylist, title: String, height: CGFloat) -> some View {
+        Button {
+            audioEngine.startWave(forPlaylist: playlist, tracks: playlistTracks)
+        } label: {
+            Label(title, systemImage: "waveform.path.ecg")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .disabled(playlistTracks.isEmpty)
+    }
+
+    @ViewBuilder
+    private func playlistEditButton(playlist: YMPlaylist, height: CGFloat) -> some View {
+        Button {
+            playlistBeingEdited = playlist
+        } label: {
+            Image(systemName: "pencil")
+                .font(.system(size: 12.5, weight: .semibold))
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .help("Изменить название, описание или приватность")
+    }
+
+    @ViewBuilder
+    private func playlistDeleteButton(playlist: YMPlaylist, height: CGFloat) -> some View {
+        Button {
+            playlistPendingDelete = playlist
+        } label: {
+            Image(systemName: "trash")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(Color.red.opacity(0.85))
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .help("Удалить плейлист")
     }
 
     // MARK: - Actions & Loading
 
     private func loadPlaylists() {
-        isLoadingPlaylists = true
-        errorMessage = nil
-
         Task {
-            guard let uid = AuthService.shared.currentUser?.userId ?? (try? keychain.getString(for: .userId)) else {
-                await MainActor.run {
-                    self.errorMessage = "Не удалось определить ID пользователя"
-                    self.isLoadingPlaylists = false
-                }
-                return
-            }
+            await playlistsService.loadPlaylists(force: true)
+        }
+    }
 
+    private func deletePlaylistConfirmed(_ playlist: YMPlaylist) {
+        playlistPendingDelete = nil
+        Task {
             do {
-                let fetched = try await networkClient.fetchUserPlaylists(uid: uid)
-                await MainActor.run {
-                    self.playlists = fetched
-                    self.isLoadingPlaylists = false
+                try await playlistsService.deletePlaylist(playlist)
+                if selectedPlaylist?.id == playlist.id {
+                    playlistDetailTask?.cancel()
+                    selectedPlaylist = nil
+                    playlistTracks = []
+                    playlistFilterQuery = ""
+                    detailErrorMessage = nil
+                    isDetailScrolled = false
                 }
+                playlistsService.showToast("Плейлист «\(playlist.title)» удалён")
             } catch {
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.isLoadingPlaylists = false
+                detailErrorMessage = "Не удалось удалить плейлист: \(error.localizedDescription)"
+                playlistsService.showToast("Ошибка удаления плейлиста")
+            }
+        }
+    }
+
+    private func removeTrackFromSelectedPlaylist(track: YMTrack, playlist: YMPlaylist) {
+        guard let originalIdx = playlistTracks.firstIndex(where: { $0.id == track.id }) else { return }
+        let removedTrack = playlistTracks.remove(at: originalIdx)
+        Task {
+            do {
+                let updated = try await playlistsService.removeTrack(at: originalIdx, from: playlist)
+                if selectedPlaylist?.id == updated.id {
+                    selectedPlaylist = updated
                 }
+                playlistsService.showToast("Трек удалён из «\(playlist.title)»")
+            } catch {
+                // Rollback optimistic removal on failure
+                let insertIdx = min(originalIdx, playlistTracks.count)
+                playlistTracks.insert(removedTrack, at: insertIdx)
+                detailErrorMessage = "Не удалось удалить трек: \(error.localizedDescription)"
             }
         }
     }
 
     private func selectPlaylist(_ playlist: YMPlaylist) {
         playlistDetailTask?.cancel()
+        isDetailScrolled = false
         selectedPlaylist = playlist
         playlistTracks = []
         isLoadingTracks = true
-        errorMessage = nil
+        detailErrorMessage = nil
         let targetPlaylistId = playlist.id
 
         playlistDetailTask = Task {
             do {
                 let details = try await networkClient.fetchPlaylistDetails(uid: playlist.uid, kind: playlist.kind)
-                var resolvedTracks: [YMTrack] = []
-                if let detailedTracks = details.tracks, !detailedTracks.isEmpty {
-                    resolvedTracks = detailedTracks.compactMap { $0.track }
-                    if resolvedTracks.isEmpty {
-                        let ids = detailedTracks.map { String($0.id) }
-                        resolvedTracks = try await networkClient.fetchTracks(trackIds: ids)
-                    }
-                }
+                let resolvedTracks = try await resolveAllTracks(from: details.tracks ?? [])
 
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
                     guard self.selectedPlaylist?.id == targetPlaylistId else { return }
+                    self.selectedPlaylist = details
+                    self.playlistsService.upsertPlaylist(details, insertAtTop: false)
                     self.playlistTracks = resolvedTracks
                     self.isLoadingTracks = false
                 }
@@ -380,10 +612,31 @@ public struct PlaylistsView: View {
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
                     guard self.selectedPlaylist?.id == targetPlaylistId else { return }
-                    self.errorMessage = "Не удалось загрузить плейлист: \(error.localizedDescription)"
+                    self.detailErrorMessage = "Не удалось загрузить плейлист: \(error.localizedDescription)"
                     self.isLoadingTracks = false
                 }
             }
+        }
+    }
+
+    private func resolveAllTracks(from detailedTracks: [YMTrackShort]) async throws -> [YMTrack] {
+        guard !detailedTracks.isEmpty else { return [] }
+        let missingIds = detailedTracks.compactMap { $0.track == nil ? String($0.id) : nil }
+        if missingIds.isEmpty {
+            return detailedTracks.compactMap(\.track)
+        }
+        let fetchedMissing = try await networkClient.fetchTracks(trackIds: missingIds)
+        var fetchedById: [String: YMTrack] = [:]
+        for track in fetchedMissing {
+            fetchedById[track.id] = track
+            if let colon = track.id.firstIndex(of: ":") {
+                fetchedById[String(track.id[..<colon])] = track
+            }
+        }
+        return detailedTracks.compactMap { short in
+            if let direct = short.track { return direct }
+            let cleanId = short.id.components(separatedBy: ":").first ?? short.id
+            return fetchedById[short.id] ?? fetchedById[cleanId]
         }
     }
 
@@ -391,14 +644,7 @@ public struct PlaylistsView: View {
         Task {
             do {
                 let details = try await networkClient.fetchPlaylistDetails(uid: playlist.uid, kind: playlist.kind)
-                var resolvedTracks: [YMTrack] = []
-                if let detailedTracks = details.tracks, !detailedTracks.isEmpty {
-                    resolvedTracks = detailedTracks.compactMap { $0.track }
-                    if resolvedTracks.isEmpty {
-                        let ids = detailedTracks.map { String($0.id) }
-                        resolvedTracks = try await networkClient.fetchTracks(trackIds: ids)
-                    }
-                }
+                let resolvedTracks = try await resolveAllTracks(from: details.tracks ?? [])
 
                 guard !resolvedTracks.isEmpty else { return }
 
@@ -428,6 +674,8 @@ private struct PlaylistCardItem: View {
     let onPlay: () -> Void
     let onShuffle: () -> Void
     let onWave: () -> Void
+    let onEdit: () -> Void
+    let onDelete: () -> Void
 
     @UIState private var isHovered = false
 
@@ -445,6 +693,16 @@ private struct PlaylistCardItem: View {
                     )
                     .frame(width: cardSize, height: cardSize)
                     .ymCardHover(cornerRadius: YMTheme.cornerRadiusMedium, scale: 1.04)
+
+                    if playlist.isPrivate {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(6)
+                            .background(Circle().fill(Color.black.opacity(0.55)))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                            .padding(6)
+                    }
 
                     if isHovered {
                         Button {
@@ -470,7 +728,12 @@ private struct PlaylistCardItem: View {
                         .foregroundStyle(isHovered ? YMTheme.accent : YMTheme.fg)
                         .lineLimit(1)
 
-                    if let count = playlist.trackCount {
+                    if let desc = playlist.description, !desc.isEmpty {
+                        Text(desc)
+                            .font(.system(size: 11))
+                            .foregroundStyle(YMTheme.fg60)
+                            .lineLimit(1)
+                    } else if let count = playlist.trackCount {
                         Text("\(count) треков")
                             .font(.caption)
                             .foregroundStyle(YMTheme.fg40)
@@ -484,6 +747,9 @@ private struct PlaylistCardItem: View {
             Button("Слушать плейлист", action: onPlay)
             Button("Перемешать", action: onShuffle)
             Button("Запустить волну по плейлисту", action: onWave)
+            Divider()
+            Button("Изменить плейлист...", action: onEdit)
+            Button("Удалить плейлист", role: .destructive, action: onDelete)
         }
     }
 }

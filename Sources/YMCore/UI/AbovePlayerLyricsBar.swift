@@ -1,14 +1,15 @@
 import SwiftUI
 
 /// Compact 3-line docked lyrics bar displayed directly above the bottom player bar.
-/// Features a gentle vertical transparency gradient (no solid plate or borders)
-/// with the active and neighboring lines perfectly centered over the playback controls.
+/// Features a gentle vertical transparency gradient (no solid plate or borders),
+/// isolated active-line updates, and quick toggle to fullscreen Now Playing lyrics.
 public struct AbovePlayerLyricsBar: View {
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var windowState = WindowState.shared
     @UIState private var themeManager = YMThemeManager.shared
     @UIState private var syncedLyrics: YMSyncedLyrics? = nil
+    @UIState private var activeLineIndex: Int? = nil
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
 
@@ -18,10 +19,6 @@ public struct AbovePlayerLyricsBar: View {
 
     private var currentTrack: YMTrack? {
         coordinator.lyricsTrack ?? audioEngine.currentTrack
-    }
-
-    private var activeLineIndex: Int? {
-        syncedLyrics?.activeLineIndex(for: audioEngine.progressTracker.currentTime)
     }
 
     private var prevLine: SyncedLyricLine? {
@@ -122,15 +119,29 @@ public struct AbovePlayerLyricsBar: View {
                 }
             }
             .frame(maxWidth: 580)
-            .padding(.horizontal, 48)
+            .padding(.horizontal, 78)
             .animation(.easeInOut(duration: 0.22), value: activeLineIndex)
 
-            // Right: Subtle Close Button pinned to trailing edge (does not displace center alignment)
-            HStack {
+            // Right: Expand to Fullscreen + Close buttons pinned to trailing edge
+            HStack(spacing: 8) {
                 Spacer()
 
                 Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                        coordinator.lyricsPosition = .right
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(YMTheme.fg80)
+                        .padding(6)
+                        .background(Circle().fill(YMTheme.surfaceComponent))
+                }
+                .buttonStyle(.plain)
+                .help("Развернуть текст песни на весь экран")
+
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
                         coordinator.isLyricsPresented = false
                         coordinator.lyricsTrack = nil
                     }
@@ -143,24 +154,32 @@ public struct AbovePlayerLyricsBar: View {
                 }
                 .buttonStyle(.plain)
                 .help("Закрыть текст песни (Esc)")
-                .padding(.trailing, windowState.isCompactWidth ? 12 : 20)
             }
+            .padding(.trailing, windowState.isCompactWidth ? 12 : 20)
         }
         .padding(.vertical, 4)
         .frame(height: 74)
         .frame(maxWidth: .infinity)
         .background {
-            // Light, airy vertical gradient fading down to the player bar without boxed plate borders
-            LinearGradient(
-                stops: [
-                    .init(color: baseGradientColor.opacity(0.0), location: 0.0),
-                    .init(color: baseGradientColor.opacity(0.20), location: 0.30),
-                    .init(color: baseGradientColor.opacity(0.60), location: 0.70),
-                    .init(color: baseGradientColor.opacity(0.90), location: 1.0)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+            ZStack {
+                // Light, airy vertical gradient fading down to the player bar without boxed plate borders
+                LinearGradient(
+                    stops: [
+                        .init(color: baseGradientColor.opacity(0.0), location: 0.0),
+                        .init(color: baseGradientColor.opacity(0.20), location: 0.30),
+                        .init(color: baseGradientColor.opacity(0.60), location: 0.70),
+                        .init(color: baseGradientColor.opacity(0.90), location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                // Isolated time observer avoids redrawing the bar on every playback timer tick
+                AbovePlayerLyricsTimeObserver(
+                    syncedLyrics: syncedLyrics,
+                    activeLineIndex: $activeLineIndex
+                )
+            }
         }
         .task(id: currentTrack?.id) {
             await loadLyricsAsync()
@@ -172,6 +191,7 @@ public struct AbovePlayerLyricsBar: View {
         guard let track = currentTrack else {
             isLoading = false
             syncedLyrics = nil
+            activeLineIndex = nil
             return
         }
 
@@ -179,11 +199,13 @@ public struct AbovePlayerLyricsBar: View {
         isLoading = true
         errorMessage = nil
         syncedLyrics = nil
+        activeLineIndex = nil
 
         do {
             if let synced = try await networkClient.fetchTrackLyricsLRC(trackId: requestedTrackId), !synced.isEmpty {
                 guard !Task.isCancelled, currentTrack?.id == requestedTrackId else { return }
                 self.syncedLyrics = synced
+                self.activeLineIndex = synced.activeLineIndex(for: audioEngine.progressTracker.currentTime)
                 self.isLoading = false
                 return
             }
@@ -207,5 +229,25 @@ public struct AbovePlayerLyricsBar: View {
             self.isLoading = false
             self.errorMessage = "Не удалось загрузить текст"
         }
+    }
+}
+
+/// Isolated 0x0 observer view updating `activeLineIndex` only when the active karaoke line actually changes.
+private struct AbovePlayerLyricsTimeObserver: View {
+    let syncedLyrics: YMSyncedLyrics?
+    @Binding var activeLineIndex: Int?
+    @UIState private var progressTracker = AudioPlayerEngine.shared.progressTracker
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: progressTracker.currentTime) { _, newTime in
+                let newIndex = syncedLyrics?.activeLineIndex(for: newTime)
+                if newIndex != activeLineIndex {
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        activeLineIndex = newIndex
+                    }
+                }
+            }
     }
 }

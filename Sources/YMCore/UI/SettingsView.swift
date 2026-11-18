@@ -6,10 +6,13 @@ public struct SettingsView: View {
     @UIState private var authService = AuthService.shared
     @UIState private var themeManager = YMThemeManager.shared
     @UIState private var coordinator = NavigationCoordinator.shared
+    @UIState private var windowState = WindowState.shared
+    @UIState private var rotorStore = RotorDiagnosticsStore.shared
     private let networkClient = YMNetworkClient.shared
 
     @UIState private var isMemoryCompressed = false
     @UIState private var isCacheCleared = false
+    @UIState private var isScrolled = false
 
     public init() {}
 
@@ -26,7 +29,7 @@ public struct SettingsView: View {
                         .font(.subheadline)
                         .foregroundStyle(YMTheme.fg60)
                 }
-                .padding(.top, 20)
+                .padding(.top, windowState.topChromeContentPadding)
 
                 Divider()
                     .overlay(YMTheme.border)
@@ -36,6 +39,7 @@ public struct SettingsView: View {
                     VStack(spacing: 8) {
                         ForEach(YMAppTheme.allCases) { theme in
                             let isSelected = themeManager.currentTheme == theme
+                            let previewPalette = YMTheme.palette(for: theme)
                             Button {
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     themeManager.setTheme(theme)
@@ -59,9 +63,26 @@ public struct SettingsView: View {
 
                                     Spacer()
 
+                                    // 3 overlapping palette swatches: background, surface card, accent
+                                    HStack(spacing: -5) {
+                                        Circle()
+                                            .fill(previewPalette.bg)
+                                            .frame(width: 14, height: 14)
+                                            .overlay(Circle().strokeBorder(YMTheme.borderHover, lineWidth: 1))
+                                        Circle()
+                                            .fill(previewPalette.surface)
+                                            .frame(width: 14, height: 14)
+                                            .overlay(Circle().strokeBorder(YMTheme.borderHover, lineWidth: 1))
+                                        Circle()
+                                            .fill(previewPalette.accent)
+                                            .frame(width: 14, height: 14)
+                                            .overlay(Circle().strokeBorder(YMTheme.borderHover, lineWidth: 1))
+                                    }
+                                    .padding(.trailing, 4)
+
                                     ZStack {
                                         Circle()
-                                            .strokeBorder(isSelected ? YMTheme.accent : YMTheme.border, lineWidth: 1.5)
+                                            .strokeBorder(isSelected ? YMTheme.accent : YMTheme.borderHover, lineWidth: 1.5)
                                             .frame(width: 18, height: 18)
 
                                         if isSelected {
@@ -74,11 +95,11 @@ public struct SettingsView: View {
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 10)
                                 .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
                                         .fill(isSelected ? YMTheme.surfaceComponentHover : Color.clear)
                                         .overlay(
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .strokeBorder(isSelected ? YMTheme.borderHover : Color.clear, lineWidth: 1)
+                                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                .strokeBorder(isSelected ? YMTheme.border : Color.clear, lineWidth: 1)
                                         )
                                 )
                                 .contentShape(Rectangle())
@@ -86,7 +107,7 @@ public struct SettingsView: View {
                             .buttonStyle(.plain)
                         }
                     }
-                    .frame(maxWidth: 440)
+                    .frame(maxWidth: 460)
                 }
 
                 // Section 0.5: Lyrics & Karaoke Position
@@ -208,37 +229,119 @@ public struct SettingsView: View {
                 // Section 2: Audio & Streaming Quality Card
                 settingsCard(title: "Качество звука и стриминг") {
                     VStack(alignment: .leading, spacing: 16) {
-                        HStack(spacing: 12) {
-                            Text("Пресет качества звука:")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(YMTheme.fg80)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 12) {
+                                Text("Пресет качества звука:")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(YMTheme.fg80)
+                                    .fixedSize(horizontal: true, vertical: false)
 
-                            YMPopupMenu(
-                                selectedTitle: audioEngine.qualitySettings.preset.title,
-                                options: YMAudioQualityPreset.allCases.map { ($0, $0.title) },
-                                selection: Binding(
-                                    get: { audioEngine.qualitySettings.preset },
-                                    set: { audioEngine.setAudioQualityPreset($0) }
-                                ),
-                                width: 250
-                            )
+                                YMPopupMenu(
+                                    selectedTitle: audioEngine.qualitySettings.preset.title,
+                                    options: YMAudioQualityPreset.allCases.map { ($0, $0.title) },
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.preset },
+                                        set: { audioEngine.setAudioQualityPreset($0) }
+                                    ),
+                                    width: 250
+                                )
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Пресет качества звука:")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(YMTheme.fg80)
+
+                                YMPopupMenu(
+                                    selectedTitle: audioEngine.qualitySettings.preset.title,
+                                    options: YMAudioQualityPreset.allCases.map { ($0, $0.title) },
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.preset },
+                                        set: { audioEngine.setAudioQualityPreset($0) }
+                                    ),
+                                    width: 250
+                                )
+                            }
                         }
 
-                        HStack(spacing: 12) {
-                            Text("Предпочитаемый кодек:")
-                                .font(.system(size: 13))
-                                .foregroundStyle(YMTheme.fg80)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 12) {
+                                Text("Предпочитаемый кодек:")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(YMTheme.fg80)
+                                    .fixedSize(horizontal: true, vertical: false)
 
-                            YMPopupMenu(
-                                selectedTitle: audioEngine.qualitySettings.codecPreference.title,
-                                options: YMAudioCodecPreference.allCases.map { ($0, $0.title) },
-                                selection: Binding(
-                                    get: { audioEngine.qualitySettings.codecPreference },
-                                    set: { audioEngine.setCodecPreference($0) }
-                                ),
-                                width: 220
-                            )
+                                YMPopupMenu(
+                                    selectedTitle: audioEngine.qualitySettings.codecPreference.title,
+                                    options: YMAudioCodecPreference.allCases.map { ($0, $0.title) },
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.codecPreference },
+                                        set: { audioEngine.setCodecPreference($0) }
+                                    ),
+                                    width: 220
+                                )
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Предпочитаемый кодек:")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(YMTheme.fg80)
+
+                                YMPopupMenu(
+                                    selectedTitle: audioEngine.qualitySettings.codecPreference.title,
+                                    options: YMAudioCodecPreference.allCases.map { ($0, $0.title) },
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.codecPreference },
+                                        set: { audioEngine.setCodecPreference($0) }
+                                    ),
+                                    width: 220
+                                )
+                            }
                         }
+
+                        Divider()
+                            .overlay(YMTheme.border)
+
+                        // Crossfade duration slider (0.0 ... 12.0 sec, 0.5 sec snap on release)
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Плавный переход между треками (Crossfade)")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(YMTheme.fg)
+
+                                Spacer()
+
+                                let duration = audioEngine.qualitySettings.crossfadeDuration
+                                Text(duration < 0.25 ? "Выключен" : String(format: "%.1f сек", duration))
+                                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                                    .foregroundStyle(duration < 0.25 ? YMTheme.fg40 : YMTheme.accent)
+                            }
+
+                            YMSlider(
+                                value: Binding(
+                                    get: { audioEngine.qualitySettings.crossfadeDuration },
+                                    set: { audioEngine.qualitySettings.setCrossfadeDuration($0) }
+                                ),
+                                in: 0...12,
+                                activeColor: YMTheme.accent,
+                                trackColor: YMTheme.surfaceComponentHover,
+                                height: 4,
+                                onEditingChanged: { editing in
+                                    if !editing {
+                                        let snapped = (audioEngine.qualitySettings.crossfadeDuration * 2.0).rounded() / 2.0
+                                        audioEngine.qualitySettings.setCrossfadeDuration(snapped < 0.5 ? 0.0 : snapped)
+                                    }
+                                }
+                            )
+                            .frame(maxWidth: 420)
+
+                            Text("Плавно затухает завершающийся трек и вводит следующий по кривой равной мощности (до 12 сек).")
+                                .font(.caption)
+                                .foregroundStyle(YMTheme.fg40)
+                        }
+
+                        Divider()
+                            .overlay(YMTheme.border)
 
                         Toggle(isOn: Binding(
                             get: { audioEngine.qualitySettings.preloadAllFavoritesInBackground },
@@ -264,42 +367,61 @@ public struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(YMTheme.fg60)
 
-                        HStack(spacing: 12) {
-                            Text("Лимит кэша обложек в памяти:")
-                                .font(.system(size: 13))
-                                .foregroundStyle(YMTheme.fg80)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 12) {
+                                Text("Лимит кэша обложек в памяти:")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(YMTheme.fg80)
+                                    .fixedSize(horizontal: true, vertical: false)
 
-                            YMPopupMenu(
-                                selectedTitle: cacheLimitTitle(audioEngine.qualitySettings.imageCacheLimitMB),
-                                options: [
-                                    (10, "10 МБ"),
-                                    (15, "15 МБ (По умолчанию)"),
-                                    (20, "20 МБ"),
-                                    (50, "50 МБ")
-                                ],
-                                selection: Binding(
-                                    get: { audioEngine.qualitySettings.imageCacheLimitMB },
-                                    set: { audioEngine.qualitySettings.setImageCacheLimitMB($0) }
-                                ),
-                                width: 200
-                            )
+                                YMPopupMenu(
+                                    selectedTitle: cacheLimitTitle(audioEngine.qualitySettings.imageCacheLimitMB),
+                                    options: [
+                                        (10, "10 МБ"),
+                                        (15, "15 МБ (По умолчанию)"),
+                                        (20, "20 МБ"),
+                                        (50, "50 МБ")
+                                    ],
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.imageCacheLimitMB },
+                                        set: { audioEngine.qualitySettings.setImageCacheLimitMB($0) }
+                                    ),
+                                    width: 200
+                                )
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Лимит кэша обложек в памяти:")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(YMTheme.fg80)
+
+                                YMPopupMenu(
+                                    selectedTitle: cacheLimitTitle(audioEngine.qualitySettings.imageCacheLimitMB),
+                                    options: [
+                                        (10, "10 МБ"),
+                                        (15, "15 МБ (По умолчанию)"),
+                                        (20, "20 МБ"),
+                                        (50, "50 МБ")
+                                    ],
+                                    selection: Binding(
+                                        get: { audioEngine.qualitySettings.imageCacheLimitMB },
+                                        set: { audioEngine.qualitySettings.setImageCacheLimitMB($0) }
+                                    ),
+                                    width: 200
+                                )
+                            }
                         }
 
-                        HStack(spacing: 12) {
-                            Button("Выгрузить неиспользуемую память") {
-                                audioEngine.qualitySettings.purgeUnusedMemory()
-                                isMemoryCompressed = true
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 12) {
+                                purgeMemoryButton
+                                clearDiskCacheButton
                             }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 32))
 
-                            Button("Очистить дисковый кэш") {
-                                Task {
-                                    await networkClient.clearCache()
-                                    await ImagePipeline.shared.clearCache()
-                                    isCacheCleared = true
-                                }
+                            VStack(alignment: .leading, spacing: 8) {
+                                purgeMemoryButton
+                                clearDiskCacheButton
                             }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
                         }
 
                         if isMemoryCompressed {
@@ -315,11 +437,301 @@ public struct SettingsView: View {
                         }
                     }
                 }
+
+                // Section 4: My Wave Algorithms & Rotor API Diagnostics (Bottom Card)
+                rotorDiagnosticsCard
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 60)
+            .background(alignment: .top) {
+                YMScrollTopSentinel(
+                    coordinateSpaceName: "settings_scroll",
+                    threshold: 48,
+                    isScrolled: $isScrolled
+                )
+            }
+        }
+        .coordinateSpace(name: "settings_scroll")
+        .overlay(alignment: .top) {
+            YMStickyTopBar(title: "Настройки", isVisible: isScrolled)
         }
         .ymScreenBackground()
+    }
+
+    @ViewBuilder
+    private var rotorDiagnosticsCard: some View {
+        let diag = rotorStore.diagnostics
+        let statusColor: Color = if diag.activeLevel == 1 && !diag.isFallbackActive {
+            Color(red: 52 / 255, green: 199 / 255, blue: 89 / 255)
+        } else if diag.isFallbackActive {
+            YMTheme.accent
+        } else {
+            YMTheme.fg40
+        }
+
+        settingsCard(title: "Алгоритмы «Моей волны» и Rotor API") {
+            VStack(alignment: .leading, spacing: 14) {
+                // 1. Protocol Mode Picker
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        Text("Режим протокола Rotor API:")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(YMTheme.fg80)
+                            .fixedSize(horizontal: true, vertical: false)
+
+                        rotorModePicker
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Режим протокола Rotor API:")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(YMTheme.fg80)
+
+                        rotorModePicker
+                    }
+                }
+
+                Divider()
+                    .overlay(YMTheme.border)
+
+                // 2. Active Protocol Status Badge
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+
+                        Text(diag.isFallbackActive ? "Активен резервный уровень (Fallback)" : (diag.activeLevel == 1 ? "Активен основной протокол" : "Ожидание запуска волны"))
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(statusColor)
+
+                        Spacer(minLength: 8)
+
+                        if diag.fetchedTracksCount > 0 || diag.filteredDuplicatesCount > 0 {
+                            Text("Загружено: \(diag.fetchedTracksCount) • Дублей отфильтровано: \(diag.filteredDuplicatesCount)")
+                                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                                .foregroundStyle(YMTheme.fg60)
+                        }
+                    }
+
+                    Text(diag.activeProtocol)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(YMTheme.fg)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(YMTheme.surfaceComponent)
+                        )
+
+                    // Session metadata
+                    VStack(alignment: .leading, spacing: 4) {
+                        rotorMetaRow(label: "radioSessionId:", value: diag.sessionId ?? "—")
+                        rotorMetaRow(label: "batchId:", value: diag.batchId ?? "—")
+                        rotorMetaRow(
+                            label: "Активные seeds:",
+                            value: diag.activeSeeds.isEmpty ? "—" : diag.activeSeeds.joined(separator: ", ")
+                        )
+                    }
+                    .padding(.top, 2)
+                }
+
+                Divider()
+                    .overlay(YMTheme.border)
+
+                // 3. Supported 4-Level Fallback Chain
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Цепочка протоколов и уровней Fallback (по приоритету):")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(YMTheme.fg80)
+
+                    rotorFallbackLevelRow(
+                        level: 1,
+                        activeLevel: diag.activeLevel,
+                        isPrimary: true,
+                        title: "Уровень 1 (Основной): Rotor Session v2",
+                        detail: "POST /rotor/session/new и /tracks — персональная ML-модель волны и комбинированные сиды"
+                    )
+
+                    rotorFallbackLevelRow(
+                        level: 2,
+                        activeLevel: diag.activeLevel,
+                        isPrimary: false,
+                        title: "Уровень 2 (Резерв сидов v2): Rotor Session v2 Simplified",
+                        detail: "Повторная инициализация v2 с базовыми сидами при ошибке составного контекста"
+                    )
+
+                    rotorFallbackLevelRow(
+                        level: 3,
+                        activeLevel: diag.activeLevel,
+                        isPrimary: false,
+                        title: "Уровень 3 (Резерв API v1): Rotor Station v1",
+                        detail: "GET /rotor/station/{stationId}/tracks?settings2=true — классический протокол радиостанций"
+                    )
+
+                    rotorFallbackLevelRow(
+                        level: 4,
+                        activeLevel: diag.activeLevel,
+                        isPrimary: false,
+                        title: "Уровень 4 (Базовый резерв): Default Personal Wave",
+                        detail: "GET /rotor/station/user:onyourwave/tracks?settings2=true — аварийный возврат к базовой персональной волне"
+                    )
+                }
+
+                // 4. Last Fallback Reason (if any)
+                if let reason = diag.lastFallbackReason, !reason.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(YMTheme.accent)
+                            .padding(.top, 1)
+
+                        Text("Причина последнего переключения: \(reason)")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(YMTheme.fg80)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(YMTheme.accent.opacity(0.10))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .strokeBorder(YMTheme.accent.opacity(0.25), lineWidth: 1)
+                            )
+                    )
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var rotorModePicker: some View {
+        YMPopupMenu(
+            selectedTitle: rotorStore.preferredAPIMode.title,
+            options: YMRotorAPIMode.allCases.map { ($0, $0.title) },
+            selection: Binding(
+                get: { rotorStore.preferredAPIMode },
+                set: { newMode in
+                    rotorStore.preferredAPIMode = newMode
+                    Task {
+                        await RotorService.shared.setPreferredAPIMode(newMode)
+                    }
+                }
+            ),
+            width: 260
+        )
+    }
+
+    @ViewBuilder
+    private func rotorMetaRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(YMTheme.fg40)
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(YMTheme.fg80)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+    }
+
+    @ViewBuilder
+    private func rotorFallbackLevelRow(
+        level: Int,
+        activeLevel: Int,
+        isPrimary: Bool,
+        title: String,
+        detail: String
+    ) -> some View {
+        let isActive = (level == activeLevel)
+        let highlightColor: Color = isPrimary
+            ? Color(red: 52 / 255, green: 199 / 255, blue: 89 / 255)
+            : YMTheme.accent
+
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(isActive ? highlightColor.opacity(0.20) : YMTheme.surfaceComponent)
+                    .frame(width: 22, height: 22)
+
+                if isActive {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(highlightColor)
+                } else {
+                    Text("\(level)")
+                        .font(.system(size: 10, weight: .bold).monospacedDigit())
+                        .foregroundStyle(YMTheme.fg40)
+                }
+            }
+            .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.system(size: 12, weight: isActive ? .bold : .semibold))
+                        .foregroundStyle(isActive ? YMTheme.fg : YMTheme.fg80)
+
+                    if isActive {
+                        Text("АКТИВЕН")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(highlightColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(highlightColor.opacity(0.16)))
+                    }
+                }
+
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(YMTheme.fg40)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isActive ? highlightColor.opacity(0.08) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(isActive ? highlightColor.opacity(0.30) : YMTheme.border, lineWidth: 1)
+                )
+        )
+    }
+
+    @ViewBuilder
+    private var purgeMemoryButton: some View {
+        Button {
+            audioEngine.qualitySettings.purgeUnusedMemory()
+            isMemoryCompressed = true
+        } label: {
+            Text("Выгрузить неиспользуемую память")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 32))
+    }
+
+    @ViewBuilder
+    private var clearDiskCacheButton: some View {
+        Button {
+            Task {
+                await networkClient.clearCache()
+                await ImagePipeline.shared.clearCache()
+                isCacheCleared = true
+            }
+        } label: {
+            Text("Очистить дисковый кэш")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
     }
 
     private func settingsCard<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -391,11 +803,11 @@ private struct YMPopupMenu<T: Hashable>: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(YMTheme.isLight ? Color(red: 228 / 255, green: 226 / 255, blue: 220 / 255) : YMTheme.surface)
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(YMTheme.surfaceComponent)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .strokeBorder(YMTheme.borderHover, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(YMTheme.border, lineWidth: 1)
                     )
             )
         }

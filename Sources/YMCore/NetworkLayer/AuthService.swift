@@ -123,8 +123,8 @@ public final class AuthService {
             do {
                 try keychain.saveToken(token)
             } catch {
-                print("[AuthService] Warning: Failed to persist token in Keychain: \(error)")
-                self.errorMessage = "Предупреждение: не удалось сохранить токен в Связку ключей (\(error.localizedDescription)). Сессия не сохранится после перезапуска."
+                print("[AuthService] Warning: Failed to persist token in secure vault: \(error)")
+                self.errorMessage = "Предупреждение: не удалось сохранить токен в защищённое хранилище (\(error.localizedDescription)). Сессия не сохранится после перезапуска."
             }
             if let uid = status.userId {
                 try? keychain.saveUserId(uid)
@@ -176,6 +176,7 @@ public final class AuthService {
         AudioPlayerEngine.shared.stopAndClear()
         NowPlayingController.shared.clearNowPlaying()
         LikesService.shared.resetAll()
+        PlaylistsService.shared.resetAll()
 
         try? keychain.clearAll()
         Task {

@@ -6,11 +6,31 @@ import YMCore
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     weak var mainWindow: NSWindow?
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
         // Гарантируем, что приложение работает как полноценное GUI-приложение с иконкой в Dock
         NSApp.setActivationPolicy(.regular)
+        applyAppIconIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         configureMainWindowIfNeeded()
+        localizeSystemMenusToRussian()
+        DispatchQueue.main.async { [weak self] in
+            self?.localizeSystemMenusToRussian()
+        }
+    }
+
+    private func applyAppIconIfNeeded() {
+        if let icnsURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: icnsURL) {
+            NSApp.applicationIconImage = icon
+        } else if let pngURL = Bundle.module.url(forResource: "AppIcon", withExtension: "png"),
+                  let icon = NSImage(contentsOf: pngURL) {
+            NSApp.applicationIconImage = icon
+        }
     }
 
     /// Вызывается macOS при клике на иконку приложения в Dock
@@ -23,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         configureMainWindowIfNeeded()
+        localizeSystemMenusToRussian()
     }
 
     private var isClosingFromFullScreen = false
@@ -61,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func configureMainWindowIfNeeded() {
         for window in NSApp.windows where !(window is NSPanel) {
+            window.tabbingMode = .disallowed
             // Игнорируем вспомогательное окно Settings (Cmd + ,)
             if window.identifier?.rawValue.contains("Settings") == true || window.title.contains("Settings") || window.title.contains("Настройки") {
                 continue
@@ -91,6 +113,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
         }
     }
+
+    /// Translates standard AppKit/SwiftUI system menu items to Russian so the menu bar is localized
+    /// both when launched as an `.app` bundle and when launched directly as a raw SwiftPM binary.
+    func localizeSystemMenusToRussian() {
+        guard let mainMenu = NSApp.mainMenu else { return }
+
+        let topLevelTranslations: [String: String] = [
+            "File": "Файл",
+            "Edit": "Правка",
+            "View": "Вид",
+            "Window": "Окно",
+            "Help": "Справка"
+        ]
+
+        let itemTranslations: [String: String] = [
+            "About YandexMusicMac": "О приложении flow~",
+            "About flow~": "О приложении flow~",
+            "Settings…": "Настройки…",
+            "Settings...": "Настройки…",
+            "Preferences…": "Настройки…",
+            "Services": "Службы",
+            "Hide": "Скрыть",
+            "Hide YandexMusicMac": "Скрыть flow~",
+            "Hide flow~": "Скрыть flow~",
+            "Hide Others": "Скрыть остальные",
+            "Show All": "Показать все",
+            "Quit": "Завершить",
+            "Quit YandexMusicMac": "Завершить flow~",
+            "Quit flow~": "Завершить flow~",
+            "Close": "Закрыть",
+            "Undo": "Отменить",
+            "Redo": "Повторить",
+            "Cut": "Вырезать",
+            "Copy": "Копировать",
+            "Paste": "Вставить",
+            "Paste and Match Style": "Вставить с текущим стилем",
+            "Delete": "Удалить",
+            "Select All": "Выделить всё",
+            "Find": "Найти",
+            "Spelling and Grammar": "Правописание и грамматика",
+            "Substitutions": "Замены",
+            "Transformations": "Преобразования",
+            "Speech": "Речь",
+            "Start Dictation…": "Начать диктовку…",
+            "Emoji & Symbols": "Эмодзи и символы",
+            "Show Sidebar": "Показать боковое меню",
+            "Hide Sidebar": "Скрыть боковое меню",
+            "Enter Full Screen": "Перейти в полноэкранный режим",
+            "Exit Full Screen": "Выйти из полноэкранного режима",
+            "Minimize": "Свернуть",
+            "Zoom": "Изменить размер",
+            "Fill": "Заполнить",
+            "Center": "По центру",
+            "Move & Resize": "Переместить и изменить размер",
+            "Full Screen Tile": "Полноэкранная плитка",
+            "Remove Window from Set": "Удалить окно из набора",
+            "Show Tab Bar": "Показать панель вкладок",
+            "Show All Tabs": "Показать все вкладки",
+            "Bring All to Front": "Все окна на передний план"
+        ]
+
+        // Ensure application menu title is "flow~"
+        if let appMenuItem = mainMenu.items.first {
+            appMenuItem.title = "flow~"
+            appMenuItem.submenu?.title = "flow~"
+        }
+
+        func translateMenu(_ menu: NSMenu, isTopLevel: Bool) {
+            if let mapped = topLevelTranslations[menu.title] {
+                menu.title = mapped
+            }
+            for item in menu.items {
+                if isTopLevel, let mapped = topLevelTranslations[item.title] {
+                    item.title = mapped
+                } else if let mapped = itemTranslations[item.title] {
+                    item.title = mapped
+                } else if item.title.hasPrefix("About ") {
+                    item.title = "О приложении flow~"
+                } else if item.title.hasPrefix("Hide ") && item.title != "Hide Others" && item.title != "Hide Sidebar" {
+                    item.title = "Скрыть flow~"
+                } else if item.title.hasPrefix("Quit ") {
+                    item.title = "Завершить flow~"
+                } else if item.title.hasSuffix(" Help") {
+                    item.title = "Справка flow~"
+                }
+
+                if let submenu = item.submenu {
+                    if let mappedSub = topLevelTranslations[submenu.title] {
+                        submenu.title = mappedSub
+                    }
+                    translateMenu(submenu, isTopLevel: false)
+                }
+            }
+        }
+
+        translateMenu(mainMenu, isTopLevel: true)
+    }
 }
 
 @main
@@ -117,17 +236,14 @@ struct YandexMusicMacApp: App {
             .frame(minWidth: 440, minHeight: 320)
             .onAppear {
                 appDelegate.configureMainWindowIfNeeded()
+                appDelegate.localizeSystemMenusToRussian()
             }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1100, height: 720)
         .commands {
-            CommandMenu("Окно плеера") {
-                Button("Показать главное окно") {
-                    appDelegate.showMainWindow()
-                }
-                .keyboardShortcut("0", modifiers: [.command])
-            }
+            // Disable creating extra windows / tabs via ⌘N
+            CommandGroup(replacing: .newItem) {}
 
             CommandMenu("Воспроизведение") {
                 Button(AudioPlayerEngine.shared.isPlaying ? "Пауза" : "Воспроизведение") {
@@ -188,6 +304,11 @@ struct YandexMusicMacApp: App {
                 }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
 
+                Button(EqualizerSettings.shared.isEnabled ? "Выключить эквалайзер" : "Включить эквалайзер") {
+                    EqualizerSettings.shared.isEnabled.toggle()
+                }
+                .keyboardShortcut("e", modifiers: [.command])
+
                 Divider()
 
                 Menu("Качество звука") {
@@ -237,39 +358,6 @@ struct YandexMusicMacApp: App {
                     NavigationCoordinator.shared.selectSection(.settings)
                 }
                 .keyboardShortcut(",", modifiers: [.command])
-            }
-
-            CommandMenu("Память") {
-                Button(
-                    AudioQualitySettings.shared.preloadAllFavoritesInBackground
-                        ? "Отключить фоновую индексацию Избранного"
-                        : "Включить фоновую индексацию Избранного"
-                ) {
-                    AudioQualitySettings.shared.setPreloadFavoritesInBackground(
-                        !AudioQualitySettings.shared.preloadAllFavoritesInBackground
-                    )
-                }
-
-                Menu("Лимит кэша обложек") {
-                    Button("10 МБ") { AudioQualitySettings.shared.setImageCacheLimitMB(10) }
-                    Button("15 МБ (По умолчанию)") { AudioQualitySettings.shared.setImageCacheLimitMB(15) }
-                    Button("20 МБ") { AudioQualitySettings.shared.setImageCacheLimitMB(20) }
-                    Button("50 МБ") { AudioQualitySettings.shared.setImageCacheLimitMB(50) }
-                }
-
-                Divider()
-
-                Button("Сжать память (Выгрузить неиспользуемое)") {
-                    AudioQualitySettings.shared.purgeUnusedMemory()
-                }
-                .keyboardShortcut("k", modifiers: [.command, .shift])
-
-                Button("Очистить дисковый и сетевой кэш") {
-                    Task {
-                        await YMNetworkClient.shared.clearCache()
-                        await ImagePipeline.shared.clearCache()
-                    }
-                }
             }
         }
         Settings {

@@ -9,6 +9,7 @@ public final class WindowState {
     public static let shared = WindowState()
 
     public var isFullScreen: Bool = false
+    public var isSidebarVisible: Bool = true
     public var windowSize: CGSize = CGSize(width: 900, height: 620)
 
     /// Узкий режим окна (< 720 pt)
@@ -16,6 +17,15 @@ public final class WindowState {
 
     /// Сверхкомпактный режим (< 560 pt)
     public var isMiniWidth: Bool { windowSize.width < 560 }
+
+    /// True when the detail content starts beneath the macOS window traffic lights.
+    public var needsTopChromeClearance: Bool { !isFullScreen && !isSidebarVisible }
+
+    /// Unified top padding for screen headers so content never overlaps window traffic lights or sidebar toggle.
+    public var topChromeContentPadding: CGFloat { needsTopChromeClearance ? 48 : 20 }
+
+    /// Leading inset for top bars ("Назад", "Сейчас играет") to sit cleanly beside traffic lights and `sidebar.left`.
+    public var topToolbarLeadingInset: CGFloat { isSidebarVisible ? 24 : (isFullScreen ? 56 : 124) }
 
     @ObservationIgnored
     private var observers: [any NSObjectProtocol] = []

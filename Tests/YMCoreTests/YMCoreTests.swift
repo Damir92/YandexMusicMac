@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import AppKit
+import MediaPlayer
 @testable import YMCore
 
 @Test("Audio URL Signer MD5 computation with reference vectors")
@@ -149,9 +150,10 @@ func testSelectBestAudioStream() {
     #expect(best?.downloadInfoUrl.absoluteString == "https://example.com/320")
 }
 
-@Test("KeychainManager operations")
+@Test("KeychainManager operations, AES-GCM encryption at rest, and 0600 permissions")
 func testKeychainManager() throws {
-    let manager = KeychainManager(service: "com.yandexmusic.mac.tests.\(UUID().uuidString)")
+    let service = "com.yandexmusic.mac.tests.\(UUID().uuidString)"
+    let manager = KeychainManager(service: service)
     let token = "test_oauth_token_12345"
     let userId = "998877"
 
@@ -161,6 +163,22 @@ func testKeychainManager() throws {
     #expect(manager.getToken() == token)
     #expect(manager.getUserId() == userId)
 
+    // Verify encrypted on disk (no plaintext leak) and strict 0600 POSIX permissions
+    let vaultURL = manager.storageFileURL
+    let rawOnDisk = try Data(contentsOf: vaultURL)
+    let rawText = String(decoding: rawOnDisk, as: UTF8.self)
+    #expect(!rawText.contains(token))
+    #expect(!rawText.contains(userId))
+
+    let attrs = try FileManager.default.attributesOfItem(atPath: vaultURL.path)
+    let perms = attrs[.posixPermissions] as? NSNumber
+    #expect(perms?.intValue == 0o600)
+
+    // Verify persistence across a fresh manager instance (simulating app relaunch / rebuild)
+    let reloadedManager = KeychainManager(service: service)
+    #expect(reloadedManager.getToken() == token)
+    #expect(reloadedManager.getUserId() == userId)
+
     try manager.deleteToken()
     #expect(manager.getToken() == nil)
     #expect(manager.getUserId() == userId)
@@ -168,6 +186,7 @@ func testKeychainManager() throws {
     try manager.clearAll()
     #expect(manager.getToken() == nil)
     #expect(manager.getUserId() == nil)
+    #expect(!FileManager.default.fileExists(atPath: vaultURL.path))
 }
 
 // MARK: - Stage 2 Audio Engine Tests
@@ -945,23 +964,43 @@ func testRotorFeedbackExtendedEventTypes() throws {
     #expect(dislikeEventDict?["trackId"] as? String == "123:456")
 }
 
-@Test("WindowState responsive width thresholds")
+@Test("WindowState responsive width thresholds and top chrome clearance")
 @MainActor
 func testWindowStateBreakpoints() {
     let state = WindowState.shared
-    state.windowSize = CGSize(width: 900, height: 620)
+    state.windowSize = CGSize(width: 1100, height: 700)
+    state.isFullScreen = false
+    state.isSidebarVisible = true
     #expect(!state.isCompactWidth)
     #expect(!state.isMiniWidth)
+    #expect(!state.needsTopChromeClearance)
+    #expect(state.topChromeContentPadding == 20)
+    #expect(state.topToolbarLeadingInset == 24)
 
+    // Windowed with hidden sidebar: clearance beneath traffic lights + sidebar.left button
     state.windowSize = CGSize(width: 650, height: 500)
+    state.isSidebarVisible = false
     #expect(state.isCompactWidth)
     #expect(!state.isMiniWidth)
+    #expect(state.needsTopChromeClearance)
+    #expect(state.topChromeContentPadding == 48)
+    #expect(state.topToolbarLeadingInset == 124)
 
-    state.windowSize = CGSize(width: 500, height: 400)
+    // Fullscreen with hidden sidebar: no traffic lights, only sidebar.left button
+    state.isFullScreen = true
+    #expect(!state.needsTopChromeClearance)
+    #expect(state.topChromeContentPadding == 20)
+    #expect(state.topToolbarLeadingInset == 56)
+
+    // Mini width (440pt)
+    state.isFullScreen = false
+    state.windowSize = CGSize(width: 440, height: 320)
     #expect(state.isCompactWidth)
     #expect(state.isMiniWidth)
 
     // Reset back to standard default
+    state.isFullScreen = false
+    state.isSidebarVisible = true
     state.windowSize = CGSize(width: 900, height: 620)
 }
 
@@ -1230,39 +1269,89 @@ func testAccountStatusActiveSubscription() {
     #expect(freeStatus.hasActiveSubscription == false)
 }
 
-@Test("TrackHoverManager single source of truth and scroll suppression")
+@Test("TrackHoverManager O(1) per-row state isolation, scroll suppression, and anchor cleanup")
 func testTrackHoverManager() async {
-    let manager = await MainActor.run { TrackHoverManager.shared }
+    let manager = await MainActor.run { TrackHoverManager() }
     await MainActor.run {
-        manager.clear()
-        #expect(manager.isHovered(trackId: "track1") == false)
+        let state1 = manager.state(for: "track1")
+        let state2 = manager.state(for: "track2")
+        let state3 = manager.state(for: "track3")
+
+        #expect(state1.isHovered == false)
+        #expect(state2.isHovered == false)
+        #expect(state3.isHovered == false)
+        #expect(manager.state(for: "track1") === state1)
 
         manager.setHovered("track1")
-        #expect(manager.isHovered(trackId: "track1") == true)
-        #expect(manager.isHovered(trackId: "track2") == false)
+        #expect(state1.isHovered == true)
+        #expect(state2.isHovered == false)
+        #expect(state3.isHovered == false)
 
-        // Switching to track2 automatically clears track1
+        // Switching to track2 updates only track1 and track2
         manager.setHovered("track2")
-        #expect(manager.isHovered(trackId: "track1") == false)
-        #expect(manager.isHovered(trackId: "track2") == true)
+        #expect(state1.isHovered == false)
+        #expect(state2.isHovered == true)
+        #expect(state3.isHovered == false)
 
-        // Simulating scroll activity suppresses hover
+        // Late onHover(false) from track1 must not clear track2
+        manager.clearIfHovered("track1")
+        #expect(state2.isHovered == true)
+
+        // unregister must not evict the actively hovered track, but should evict inactive ones
+        manager.unregister(trackId: "track2")
+        #expect(manager.state(for: "track2") === state2)
+        manager.unregister(trackId: "track1")
+        #expect(manager.registeredRowStateCount == 2)
+
+        // Anchor view must never intercept mouse events
+        let anchorView = TrackHoverAnchorNSView(frame: NSRect(x: 0, y: 0, width: 300, height: 48))
+        #expect(anchorView.hitTest(NSPoint(x: 10, y: 10)) == nil)
+        manager.registerAnchor(anchorView, for: "track3")
+        #expect(manager.registeredAnchorCount == 1)
+
+        // Simulating scroll activity suppresses hover and clears current state
         manager.notifyScrollActivity()
-        #expect(manager.isScrolling == true)
-        #expect(manager.isHovered(trackId: "track2") == false)
+        #expect(manager.isScrollSuppressed == true)
+        #expect(state2.isHovered == false)
 
         // Hover events while scrolling are ignored
         manager.setHovered("track3")
-        #expect(manager.isHovered(trackId: "track3") == false)
+        #expect(state3.isHovered == false)
 
-        // Ending scroll restores capability
+        // Unregistering the last anchor for an inactive track frees its rowState entry
+        manager.unregisterAnchor(anchorView, for: "track3")
+        #expect(manager.registeredAnchorCount == 0)
+        #expect(manager.registeredRowStateCount == 1)
+
+        // Ending scroll restores hover capability
         manager.notifyScrollEnded()
-        #expect(manager.isScrolling == false)
+        #expect(manager.isScrollSuppressed == false)
+        let freshState3 = manager.state(for: "track3")
         manager.setHovered("track3")
-        #expect(manager.isHovered(trackId: "track3") == true)
+        #expect(freshState3.isHovered == true)
 
         manager.clear()
-        #expect(manager.isHovered(trackId: "track3") == false)
+        #expect(freshState3.isHovered == false)
+    }
+
+    // Watchdog deadline automatically ends scrolling and resolves pointerCandidateTrackId
+    await MainActor.run {
+        let state4 = manager.state(for: "track4")
+        manager.notifyScrollActivity(debounceNanoseconds: 25_000_000)
+        #expect(manager.isScrollSuppressed == true)
+
+        // Hover candidate recorded during scroll without mutating row state yet
+        manager.handleRowHover(trackId: "track4", isInside: true)
+        #expect(state4.isHovered == false)
+    }
+    try? await Task.sleep(nanoseconds: 60_000_000)
+    await MainActor.run {
+        #expect(manager.isScrollSuppressed == false)
+        #expect(manager.state(for: "track4").isHovered == true)
+
+        // Leaving row clears hover immediately when not scrolling
+        manager.handleRowHover(trackId: "track4", isInside: false)
+        #expect(manager.state(for: "track4").isHovered == false)
     }
 }
 
@@ -1315,6 +1404,409 @@ func testSearchResponseWithAlbums() throws {
     #expect(response.artists?.results.count == 1)
     #expect(response.artists?.results.first?.name == "Artist One")
 }
+
+@Test("YMAppTheme palettes, backward-compatible rawValues, and light/dark classification")
+@MainActor
+func testThemePalettes() {
+    #expect(YMAppTheme.allCases.count == 5)
+    #expect(YMAppTheme.system.rawValue == "system")
+    #expect(YMAppTheme.dark.rawValue == "dark")
+    #expect(YMAppTheme.midnight.rawValue == "midnight")
+    #expect(YMAppTheme.light.rawValue == "light")
+    #expect(YMAppTheme.latte.rawValue == "latte")
+
+    #expect(YMTheme.palette(for: .dark).isLight == false)
+    #expect(YMTheme.palette(for: .midnight).isLight == false)
+    #expect(YMTheme.palette(for: .light).isLight == true)
+    #expect(YMTheme.palette(for: .latte).isLight == true)
+    #expect(YMAppTheme.dark.colorScheme == .dark)
+    #expect(YMAppTheme.midnight.colorScheme == .dark)
+    #expect(YMAppTheme.light.colorScheme == .light)
+    #expect(YMAppTheme.latte.colorScheme == .light)
+    #expect(YMAppTheme.system.colorScheme == nil)
+}
+
+@Test("Rotor v2 batchId request, trackParameters decoding, personal waves dashboard, and extended vibes")
+func testRotorExtendedModelsAndDashboard() throws {
+    // 1. YMRotorSessionNextTracksRequest includes batchId
+    let nextReq = YMRotorSessionNextTracksRequest(queue: ["101:201", "102:202"], batchId: "batch-xyz")
+    let reqData = try JSONEncoder().encode(nextReq)
+    let reqJson = try JSONSerialization.jsonObject(with: reqData) as? [String: Any]
+    #expect(reqJson?["batchId"] as? String == "batch-xyz")
+    #expect((reqJson?["queue"] as? [String])?.count == 2)
+
+    // 2. YMRotorSequenceItem decoding with trackParameters and waveText
+    let seqJson = """
+    {
+        "type": "track",
+        "track": { "id": "555", "title": "Pulse", "durationMs": 200000 },
+        "trackParameters": { "bpm": 128.4, "hue": 210.0, "energy": 0.85 },
+        "waveText": "Высокая энергия под ваш ритм"
+    }
+    """.data(using: .utf8)!
+    let seqItem = try JSONDecoder().decode(YMRotorSequenceItem.self, from: seqJson)
+    #expect(seqItem.track?.id == "555")
+    #expect(seqItem.trackParameters?.bpm == 128.4)
+    #expect(seqItem.trackParameters?.energy == 0.85)
+    #expect(seqItem.waveText == "Высокая энергия под ваш ритм")
+
+    let insightWithWaveText = YMRotorTrackInsight(
+        trackParameters: seqItem.trackParameters,
+        waveText: seqItem.waveText
+    )
+    #expect(insightWithWaveText.formattedInsight == "Высокая энергия под ваш ритм")
+
+    let insightFromBpm = YMRotorTrackInsight(trackParameters: seqItem.trackParameters)
+    #expect(insightFromBpm.formattedInsight == "Высокая энергия • 128 BPM")
+
+    // 3. Dashboard response decoding & YMPersonalWaveStation seed combining
+    let dashJson = """
+    {
+        "dashboardId": "dash-1",
+        "stations": [
+            {
+                "station": {
+                    "id": { "type": "genre", "tag": "indie" },
+                    "name": "Инди",
+                    "icon": { "backgroundColor": "#6C63FF", "imageUrl": "avatars.yandex.net/get-music-misc/1/%%" }
+                },
+                "rupTitle": "Моя волна",
+                "rupDescription": "Независимая сцена"
+            },
+            {
+                "station": {
+                    "id": { "type": "artist", "tag": "12345" },
+                    "name": "Radiohead"
+                }
+            }
+        ]
+    }
+    """.data(using: .utf8)!
+    let dash = try JSONDecoder().decode(YMRotorDashboardResponse.self, from: dashJson)
+    #expect(dash.stations.count == 2)
+
+    let indie = try #require(dash.stations[0].toPersonalWaveStation())
+    #expect(indie.id == "genre:indie")
+    #expect(indie.title == "Инди")
+    #expect(indie.combineWithMyWave == true)
+    #expect(indie.toWaveContext().seeds == ["user:onyourwave", "genre:indie"])
+
+    let artistStation = try #require(dash.stations[1].toPersonalWaveStation())
+    #expect(artistStation.id == "artist:12345")
+    #expect(artistStation.combineWithMyWave == false)
+    #expect(artistStation.toWaveContext().seeds == ["artist:12345"])
+
+    // 4. Extended YMWaveVibePreset seeds & v1 query parameters
+    #expect(YMWaveVibePreset.allCases.count == 12)
+    #expect(YMWaveVibePreset.joyful.seedParameter == "mood:fun")
+    #expect(YMWaveVibePreset.sad.seedParameter == "mood:sad")
+    #expect(YMWaveVibePreset.russian.seedParameter == "language:russian")
+    #expect(YMWaveVibePreset.foreign.seedParameter == "language:not-russian")
+    #expect(YMWaveVibePreset.focus.seedParameter == "activity:work")
+    #expect(YMWaveVibePreset.workout.seedParameter == "activity:sport")
+    #expect(YMWaveVibePreset.unfamiliar.v1QueryItems.first == URLQueryItem(name: "diversity", value: "discover"))
+    #expect(YMWaveVibePreset.energetic.v1QueryItems.first == URLQueryItem(name: "moodEnergy", value: "energize"))
+    #expect(YMWaveVibePreset.sad.v1QueryItems.first == URLQueryItem(name: "moodEnergy", value: "sad"))
+
+    // 5. YMRotorAPIMode & diagnostics defaults
+    #expect(YMRotorAPIMode.allCases.count == 3)
+    let diag = YMRotorDiagnostics()
+    #expect(diag.activeProtocol == "Не запущена")
+    #expect(diag.isFallbackActive == false)
+
+    // 6. YMUnifiedWaveItem & YMWaveCategoryFilter filtering
+    let dashboardSample = [
+        indie,
+        artistStation,
+        YMPersonalWaveStation(type: "mood", tag: "relax", title: "Расслабление")
+    ]
+    let forYouItems = YMUnifiedWaveItem.items(for: .forYou, dashboardStations: dashboardSample)
+    #expect(forYouItems.first == .baseWave)
+    #expect(forYouItems.contains(.vibe(.unfamiliar)))
+    #expect(forYouItems.contains(.vibe(.energetic)))
+    #expect(forYouItems.contains(.station(indie)))
+    #expect(forYouItems.contains(.station(artistStation)))
+
+    let moodItems = YMUnifiedWaveItem.items(for: .moods, dashboardStations: dashboardSample)
+    #expect(!moodItems.contains(.baseWave))
+    #expect(!moodItems.contains(.vibe(.defaultWave)))
+    #expect(moodItems.contains(.vibe(.focus)))
+    #expect(moodItems.contains(where: { $0.id == "station:mood:relax" }))
+    #expect(!moodItems.contains(.station(indie)))
+
+    let genreItems = YMUnifiedWaveItem.items(for: .genresAndArtists, dashboardStations: dashboardSample)
+    #expect(genreItems.contains(.station(indie)))
+    #expect(genreItems.contains(.station(artistStation)))
+    #expect(!genreItems.contains(where: { $0.id == "station:mood:relax" }))
+}
+
+@Test("AudioQualitySettings crossfadeDuration clamping and UserDefaults persistence")
+@MainActor
+func testAudioQualitySettingsCrossfadeDuration() {
+    let settings = AudioQualitySettings.shared
+    let original = settings.crossfadeDuration
+    defer { settings.setCrossfadeDuration(original) }
+
+    settings.setCrossfadeDuration(4.5)
+    #expect(settings.crossfadeDuration == 4.5)
+    #expect(UserDefaults.standard.double(forKey: "ym_audio_crossfade_seconds") == 4.5)
+
+    // Upper bound clamping
+    settings.setCrossfadeDuration(25.0)
+    #expect(settings.crossfadeDuration == 12.0)
+
+    // Lower bound clamping
+    settings.setCrossfadeDuration(-3.0)
+    #expect(settings.crossfadeDuration == 0.0)
+}
+
+@Test("AudioPlayerEngine reactive stored volume clamping and persistence")
+@MainActor
+func testAudioPlayerEngineVolumeClamping() {
+    let engine = AudioPlayerEngine()
+    let original = engine.volume
+    defer { engine.volume = original }
+
+    engine.volume = 0.65
+    #expect(abs(engine.volume - 0.65) < 0.001)
+    #expect(abs(UserDefaults.standard.float(forKey: "ym_audio_player_volume") - 0.65) < 0.001)
+
+    engine.volume = 1.8
+    #expect(engine.volume == 1.0)
+
+    engine.volume = -0.5
+    #expect(engine.volume == 0.0)
+}
+
+@Test("NowPlayingController queue metadata update and clearNowPlaying playbackState")
+@MainActor
+func testNowPlayingControllerQueueInfo() {
+    let controller = NowPlayingController.shared
+    let track = YMTrack(
+        id: "777001",
+        title: "Queue Test Track",
+        durationMs: 210_000,
+        artists: [YMArtist(id: "1", name: "Test Artist")],
+        albums: [YMAlbum(id: "55", title: "Test Album")]
+    )
+
+    controller.updateTrack(
+        track,
+        isPlaying: true,
+        currentTime: 12.0,
+        queueIndex: 2,
+        queueCount: 10,
+        collectionIdentifier: "album:55"
+    )
+
+    let initialInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo
+    #expect(initialInfo?[MPNowPlayingInfoPropertyPlaybackQueueIndex] as? Int == 2)
+    #expect(initialInfo?[MPNowPlayingInfoPropertyPlaybackQueueCount] as? Int == 10)
+    #expect(initialInfo?[MPNowPlayingInfoCollectionIdentifier] as? String == "album:55")
+    #expect(initialInfo?[MPNowPlayingInfoPropertyExternalContentIdentifier] as? String == "777001")
+    #expect(initialInfo?[MPNowPlayingInfoPropertyIsLiveStream] as? Bool == false)
+    #expect(MPNowPlayingInfoCenter.default().playbackState == .playing)
+
+    controller.updateQueueInfo(currentIndex: 4, queueCount: 15, collectionIdentifier: "wave:user:onyourwave")
+    let updatedInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo
+    #expect(updatedInfo?[MPNowPlayingInfoPropertyPlaybackQueueIndex] as? Int == 4)
+    #expect(updatedInfo?[MPNowPlayingInfoPropertyPlaybackQueueCount] as? Int == 15)
+    #expect(updatedInfo?[MPNowPlayingInfoCollectionIdentifier] as? String == "wave:user:onyourwave")
+
+    controller.clearNowPlaying()
+    #expect(MPNowPlayingInfoCenter.default().nowPlayingInfo == nil)
+    #expect(MPNowPlayingInfoCenter.default().playbackState == .stopped)
+}
+
+@Test("YMPlaylist extended metadata decoding and PlaylistsService upsert/reset")
+@MainActor
+func testYMPlaylistMetadataAndService() throws {
+    let json1 = """
+    {
+        "uid": 100500,
+        "kind": 1012,
+        "title": "Ночной драйв",
+        "description": "Синтвейв и электроника для поездок",
+        "visibility": "private",
+        "revision": 7,
+        "trackCount": 14
+    }
+    """.data(using: .utf8)!
+    let p1 = try JSONDecoder().decode(YMPlaylist.self, from: json1)
+    #expect(p1.uid == "100500")
+    #expect(p1.kind == 1012)
+    #expect(p1.title == "Ночной драйв")
+    #expect(p1.description == "Синтвейв и электроника для поездок")
+    #expect(p1.visibility == "private")
+    #expect(p1.isPrivate == true)
+    #expect(p1.revision == 7)
+
+    let json2 = """
+    {
+        "uid": "100500",
+        "kind": 1013,
+        "title": "Утренний кофе",
+        "description": { "text": "Спокойный джаз" },
+        "visibility": "public",
+        "revision": 2,
+        "trackCount": 5
+    }
+    """.data(using: .utf8)!
+    let p2 = try JSONDecoder().decode(YMPlaylist.self, from: json2)
+    #expect(p2.description == "Спокойный джаз")
+    #expect(p2.isPrivate == false)
+    #expect(p2.revision == 2)
+
+    let service = PlaylistsService()
+    service.upsertPlaylist(p1, insertAtTop: true)
+    service.upsertPlaylist(p2, insertAtTop: true)
+    #expect(service.playlists.count == 2)
+    #expect(service.playlists.first?.id == p2.id)
+
+    let updatedP1 = YMPlaylist(
+        uid: p1.uid,
+        kind: p1.kind,
+        title: "Ночной драйв v2",
+        description: "Новое описание",
+        visibility: "public",
+        revision: 8,
+        trackCount: 15
+    )
+    service.upsertPlaylist(updatedP1, insertAtTop: false)
+    #expect(service.playlists.count == 2)
+    #expect(service.playlists.last?.title == "Ночной драйв v2")
+    #expect(service.playlists.last?.isPrivate == false)
+
+    service.resetAll()
+    #expect(service.playlists.isEmpty)
+}
+
+@Test("AudioPlayerEngine paginated queue continuation advances seamlessly past initial 50-track batch")
+@MainActor
+func testAudioPlayerEngineQueueContinuationPast50Tracks() async {
+    let engine = AudioPlayerEngine()
+    let initialBatch = (1...50).map { i in
+        YMTrack(id: "\(i)", title: "Track \(i)", durationMs: 180_000)
+    }
+    let secondBatch = (51...100).map { i in
+        YMTrack(id: "\(i)", title: "Track \(i)", durationMs: 180_000)
+    }
+
+    var continuationCalls = 0
+    engine.setQueue(initialBatch, startingAt: 49)
+    engine.attachQueueContinuation { existingIds in
+        continuationCalls += 1
+        return secondBatch.filter { !existingIds.contains($0.id) }
+    }
+
+    // Wait briefly for proactive prefetch or trigger next() directly
+    engine.next()
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    #expect(continuationCalls >= 1)
+    #expect(engine.queue.count == 100)
+    #expect(engine.currentIndex == 50)
+    #expect(engine.currentTrack?.id == "51")
+
+    engine.stopAndClear()
+}
+
+@Test("EqualizerSettings presets, custom band clamping, reset, and EqualizerParameterBridge sync")
+@MainActor
+func testEqualizerSettingsAndBridge() {
+    let settings = EqualizerSettings.shared
+    let origEnabled = settings.isEnabled
+    let origPreset = settings.selectedPreset
+    let origGains = settings.bandGains
+    let origPreamp = settings.preampDb
+    defer {
+        settings.selectedPreset = origPreset
+        settings.bandGains = origGains
+        settings.preampDb = origPreamp
+        settings.isEnabled = origEnabled
+    }
+
+    settings.isEnabled = false
+    settings.selectPreset(.rock)
+    #expect(settings.selectedPreset == .rock)
+    #expect(settings.bandGains == YMEqualizerPreset.rock.gains)
+    #expect(settings.isEnabled == true)
+
+    let rockSnap = EqualizerParameterBridge.shared.readSnapshot()
+    #expect(rockSnap.isEnabled == true)
+    #expect(rockSnap.bandGains == YMEqualizerPreset.rock.gains)
+
+    settings.selectPreset(.bassBoost)
+    #expect(settings.selectedPreset == .bassBoost)
+    #expect(settings.bandGains == YMEqualizerPreset.bassBoost.gains)
+
+    // Manual band tweak switches preset to .custom and clamps to -12...+12 dB
+    settings.setBandGain(index: 0, gain: 20.0)
+    #expect(settings.selectedPreset == .custom)
+    #expect(settings.bandGains[0] == 12.0)
+
+    settings.setBandGain(index: 9, gain: -25.0)
+    #expect(settings.bandGains[9] == -12.0)
+
+    // Preamp clamping -6...+6 dB
+    settings.setPreamp(10.0)
+    #expect(settings.preampDb == 6.0)
+    settings.setPreamp(-10.0)
+    #expect(settings.preampDb == -6.0)
+
+    let customSnap = EqualizerParameterBridge.shared.readSnapshot()
+    #expect(customSnap.bandGains[0] == 12.0)
+    #expect(customSnap.bandGains[9] == -12.0)
+    #expect(customSnap.preampDb == -6.0)
+    #expect(customSnap.generation > rockSnap.generation)
+
+    // Reset restores flat gains and 0 dB preamp
+    settings.reset()
+    #expect(settings.selectedPreset == .flat)
+    #expect(settings.preampDb == 0.0)
+    #expect(settings.bandGains == YMEqualizerPreset.flat.gains)
+
+    let resetSnap = EqualizerParameterBridge.shared.readSnapshot()
+    #expect(resetSnap.preampDb == 0.0)
+    #expect(resetSnap.bandGains == YMEqualizerPreset.flat.gains)
+}
+
+@Test("NavigationCoordinator closes fullscreen (.right) lyrics on menu selection while keeping .abovePlayer open")
+@MainActor
+func testNavigationCoordinatorDismissesFullscreenLyrics() {
+    let coordinator = NavigationCoordinator()
+    let originalPos = coordinator.lyricsPosition
+    defer { coordinator.lyricsPosition = originalPos }
+
+    let sampleTrack = YMTrack(id: "42", title: "Lyrics Track", durationMs: 180_000)
+
+    // 1. Fullscreen (.right) closes when switching sections
+    coordinator.lyricsPosition = .right
+    coordinator.showLyrics(for: sampleTrack)
+    #expect(coordinator.isLyricsPresented == true)
+
+    coordinator.selectSection(.search)
+    #expect(coordinator.selectedSection == .search)
+    #expect(coordinator.isLyricsPresented == false)
+    #expect(coordinator.lyricsTrack == nil)
+    #expect(coordinator.lyricsPosition == .right)
+
+    // 2. Fullscreen (.right) closes when navigating to album/artist
+    coordinator.showLyrics(for: sampleTrack)
+    coordinator.navigate(to: .album(id: "100", title: "Album"))
+    #expect(coordinator.isLyricsPresented == false)
+
+    // 3. Compact (.abovePlayer) remains open when switching sections
+    coordinator.lyricsPosition = .abovePlayer
+    coordinator.showLyrics(for: sampleTrack)
+    coordinator.selectSection(.myWave)
+    #expect(coordinator.selectedSection == .myWave)
+    #expect(coordinator.isLyricsPresented == true)
+}
+
+
+
+
 
 
 

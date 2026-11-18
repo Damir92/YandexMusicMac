@@ -9,6 +9,7 @@ public struct FavoritesListView: View {
     @UIState private var coordinator = NavigationCoordinator.shared
 
     @UIState private var filterQuery = ""
+    @UIState private var isScrolled = false
 
     public init() {}
 
@@ -34,44 +35,61 @@ public struct FavoritesListView: View {
         ScrollView(.vertical) {
             VStack(spacing: 20) {
                 // Hero Header
-                HStack(alignment: .bottom, spacing: 20) {
+                let tileSize: CGFloat = windowState.isMiniWidth ? 80 : (windowState.isCompactWidth ? 96 : 120)
+                let iconSize: CGFloat = windowState.isMiniWidth ? 34 : (windowState.isCompactWidth ? 42 : 50)
+                HStack(alignment: .bottom, spacing: windowState.isCompactWidth ? 16 : 20) {
                     // Iconic Gradient Heart Tile
                     ZStack {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        RoundedRectangle(cornerRadius: windowState.isMiniWidth ? 12 : 16, style: .continuous)
                             .fill(
                                 LinearGradient(
                                     colors: [
-                                        Color(red: 255 / 255, green: 75 / 255, blue: 43 / 255),
-                                        Color(red: 255 / 255, green: 65 / 255, blue: 108 / 255),
-                                        Color(red: 142 / 255, green: 45 / 255, blue: 226 / 255)
+                                        Color(red: 228 / 255, green: 92 / 255, blue: 78 / 255),   // Deep coral
+                                        Color(red: 196 / 255, green: 52 / 255, blue: 102 / 255),  // Rich crimson
+                                        Color(red: 108 / 255, green: 44 / 255, blue: 132 / 255)   // Modern plum
                                     ],
                                     startPoint: .topLeading,
                                     endPoint: .bottomTrailing
                                 )
                             )
-                            .frame(width: 120, height: 120)
+                            .frame(width: tileSize, height: tileSize)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(Color.white.opacity(0.2), lineWidth: 1)
+                                RoundedRectangle(cornerRadius: windowState.isMiniWidth ? 12 : 16, style: .continuous)
+                                    .fill(
+                                        RadialGradient(
+                                            colors: [
+                                                Color.white.opacity(0.24),
+                                                Color.white.opacity(0.0)
+                                            ],
+                                            center: .topLeading,
+                                            startRadius: 4,
+                                            endRadius: tileSize * 0.8
+                                        )
+                                    )
                             )
-                            .shadow(color: Color.red.opacity(0.3), radius: 16, y: 8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: windowState.isMiniWidth ? 12 : 16, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                            )
+                            .shadow(color: Color(red: 196 / 255, green: 52 / 255, blue: 102 / 255).opacity(0.28), radius: 18, y: 8)
 
                         Image(systemName: "heart.fill")
-                            .font(.system(size: 52, weight: .bold))
+                            .font(.system(size: iconSize, weight: .bold))
                             .foregroundStyle(.white)
-                            .shadow(color: .black.opacity(0.3), radius: 6, y: 3)
+                            .shadow(color: .black.opacity(0.24), radius: 6, y: 3)
                     }
 
                     // Metadata & Actions
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: windowState.isCompactWidth ? 6 : 8) {
                         Text("ПЛЕЙЛИСТ")
                             .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(YMTheme.fg40)
                             .tracking(1.2)
 
                         Text("Мне нравится")
-                            .font(.system(size: 28, weight: .bold))
+                            .font(.system(size: windowState.isCompactWidth ? 22 : 28, weight: .bold))
                             .foregroundStyle(YMTheme.fg)
+                            .lineLimit(1)
 
                         HStack(spacing: 6) {
                             Text("\(likesService.likedTrackIds.count) треков")
@@ -81,49 +99,37 @@ public struct FavoritesListView: View {
                         }
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(YMTheme.fg60)
+                        .lineLimit(1)
 
-                        // Actions Bar
-                        HStack(spacing: 10) {
-                            Button {
-                                let playable = displayedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }
-                                if !playable.isEmpty {
-                                    audioEngine.isWaveMode = false
-                                    audioEngine.setQueue(playable, startingAt: 0)
+                        // Adaptive Actions Bar
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 10) {
+                                playAllButton(title: "Слушать всё", height: 32)
+                                shuffleButton(title: "Перемешать", height: 32)
+                                waveButton(title: "Волна по любимому", height: 32)
+                            }
+
+                            HStack(spacing: 8) {
+                                playAllButton(title: "Слушать", height: 30)
+                                shuffleButton(title: "Микс", height: 30)
+                                waveButton(title: "Волна", height: 30)
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(spacing: 8) {
+                                    playAllButton(title: "Слушать", height: 30)
+                                    shuffleButton(title: "Микс", height: 30)
                                 }
-                            } label: {
-                                Label("Слушать всё", systemImage: "play.fill")
+                                waveButton(title: "Волна по любимому", height: 30)
                             }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 32))
-
-                            Button {
-                                if !filterQuery.isEmpty {
-                                    audioEngine.playShuffled(displayedTracks)
-                                } else {
-                                    Task {
-                                        let randomTracks = await likesService.fetchRandomLikedTracksForShuffle(limit: 50)
-                                        audioEngine.playShuffled(randomTracks)
-                                    }
-                                }
-                            } label: {
-                                Label("Перемешать", systemImage: "shuffle")
-                            }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
-
-                            Button {
-                                let playable = displayedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }
-                                audioEngine.startWave(forPlaylist: YMPlaylist(uid: "user", kind: 3, title: "Мне нравится"), tracks: Array(playable))
-                            } label: {
-                                Label("Волна по любимому", systemImage: "waveform.path.ecg")
-                            }
-                            .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 32))
                         }
                         .padding(.top, 2)
                     }
 
-                    Spacer()
+                    Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 20)
+                .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
+                .padding(.top, windowState.topChromeContentPadding)
 
                 // Search & Filter Input Bar
                 HStack(spacing: 10) {
@@ -156,12 +162,12 @@ public struct FavoritesListView: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
                 .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(YMTheme.surface)
-                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(YMTheme.border, lineWidth: 1))
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(YMTheme.surfaceComponent)
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(YMTheme.border, lineWidth: 1))
                 )
                 .padding(.horizontal, 24)
 
@@ -211,9 +217,13 @@ public struct FavoritesListView: View {
                         tracks: displayedTracks,
                         onPlayTrack: { track in
                             audioEngine.isWaveMode = false
+                            let isFiltered = !filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             let playable = displayedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }
                             if let idx = playable.firstIndex(where: { $0.id == track.id }) {
                                 audioEngine.setQueue(playable, startingAt: idx)
+                                if !isFiltered {
+                                    attachSequentialLikesContinuation()
+                                }
                             } else {
                                 Task {
                                     if let resolved = await likesService.fetchTrackImmediately(trackId: track.id) {
@@ -222,6 +232,9 @@ public struct FavoritesListView: View {
                                             audioEngine.setQueue(updatedPlayable, startingAt: newIdx)
                                         } else {
                                             audioEngine.setQueue([resolved], startingAt: 0)
+                                        }
+                                        if !isFiltered {
+                                            attachSequentialLikesContinuation()
                                         }
                                     }
                                 }
@@ -247,6 +260,17 @@ public struct FavoritesListView: View {
                 }
             }
             .padding(.bottom, 80)
+            .background(alignment: .top) {
+                YMScrollTopSentinel(
+                    coordinateSpaceName: "favorites_scroll",
+                    threshold: 88,
+                    isScrolled: $isScrolled
+                )
+            }
+        }
+        .coordinateSpace(name: "favorites_scroll")
+        .overlay(alignment: .top) {
+            YMStickyTopBar(title: "Мне нравится", isVisible: isScrolled)
         }
         .ymScreenBackground()
         .task {
@@ -259,5 +283,69 @@ public struct FavoritesListView: View {
             guard !Task.isCancelled else { return }
             await likesService.ensureAllLikedTracksLoadedForSearch()
         }
+    }
+
+    @ViewBuilder
+    private func playAllButton(title: String, height: CGFloat) -> some View {
+        Button {
+            let isFiltered = !filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let playable = displayedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }
+            if !playable.isEmpty {
+                audioEngine.isWaveMode = false
+                audioEngine.setQueue(playable, startingAt: 0)
+                if !isFiltered {
+                    attachSequentialLikesContinuation()
+                }
+            }
+        } label: {
+            Label(title, systemImage: "play.fill")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: height))
+    }
+
+    @ViewBuilder
+    private func shuffleButton(title: String, height: CGFloat) -> some View {
+        Button {
+            if !filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                audioEngine.playShuffled(displayedTracks)
+            } else {
+                Task {
+                    let randomTracks = await likesService.fetchRandomLikedTracksForShuffle(limit: 50)
+                    audioEngine.playShuffled(randomTracks)
+                    attachShuffledLikesContinuation()
+                }
+            }
+        } label: {
+            Label(title, systemImage: "shuffle")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+    }
+
+    private func attachSequentialLikesContinuation() {
+        let likes = likesService
+        audioEngine.attachQueueContinuation { existingIds in
+            await likes.loadNextLikedTracksForPlayback(excludingIds: existingIds, batchSize: 50)
+        }
+    }
+
+    private func attachShuffledLikesContinuation() {
+        let likes = likesService
+        audioEngine.attachQueueContinuation { existingIds in
+            await likes.fetchMoreRandomLikedTracksForShuffle(excludingIds: existingIds, limit: 50)
+        }
+    }
+
+    @ViewBuilder
+    private func waveButton(title: String, height: CGFloat) -> some View {
+        Button {
+            let playable = displayedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }
+            audioEngine.startWave(forPlaylist: YMPlaylist(uid: "user", kind: 3, title: "Мне нравится"), tracks: Array(playable))
+        } label: {
+            Label(title, systemImage: "waveform.path.ecg")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
     }
 }

@@ -42,7 +42,7 @@ public struct SubscriptionRequiredSheetView: View {
                     .foregroundStyle(YMTheme.fg)
 
                 let userDisplayName = authService.currentUser?.displayName ?? "Ваш аккаунт"
-                Text("На аккаунте \(userDisplayName) нет активной подписки Яндекс Плюс.\n\nКлиент YandexMusicMac строго следует политике сервиса Яндекс Музыки. Воспроизведение треков, альбомов и «Моей волны» доступно только подписчикам Яндекс Плюса.")
+                Text("На аккаунте \(userDisplayName) нет активной подписки Яндекс Плюс.\n\nКлиент flow~ строго следует политике сервиса Яндекс Музыки. Воспроизведение треков, альбомов и «Моей волны» доступно только подписчикам Яндекс Плюса.")
                     .font(.system(size: 13))
                     .foregroundStyle(YMTheme.fg80)
                     .multilineTextAlignment(.center)

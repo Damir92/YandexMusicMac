@@ -18,6 +18,7 @@ if FileManager.default.fileExists(atPath: cltPluginPath) &&
 
 let package = Package(
     name: "YandexMusicMac",
+    defaultLocalization: "ru",
     platforms: [
         .macOS(.v14)
     ],
@@ -32,7 +33,8 @@ let package = Package(
         ),
         .executableTarget(
             name: "YandexMusicMac",
-            dependencies: ["YMCore"]
+            dependencies: ["YMCore"],
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "YMCoreTests",

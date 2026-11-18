@@ -17,6 +17,7 @@ public struct SearchView: View {
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var coordinator = NavigationCoordinator.shared
+    @UIState private var windowState = WindowState.shared
     private let networkClient = YMNetworkClient.shared
 
     private let quickGenres: [String] = [
@@ -65,8 +66,9 @@ public struct SearchView: View {
                     .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(YMTheme.border, lineWidth: 1))
             )
             .padding(.horizontal, 24)
-            .padding(.top, 16)
+            .padding(.top, windowState.topChromeContentPadding)
             .padding(.bottom, 12)
+            .background(YMWindowDragHandle())
 
             Divider()
                 .padding(.horizontal, 24)
@@ -156,7 +158,7 @@ public struct SearchView: View {
                     VStack(alignment: .leading, spacing: 20) {
                         // Artists Carousel if any match
                         if !searchArtists.isEmpty {
-                            VStack(alignment: .leading, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text("Исполнители")
                                     .font(.system(size: 16, weight: .bold))
                                     .foregroundStyle(YMTheme.fg)
@@ -171,14 +173,15 @@ public struct SearchView: View {
                                         }
                                     }
                                     .padding(.horizontal, 24)
-                                    .padding(.vertical, 8)
+                                    .padding(.top, 10)
+                                    .padding(.bottom, 8)
                                 }
                             }
                         }
 
                         // Albums Carousel if any match
                         if !searchAlbums.isEmpty {
-                            VStack(alignment: .leading, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 4) {
                                 Text("Альбомы")
                                     .font(.system(size: 16, weight: .bold))
                                     .foregroundStyle(YMTheme.fg)
@@ -212,7 +215,7 @@ public struct SearchView: View {
                                         }
                                     }
                                     .padding(.horizontal, 24)
-                                    .padding(.vertical, 8)
+                                    .padding(.vertical, 12)
                                 }
                             }
                         }
@@ -230,6 +233,19 @@ public struct SearchView: View {
                                     audioEngine.isWaveMode = false
                                     if let idx = searchResults.firstIndex(where: { $0.id == track.id }) {
                                         audioEngine.setQueue(searchResults, startingAt: idx)
+                                        let capturedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        if !capturedQuery.isEmpty && canLoadMore {
+                                            var nextPage = currentPage + 1
+                                            let client = networkClient
+                                            audioEngine.attachQueueContinuation { existingIds in
+                                                guard let pageTracks = try? await client.searchTracks(query: capturedQuery, page: nextPage),
+                                                      !pageTracks.isEmpty else {
+                                                    return []
+                                                }
+                                                nextPage += 1
+                                                return pageTracks.filter { !existingIds.contains($0.id) }
+                                            }
+                                        }
                                     }
                                 },
                                 onLoadMore: {

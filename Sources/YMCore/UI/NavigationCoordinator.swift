@@ -35,6 +35,7 @@ public final class NavigationCoordinator: @unchecked Sendable {
     public var path: [AppRoute] = []
     public var selectedSection: SidebarSection = .myWave
     public var isLyricsPresented: Bool = false
+    public var isEqualizerPresented: Bool = false
     public var lyricsTrack: YMTrack? = nil
     public var activeSimilarTrack: YMTrack? = nil
 
@@ -64,10 +65,21 @@ public final class NavigationCoordinator: @unchecked Sendable {
     public func selectSection(_ section: SidebarSection) {
         self.selectedSection = section
         popToRoot()
+        dismissFullscreenLyricsIfNeeded()
     }
 
     public func navigate(to route: AppRoute) {
         path.append(route)
+        dismissFullscreenLyricsIfNeeded()
+    }
+
+    /// Closes the fullscreen "Now Playing" lyrics overlay (`.right`) when navigating to a menu section or detail screen,
+    /// while preserving the user's preferred `lyricsPosition` setting and keeping compact `.abovePlayer` lyrics open.
+    private func dismissFullscreenLyricsIfNeeded() {
+        if isLyricsPresented && lyricsPosition == .right {
+            isLyricsPresented = false
+            lyricsTrack = nil
+        }
     }
 
     public func pop() {

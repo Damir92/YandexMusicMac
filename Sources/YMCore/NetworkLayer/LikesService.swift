@@ -95,7 +95,9 @@ public final class LikesService {
     public private(set) var hasLoadedInitialBatch: Bool = false
 
     private var allLikedItems: [YMLikedTrackItem] = []
+    private var nextLikedItemCursor: Int = 0
     private var inFlightBatches: Set<Int> = []
+    private var loadMoreTask: Task<Void, Never>?
     private var backgroundCatalogTask: Task<Void, Never>?
     private let networkClient: YMNetworkClient
     private let keychain: KeychainManager
@@ -172,6 +174,9 @@ public final class LikesService {
         self.likedTrackIds = Set(allLikedItems.map(\.id))
         self.searchCatalog = []
         self.inFlightBatches.removeAll()
+        self.nextLikedItemCursor = 0
+        self.loadMoreTask?.cancel()
+        self.loadMoreTask = nil
 
         guard !allLikedItems.isEmpty else {
             self.likedTracks = []
@@ -193,8 +198,9 @@ public final class LikesService {
         var result = localUnsynced
         result.append(contentsOf: fullTracks)
         self.likedTracks = result
+        self.nextLikedItemCursor = initialBatchSize
         self.searchCatalog = fullTracks
-        self.hasMoreLikes = self.likedTracks.count < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
+        self.hasMoreLikes = self.nextLikedItemCursor < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
         self.hasLoadedInitialBatch = true
 
         if AudioQualitySettings.shared.preloadAllFavoritesInBackground {
@@ -204,28 +210,41 @@ public final class LikesService {
         return self.likedTracks
     }
 
-    /// Выбирает случайные треки из всей коллекции «Мне нравится» и подгружает метаданные только для первого чанка (50 шт.),
+    /// Выбирает случайные треки из всей коллекции «Мне нравится» и подгружает метаданные только для чанка (50 шт.),
     /// гарантируя мгновенный старт Shuffle без превышения лимита 40-70 МБ ОЗУ.
     public func fetchRandomLikedTracksForShuffle(limit: Int = 50) async -> [YMTrack] {
+        await fetchMoreRandomLikedTracksForShuffle(excludingIds: [], limit: limit)
+    }
+
+    /// Выбирает следующую порцию случайных ещё не добавленных в очередь треков из всей коллекции «Мне нравится».
+    public func fetchMoreRandomLikedTracksForShuffle(excludingIds: Set<String>, limit: Int = 50) async -> [YMTrack] {
         if allLikedItems.isEmpty {
             try? await syncLikes()
         }
 
         let loadedMap = Dictionary(
-            likedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }.map { ($0.id, $0) },
+            likedTracks.filter { !$0.isPlaceholder && !$0.isSpacer }.map { (extractCleanId(from: $0.id), $0) },
             uniquingKeysWith: { first, _ in first }
         )
 
-        guard !allLikedItems.isEmpty else {
-            return Array(loadedMap.values).shuffled()
+        let remainingItems = allLikedItems.filter { item in
+            let cleanId = extractCleanId(from: item.id)
+            return !excludingIds.contains(item.id)
+                && !excludingIds.contains(item.trackIdentifier)
+                && !excludingIds.contains(cleanId)
         }
 
-        let sampledItems = Array(allLikedItems.shuffled().prefix(limit))
+        guard !remainingItems.isEmpty else {
+            return []
+        }
+
+        let sampledItems = Array(remainingItems.shuffled().prefix(limit))
         var result: [YMTrack] = []
         var missingIds: [String] = []
 
         for item in sampledItems {
-            if let existing = loadedMap[item.id] ?? loadedMap[item.trackIdentifier] {
+            let cleanId = extractCleanId(from: item.id)
+            if let existing = loadedMap[cleanId] {
                 result.append(existing)
             } else {
                 missingIds.append(item.id)
@@ -239,6 +258,30 @@ public final class LikesService {
         }
 
         return result.shuffled()
+    }
+
+    /// Returns the next batch of sequential liked tracks not yet present in `excludingIds`,
+    /// automatically loading the next 50-track page from the API when needed.
+    public func loadNextLikedTracksForPlayback(excludingIds: Set<String>, batchSize: Int = 50) async -> [YMTrack] {
+        func collectNewTracks() -> [YMTrack] {
+            likedTracks.filter { track in
+                guard !track.isPlaceholder && !track.isSpacer else { return false }
+                let cleanId = extractCleanId(from: track.id)
+                return !excludingIds.contains(track.id) && !excludingIds.contains(cleanId)
+            }
+        }
+
+        let alreadyLoaded = collectNewTracks()
+        if !alreadyLoaded.isEmpty {
+            return alreadyLoaded
+        }
+
+        guard hasMoreLikes || nextLikedItemCursor < allLikedItems.count || likedTracks.contains(where: \.isPlaceholder) else {
+            return []
+        }
+
+        await loadMoreLikedTracks(batchSize: batchSize)
+        return collectNewTracks()
     }
 
     /// Loads a batch of tracks around the specified trackId as user scrolls past placeholder rows
@@ -326,58 +369,79 @@ public final class LikesService {
         return nil
     }
 
-    /// Loads the next batch of real tracks from allLikedItems as user scrolls
+    /// Loads the next batch of real tracks from allLikedItems as user scrolls or skips ahead
     public func loadMoreLikedTracks(batchSize: Int = 50) async {
-        guard !isLoadingMore else { return }
+        if let existingTask = loadMoreTask {
+            await existingTask.value
+            return
+        }
 
-        // 1. Если после сжатия памяти в likedTracks есть плейсхолдеры — сначала гидрируем их
-        if let firstPlaceholderIdx = likedTracks.firstIndex(where: \.isPlaceholder) {
+        let task = Task { @MainActor [weak self] in
+            guard let self = self else { return }
             self.isLoadingMore = true
-            defer { self.isLoadingMore = false }
-
-            let batchEnd = min(firstPlaceholderIdx + batchSize, min(likedTracks.count, allLikedItems.count))
-            let idsToFetch = (firstPlaceholderIdx..<batchEnd).map { allLikedItems[$0].id }
-            do {
-                let fetched = try await networkClient.fetchTracks(trackIds: idsToFetch)
-                let trackMap = Dictionary(fetched.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-                for i in firstPlaceholderIdx..<batchEnd {
-                    let itemId = allLikedItems[i].id
-                    if let realTrack = trackMap[itemId] {
-                        likedTracks[i] = realTrack
-                    }
-                }
-                let existingIds = Set(self.searchCatalog.map(\.id))
-                self.searchCatalog.append(contentsOf: fetched.filter { !existingIds.contains($0.id) })
-                self.hasMoreLikes = self.likedTracks.count < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
-            } catch {
-                print("[LikesService] Error hydrating placeholder tracks: \(error)")
+            defer {
+                self.isLoadingMore = false
+                self.loadMoreTask = nil
             }
-            return
+
+            // 1. Если после сжатия памяти в likedTracks есть плейсхолдеры — сначала гидрируем их
+            if let firstPlaceholderIdx = self.likedTracks.firstIndex(where: \.isPlaceholder) {
+                let batchEnd = min(firstPlaceholderIdx + batchSize, min(self.likedTracks.count, self.allLikedItems.count))
+                let idsToFetch = (firstPlaceholderIdx..<batchEnd).map { self.allLikedItems[$0].id }
+                do {
+                    let fetched = try await self.networkClient.fetchTracks(trackIds: idsToFetch)
+                    let trackMap = Dictionary(fetched.map { (self.extractCleanId(from: $0.id), $0) }, uniquingKeysWith: { first, _ in first })
+                    for i in firstPlaceholderIdx..<batchEnd {
+                        let itemId = self.extractCleanId(from: self.allLikedItems[i].id)
+                        if let realTrack = trackMap[itemId] {
+                            self.likedTracks[i] = realTrack
+                        } else {
+                            self.likedTracks[i] = YMTrack(
+                                id: self.allLikedItems[i].id,
+                                title: "Недоступный трек",
+                                available: false,
+                                isPlaceholder: false
+                            )
+                        }
+                    }
+                    let existingIds = Set(self.searchCatalog.map(\.id))
+                    self.searchCatalog.append(contentsOf: fetched.filter { !existingIds.contains($0.id) })
+                    self.hasMoreLikes = self.nextLikedItemCursor < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
+                } catch {
+                    print("[LikesService] Error hydrating placeholder tracks: \(error)")
+                }
+                return
+            }
+
+            // 2. Стандартная подгрузка следующих чанков по курсору allLikedItems
+            let cursor = max(self.nextLikedItemCursor, self.likedTracks.count)
+            guard cursor < self.allLikedItems.count else {
+                self.nextLikedItemCursor = self.allLikedItems.count
+                self.hasMoreLikes = false
+                return
+            }
+
+            let nextEnd = min(cursor + batchSize, self.allLikedItems.count)
+            let slice = Array(self.allLikedItems[cursor..<nextEnd])
+            let idsToFetch = slice.map(\.id)
+
+            do {
+                let fetched = try await self.networkClient.fetchTracks(trackIds: idsToFetch)
+                let existingTrackIds = Set(self.likedTracks.map { self.extractCleanId(from: $0.id) })
+                let uniqueFetched = fetched.filter { !existingTrackIds.contains(self.extractCleanId(from: $0.id)) }
+                self.likedTracks.append(contentsOf: uniqueFetched)
+                self.nextLikedItemCursor = nextEnd
+
+                let existingCatalogIds = Set(self.searchCatalog.map(\.id))
+                self.searchCatalog.append(contentsOf: fetched.filter { !existingCatalogIds.contains($0.id) })
+                self.hasMoreLikes = self.nextLikedItemCursor < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
+            } catch {
+                print("[LikesService] Error loading more liked tracks: \(error)")
+            }
         }
 
-        // 2. Стандартная подгрузка следующих чанков
-        let currentCount = likedTracks.count
-        guard currentCount < allLikedItems.count else {
-            self.hasMoreLikes = false
-            return
-        }
-
-        self.isLoadingMore = true
-        defer { self.isLoadingMore = false }
-
-        let nextEnd = min(currentCount + batchSize, allLikedItems.count)
-        let slice = Array(allLikedItems[currentCount..<nextEnd])
-        let idsToFetch = slice.map(\.id)
-
-        do {
-            let fetched = try await networkClient.fetchTracks(trackIds: idsToFetch)
-            self.likedTracks.append(contentsOf: fetched)
-            let existingIds = Set(self.searchCatalog.map(\.id))
-            self.searchCatalog.append(contentsOf: fetched.filter { !existingIds.contains($0.id) })
-            self.hasMoreLikes = self.likedTracks.count < self.allLikedItems.count || self.likedTracks.contains(where: \.isPlaceholder)
-        } catch {
-            print("[LikesService] Error loading more liked tracks: \(error)")
-        }
+        self.loadMoreTask = task
+        await task.value
     }
 
     /// Starts gentle background preloading of remaining tracks into searchCatalog and updates placeholders
@@ -536,6 +600,9 @@ public final class LikesService {
     public func resetAll() {
         backgroundCatalogTask?.cancel()
         backgroundCatalogTask = nil
+        loadMoreTask?.cancel()
+        loadMoreTask = nil
+        nextLikedItemCursor = 0
         inFlightBatches.removeAll()
         allLikedItems.removeAll()
         likedTrackIds.removeAll()

@@ -16,6 +16,9 @@ public actor YMNetworkClient {
     }
     private var streamInfosCache: [String: CachedStreamInfos] = [:]
     private let streamCacheTTL: TimeInterval = 600 // 10 минут
+    /// Tiny bounded in-memory LRC cache (max 2 tracks) so switching lyrics display modes is instant
+    private var lyricsLRCCache: [String: YMSyncedLyrics] = [:]
+    private var lyricsLRCCacheOrder: [String] = []
 
     public static let clientHeader = "YandexMusicAndroid/24023621"
     public static let acceptLanguage = "ru"
@@ -620,14 +623,191 @@ public actor YMNetworkClient {
 
     // MARK: - Playlists API
 
+    private static func formEncodedBody(_ pairs: [(String, String)]) -> Data {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._*")
+        let encoded = pairs.map { key, value -> String in
+            let k = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+            let v = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+            return "\(k)=\(v)"
+        }.joined(separator: "&")
+        return Data(encoded.utf8)
+    }
+
     /// GET /users/{uid}/playlists/list
-    public func fetchUserPlaylists(uid: String) async throws -> [YMPlaylist] {
-        try await request(endpoint: "/users/\(Self.escapePath(uid))/playlists/list")
+    public func fetchUserPlaylists(
+        uid: String,
+        cachePolicy: URLRequest.CachePolicy = .reloadIgnoringLocalCacheData
+    ) async throws -> [YMPlaylist] {
+        try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/list",
+            cachePolicy: cachePolicy
+        )
     }
 
     /// GET /users/{uid}/playlists/{kind}
-    public func fetchPlaylistDetails(uid: String, kind: Int) async throws -> YMPlaylist {
-        try await request(endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)")
+    public func fetchPlaylistDetails(
+        uid: String,
+        kind: Int,
+        cachePolicy: URLRequest.CachePolicy = .reloadIgnoringLocalCacheData
+    ) async throws -> YMPlaylist {
+        try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)",
+            cachePolicy: cachePolicy
+        )
+    }
+
+    /// POST /users/{uid}/playlists/create
+    /// Creates a new playlist with title, visibility ("public" or "private"), and optional description.
+    public func createPlaylist(
+        uid: String,
+        title: String,
+        description: String? = nil,
+        visibility: String = "public"
+    ) async throws -> YMPlaylist {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedVisibility = (visibility.lowercased() == "private") ? "private" : "public"
+        var formPairs: [(String, String)] = [
+            ("title", trimmedTitle),
+            ("visibility", normalizedVisibility)
+        ]
+        let trimmedDescription = description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let desc = trimmedDescription, !desc.isEmpty {
+            formPairs.append(("description", desc))
+        }
+
+        var created: YMPlaylist = try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/create",
+            method: "POST",
+            body: Self.formEncodedBody(formPairs),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+
+        // Yandex Music's /create endpoint sometimes ignores description in the initial form;
+        // persist it via the dedicated description endpoint if not echoed back.
+        if let desc = trimmedDescription, !desc.isEmpty, (created.description ?? "").isEmpty {
+            if let updated = try? await updatePlaylistDescription(uid: uid, kind: created.kind, description: desc) {
+                created = updated
+            }
+        }
+        return created
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/name
+    public func updatePlaylistName(uid: String, kind: Int, title: String) async throws -> YMPlaylist {
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/name",
+            method: "POST",
+            body: Self.formEncodedBody([("value", trimmedTitle)]),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/description
+    public func updatePlaylistDescription(uid: String, kind: Int, description: String) async throws -> YMPlaylist {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/description",
+            method: "POST",
+            body: Self.formEncodedBody([("value", trimmed)]),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/visibility
+    public func updatePlaylistVisibility(uid: String, kind: Int, visibility: String) async throws -> YMPlaylist {
+        let normalizedVisibility = (visibility.lowercased() == "private") ? "private" : "public"
+        return try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/visibility",
+            method: "POST",
+            body: Self.formEncodedBody([("value", normalizedVisibility)]),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/delete
+    public func deletePlaylist(uid: String, kind: Int) async throws {
+        let (data, response) = try await performRawRequest(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/delete",
+            method: "POST",
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+        guard (200...299).contains(response.statusCode) else {
+            throw YMAPIError.httpError(statusCode: response.statusCode, data: data)
+        }
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/change-relative (insert tracks)
+    public func addTracksToPlaylist(
+        uid: String,
+        kind: Int,
+        revision: Int,
+        tracks: [YMTrack],
+        at index: Int = 0
+    ) async throws -> YMPlaylist {
+        struct DiffTrack: Encodable {
+            let id: String
+            let albumId: String?
+        }
+        struct InsertDiff: Encodable {
+            let op: String
+            let at: Int
+            let tracks: [DiffTrack]
+        }
+
+        let diffTracks = tracks.map { track in
+            let cleanId = track.id.components(separatedBy: ":").first ?? track.id
+            let albumId = track.albums.first?.id
+            return DiffTrack(id: cleanId, albumId: albumId)
+        }
+        let diffPayload = [InsertDiff(op: "insert", at: max(0, index), tracks: diffTracks)]
+        let diffData = try encoder.encode(diffPayload)
+        let diffJSON = String(data: diffData, encoding: .utf8) ?? "[]"
+
+        return try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
+            method: "POST",
+            body: Self.formEncodedBody([
+                ("diff", diffJSON),
+                ("revision", String(revision))
+            ]),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
+    }
+
+    /// POST /users/{uid}/playlists/{kind}/change-relative (delete track at index)
+    public func removeTrackFromPlaylist(
+        uid: String,
+        kind: Int,
+        revision: Int,
+        at index: Int
+    ) async throws -> YMPlaylist {
+        struct DeleteDiff: Encodable {
+            let op: String
+            let from: Int
+            let to: Int
+        }
+        let diffPayload = [DeleteDiff(op: "delete", from: max(0, index), to: max(0, index) + 1)]
+        let diffData = try encoder.encode(diffPayload)
+        let diffJSON = String(data: diffData, encoding: .utf8) ?? "[]"
+
+        return try await request(
+            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
+            method: "POST",
+            body: Self.formEncodedBody([
+                ("diff", diffJSON),
+                ("revision", String(revision))
+            ]),
+            headers: ["Content-Type": "application/x-www-form-urlencoded"],
+            cachePolicy: .reloadIgnoringLocalCacheData
+        )
     }
 
     // MARK: - Search & Artist API
@@ -695,6 +875,9 @@ public actor YMNetworkClient {
     /// Returns nil if synchronized lyrics are not available for this track.
     public func fetchTrackLyricsLRC(trackId: String) async throws -> YMSyncedLyrics? {
         let numericId = trackId.components(separatedBy: ":").first ?? trackId
+        if let cached = lyricsLRCCache[numericId] {
+            return cached
+        }
         let timestamp = Int(Date().timeIntervalSince1970)
         let sign = YMAudioURLSigner.computeLyricsSign(trackId: numericId, timestamp: timestamp)
 
@@ -736,7 +919,17 @@ public actor YMNetworkClient {
         }
 
         let synced = YMSyncedLyrics.parse(lrcContent: lrcContent)
-        return synced.isEmpty ? nil : synced
+        if !synced.isEmpty {
+            lyricsLRCCache[numericId] = synced
+            lyricsLRCCacheOrder.removeAll { $0 == numericId }
+            lyricsLRCCacheOrder.append(numericId)
+            while lyricsLRCCacheOrder.count > 2 {
+                let evicted = lyricsLRCCacheOrder.removeFirst()
+                lyricsLRCCache.removeValue(forKey: evicted)
+            }
+            return synced
+        }
+        return nil
     }
 
     /// GET /tracks/{trackId}/similar

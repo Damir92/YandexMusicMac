@@ -1,17 +1,29 @@
 import Foundation
-import Security
+import CryptoKit
+import IOKit
 
-/// Thread-safe manager for secure credentials storage in macOS Keychain.
-/// Uses `kSecAttrAccessibleAfterFirstUnlock` for background reliability and security.
-/// Includes an in-memory cache to prevent repetitive macOS Keychain access permission prompts.
+/// Thread-safe manager for secure, encrypted credentials storage on macOS.
+///
+/// Uses an AES-256-GCM authenticated encrypted vault stored in `~/Library/Application Support/YandexMusicMac/`
+/// with strict owner-only POSIX permissions (`0600` file / `0700` directory), excluded from Time Machine backups,
+/// and encrypted with a machine- & user-bound 256-bit key derived via `HKDF<SHA256>` from `IOPlatformUUID`.
+///
+/// This completely eliminates repetitive macOS Keychain password prompts caused by ad-hoc code signing
+/// (`codesign --sign -`) changing CDHash across rebuilds and updates, while keeping credentials strongly
+/// encrypted at rest and non-portable across machines.
 public final class KeychainManager: @unchecked Sendable {
     public static let shared = KeychainManager()
 
+    public static let defaultService = "com.yandexmusic.mac.credentials"
+
     private let service: String
     private let accessGroup: String?
+    private let vaultURL: URL
+    private let symmetricKey: SymmetricKey
 
-    private let cacheLock = NSLock()
+    private let lock = NSLock()
     private var inMemoryCache: [String: String] = [:]
+    private var hasLoadedFromDisk: Bool = false
 
     public enum KeychainKey: String, Sendable {
         case oauthToken = "ym_oauth_token"
@@ -23,76 +35,72 @@ public final class KeychainManager: @unchecked Sendable {
         case duplicateItem
         case unexpectedStatus(OSStatus)
         case invalidDataConversion
+        case encryptionFailed
+        case storageFailure(String)
 
         public var errorDescription: String? {
             switch self {
             case .itemNotFound:
-                return "Item not found in Keychain."
+                return "Item not found in secure vault."
             case .duplicateItem:
-                return "Duplicate item in Keychain."
+                return "Duplicate item in secure vault."
             case .unexpectedStatus(let status):
-                return "Keychain error status: \(status)"
+                return "Secure storage error status: \(status)"
             case .invalidDataConversion:
                 return "Data could not be converted to string."
+            case .encryptionFailed:
+                return "Failed to encrypt credentials payload."
+            case .storageFailure(let message):
+                return "Secure storage failure: \(message)"
             }
         }
     }
 
-    public init(service: String = "com.yandexmusic.mac.credentials", accessGroup: String? = nil) {
+    public init(service: String = KeychainManager.defaultService, accessGroup: String? = nil) {
         self.service = service
         self.accessGroup = accessGroup
+        self.vaultURL = Self.makeVaultURL(for: service)
+        self.symmetricKey = Self.deriveVaultKey(service: service, accessGroup: accessGroup)
     }
+
+    // Internal accessor for unit tests to verify on-disk encryption & permissions
+    var storageFileURL: URL { vaultURL }
 
     // MARK: - Generic Secure Storage Operations
 
     public func setString(_ value: String, for key: KeychainKey) throws {
-        guard let data = value.data(using: .utf8) else {
-            throw KeychainError.invalidDataConversion
-        }
-        try setData(data, for: key.rawValue)
+        lock.lock()
+        defer { lock.unlock() }
 
-        cacheLock.lock()
+        ensureLoadedLocked()
         inMemoryCache[key.rawValue] = value
-        cacheLock.unlock()
+        try persistLocked()
     }
 
     public func getString(for key: KeychainKey) throws -> String? {
-        cacheLock.lock()
-        if let cached = inMemoryCache[key.rawValue] {
-            cacheLock.unlock()
-            return cached
-        }
-        cacheLock.unlock()
+        lock.lock()
+        defer { lock.unlock() }
 
-        guard let data = try getData(for: key.rawValue) else {
-            return nil
-        }
-        guard let string = String(data: data, encoding: .utf8) else {
-            throw KeychainError.invalidDataConversion
-        }
-
-        cacheLock.lock()
-        inMemoryCache[key.rawValue] = string
-        cacheLock.unlock()
-
-        return string
+        ensureLoadedLocked()
+        return inMemoryCache[key.rawValue]
     }
 
     public func delete(for key: KeychainKey) throws {
-        cacheLock.lock()
-        inMemoryCache.removeValue(forKey: key.rawValue)
-        cacheLock.unlock()
+        lock.lock()
+        defer { lock.unlock() }
 
-        try deleteData(for: key.rawValue)
+        ensureLoadedLocked()
+        inMemoryCache.removeValue(forKey: key.rawValue)
+        try persistLocked()
     }
 
     public func clearAll() throws {
-        cacheLock.lock()
-        inMemoryCache.removeAll()
-        cacheLock.unlock()
+        lock.lock()
+        defer { lock.unlock() }
 
-        try delete(for: .oauthToken)
-        try delete(for: .userId)
+        inMemoryCache.removeAll()
+        hasLoadedFromDisk = true
+        try persistLocked()
     }
 
     // MARK: - Specialized Convenience API
@@ -121,67 +129,122 @@ public final class KeychainManager: @unchecked Sendable {
         try delete(for: .userId)
     }
 
-    // MARK: - Low-Level Security Framework Operations
+    // MARK: - Encrypted Vault Persistence (AES-256-GCM + HKDF-SHA256)
 
-    private func makeBaseQuery(for key: String) -> [CFString: Any] {
-        var query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: key
-        ]
-        if let accessGroup = accessGroup {
-            query[kSecAttrAccessGroup] = accessGroup
+    private func ensureLoadedLocked() {
+        guard !hasLoadedFromDisk else { return }
+        hasLoadedFromDisk = true
+
+        guard FileManager.default.fileExists(atPath: vaultURL.path) else {
+            return
         }
-        return query
+
+        do {
+            let encryptedData = try Data(contentsOf: vaultURL)
+            guard !encryptedData.isEmpty else { return }
+
+            let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
+            let decryptedData = try AES.GCM.open(sealedBox, using: symmetricKey)
+            let decoded = try JSONDecoder().decode([String: String].self, from: decryptedData)
+            inMemoryCache = decoded
+        } catch {
+            print("[KeychainManager] Failed to decrypt credential vault (resetting cache): \(error.localizedDescription)")
+            inMemoryCache = [:]
+        }
     }
 
-    private func setData(_ data: Data, for key: String) throws {
-        var query = makeBaseQuery(for: key)
-        query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlock
+    private func persistLocked() throws {
+        let fm = FileManager.default
 
-        // First attempt to add
-        var addQuery = query
-        addQuery[kSecValueData] = data
-
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            // Item exists, update it
-            let updateQuery = makeBaseQuery(for: key)
-            let attributesToUpdate: [CFString: Any] = [
-                kSecValueData: data,
-                kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock
-            ]
-            let updateStatus = SecItemUpdate(updateQuery as CFDictionary, attributesToUpdate as CFDictionary)
-            if updateStatus != errSecSuccess {
-                throw KeychainError.unexpectedStatus(updateStatus)
+        if inMemoryCache.isEmpty {
+            if fm.fileExists(atPath: vaultURL.path) {
+                try fm.removeItem(at: vaultURL)
             }
-        } else if status != errSecSuccess {
-            throw KeychainError.unexpectedStatus(status)
+            return
+        }
+
+        let parentDir = vaultURL.deletingLastPathComponent()
+        if !fm.fileExists(atPath: parentDir.path) {
+            try fm.createDirectory(
+                at: parentDir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+            )
+        } else {
+            try? fm.setAttributes([.posixPermissions: NSNumber(value: Int16(0o700))], ofItemAtPath: parentDir.path)
+        }
+
+        let plaintext = try JSONEncoder().encode(inMemoryCache)
+        let sealedBox = try AES.GCM.seal(plaintext, using: symmetricKey)
+        guard let combined = sealedBox.combined else {
+            throw KeychainError.encryptionFailed
+        }
+
+        do {
+            try combined.write(to: vaultURL, options: .atomic)
+            try fm.setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: vaultURL.path)
+
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            var mutableURL = vaultURL
+            try? mutableURL.setResourceValues(resourceValues)
+        } catch {
+            throw KeychainError.storageFailure(error.localizedDescription)
         }
     }
 
-    private func getData(for key: String) throws -> Data? {
-        var query = makeBaseQuery(for: key)
-        query[kSecReturnData] = kCFBooleanTrue
-        query[kSecMatchLimit] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-
-        if status == errSecItemNotFound {
-            return nil
+    private static func makeVaultURL(for service: String) -> URL {
+        let fm = FileManager.default
+        if service == defaultService {
+            let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+            return appSupport
+                .appendingPathComponent("YandexMusicMac", isDirectory: true)
+                .appendingPathComponent("credentials.vault", isDirectory: false)
+        } else {
+            let hash = SHA256.hash(data: Data(service.utf8))
+                .prefix(12)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            return fm.temporaryDirectory
+                .appendingPathComponent("YandexMusicMacVaults", isDirectory: true)
+                .appendingPathComponent("vault_\(hash).enc", isDirectory: false)
         }
-        guard status == errSecSuccess else {
-            throw KeychainError.unexpectedStatus(status)
-        }
-        return item as? Data
     }
 
-    private func deleteData(for key: String) throws {
-        let query = makeBaseQuery(for: key)
-        let status = SecItemDelete(query as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
-            throw KeychainError.unexpectedStatus(status)
+    private static func deriveVaultKey(service: String, accessGroup: String?) -> SymmetricKey {
+        let machineUUID = hardwarePlatformUUID()
+        let uid = getuid()
+        let home = NSHomeDirectory()
+        let materialString = "\(machineUUID)|uid:\(uid)|home:\(home)|group:\(accessGroup ?? "")"
+        let inputKey = SymmetricKey(data: Data(materialString.utf8))
+        let salt = Data("com.yandexmusic.mac.vault.v1|\(service)".utf8)
+        let info = Data("AES-256-GCM-Credentials-Vault".utf8)
+
+        return HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKey,
+            salt: salt,
+            info: info,
+            outputByteCount: 32
+        )
+    }
+
+    private static func hardwarePlatformUUID() -> String {
+        let platformExpert = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPlatformExpertDevice")
+        )
+        guard platformExpert != 0 else { return "fallback-mac-host" }
+        defer { IOObjectRelease(platformExpert) }
+
+        if let cfValue = IORegistryEntryCreateCFProperty(
+            platformExpert,
+            "IOPlatformUUID" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? String, !cfValue.isEmpty {
+            return cfValue
         }
+        return "fallback-mac-host"
     }
 }

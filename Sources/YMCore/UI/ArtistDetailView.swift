@@ -9,10 +9,12 @@ public struct ArtistDetailView: View {
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
     @UIState private var loadTask: Task<Void, Never>? = nil
+    @UIState private var isScrolled = false
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var likesService = LikesService.shared
     @UIState private var coordinator = NavigationCoordinator.shared
+    @UIState private var windowState = WindowState.shared
     private let networkClient = YMNetworkClient.shared
 
     public init(artistId: String, artistName: String) {
@@ -23,34 +25,6 @@ public struct ArtistDetailView: View {
     public var body: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 28) {
-                // Top Navigation Bar (Back button + Title)
-                HStack(spacing: 12) {
-                    Button {
-                        coordinator.pop()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text("Назад")
-                                .font(.system(size: 13, weight: .medium))
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Capsule().fill(YMTheme.surfaceComponent))
-                        .overlay(Capsule().strokeBorder(YMTheme.border, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut("[", modifiers: .command)
-
-                    Text(artistName)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(YMTheme.fg60)
-
-                    Spacer()
-                }
-                .padding(.top, 16)
-                .padding(.horizontal, 24)
-
                 if isLoading {
                     VStack(spacing: 16) {
                         ProgressView()
@@ -60,6 +34,7 @@ public struct ArtistDetailView: View {
                             .foregroundStyle(YMTheme.fg40)
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
+                    .padding(.top, 52)
                 } else if let error = errorMessage {
                     VStack(spacing: 14) {
                         Image(systemName: "exclamationmark.triangle")
@@ -74,24 +49,27 @@ public struct ArtistDetailView: View {
                         .buttonStyle(YMGlassPillButtonStyle(primary: true))
                     }
                     .frame(maxWidth: .infinity, minHeight: 300)
+                    .padding(.top, 52)
                 } else if let info = briefInfo {
-                    // Hero Banner
-                    HStack(spacing: 24) {
+                    // Hero Banner with atmospheric cover glow
+                    let avatarSize: CGFloat = windowState.isCompactWidth ? 104 : 150
+                    HStack(alignment: .center, spacing: windowState.isCompactWidth ? 16 : 24) {
                         CachedCoverImage(
                             coverUri: info.artist.coverUri,
                             size: .medium,
-                            displaySize: 150,
-                            cornerRadius: 75
+                            displaySize: avatarSize,
+                            cornerRadius: avatarSize / 2
                         )
-                        .frame(width: 150, height: 150)
+                        .frame(width: avatarSize, height: avatarSize)
                         .clipShape(Circle())
                         .overlay(Circle().strokeBorder(YMTheme.border, lineWidth: 1))
-                        .shadow(color: .black.opacity(0.4), radius: 18, y: 8)
+                        .shadow(color: YMTheme.shadowColor, radius: 18, y: 8)
 
-                        VStack(alignment: .leading, spacing: 10) {
+                        VStack(alignment: .leading, spacing: windowState.isCompactWidth ? 6 : 10) {
                             Text(info.artist.name)
-                                .font(.system(size: 32, weight: .bold))
+                                .font(.system(size: windowState.isCompactWidth ? 22 : 32, weight: .bold))
                                 .foregroundStyle(YMTheme.fg)
+                                .lineLimit(2)
 
                             if let stats = info.stats, !stats.formattedListeners.isEmpty {
                                 HStack(spacing: 6) {
@@ -99,33 +77,62 @@ public struct ArtistDetailView: View {
                                         .font(.caption)
                                     Text(stats.formattedListeners)
                                         .font(.system(size: 13, weight: .medium))
+                                        .lineLimit(1)
                                 }
                                 .foregroundStyle(YMTheme.fg60)
                             }
 
-                            // Actions Bar
-                            HStack(spacing: 12) {
-                                if !info.popularTracks.isEmpty {
-                                    Button {
-                                        audioEngine.isWaveMode = false
-                                        audioEngine.assignQueue(info.popularTracks, startingAt: 0)
-                                    } label: {
-                                        Label("Слушать популярное", systemImage: "play.fill")
+                            // Adaptive Actions Bar
+                            ViewThatFits(in: .horizontal) {
+                                HStack(spacing: 10) {
+                                    if !info.popularTracks.isEmpty {
+                                        Button {
+                                            audioEngine.isWaveMode = false
+                                            audioEngine.assignQueue(info.popularTracks, startingAt: 0)
+                                        } label: {
+                                            Label("Слушать популярное", systemImage: "play.fill")
+                                                .fixedSize(horizontal: true, vertical: false)
+                                        }
+                                        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 34))
                                     }
-                                    .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 34))
+
+                                    Button {
+                                        audioEngine.startWave(forArtist: info.artist)
+                                    } label: {
+                                        Label("Моя волна по артисту", systemImage: "waveform.path.ecg")
+                                            .fixedSize(horizontal: true, vertical: false)
+                                    }
+                                    .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 34))
                                 }
 
-                                Button {
-                                    audioEngine.startWave(forArtist: info.artist)
-                                } label: {
-                                    Label("Моя волна по артисту", systemImage: "waveform.path.ecg")
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if !info.popularTracks.isEmpty {
+                                        Button {
+                                            audioEngine.isWaveMode = false
+                                            audioEngine.assignQueue(info.popularTracks, startingAt: 0)
+                                        } label: {
+                                            Label(windowState.isMiniWidth ? "Популярное" : "Слушать популярное", systemImage: "play.fill")
+                                        }
+                                        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 30))
+                                    }
+
+                                    Button {
+                                        audioEngine.startWave(forArtist: info.artist)
+                                    } label: {
+                                        Label(windowState.isMiniWidth ? "Волна" : "Моя волна по артисту", systemImage: "waveform.path.ecg")
+                                    }
+                                    .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 30))
                                 }
-                                .buttonStyle(YMGlassPillButtonStyle(primary: false, height: 34))
                             }
                             .padding(.top, 4)
                         }
+
+                        Spacer(minLength: 0)
                     }
-                    .padding(.horizontal, 24)
+                    .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
+                    .padding(.top, 54)
+                    .padding(.bottom, 16)
+                    .ymAmbientCoverGlow(coverUri: info.artist.coverUri, opacity: 0.24)
 
                     // Popular Tracks Section
                     if !info.popularTracks.isEmpty {
@@ -174,13 +181,14 @@ public struct ArtistDetailView: View {
                                     }
                                 }
                                 .padding(.horizontal, 24)
+                                .padding(.vertical, 12)
                             }
                         }
                     }
 
                     // Singles & EPs Section
                     if !info.alsoAlbums.isEmpty {
-                        VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 6) {
                             Text("Синглы и сборники")
                                 .font(.system(size: 18, weight: .bold))
                                 .foregroundStyle(YMTheme.fg)
@@ -202,13 +210,14 @@ public struct ArtistDetailView: View {
                                     }
                                 }
                                 .padding(.horizontal, 24)
+                                .padding(.vertical, 12)
                             }
                         }
                     }
 
                     // Similar Artists Section
                     if !info.similarArtists.isEmpty {
-                        VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 4) {
                             Text("Похожие исполнители")
                                 .font(.system(size: 18, weight: .bold))
                                 .foregroundStyle(YMTheme.fg)
@@ -223,6 +232,8 @@ public struct ArtistDetailView: View {
                                     }
                                 }
                                 .padding(.horizontal, 24)
+                                .padding(.top, 10)
+                                .padding(.bottom, 8)
                             }
                         }
                     }
@@ -250,9 +261,27 @@ public struct ArtistDetailView: View {
                 }
             }
             .padding(.bottom, 24)
+            .background(alignment: .top) {
+                YMScrollTopSentinel(
+                    coordinateSpaceName: "artist_detail_scroll",
+                    threshold: 84,
+                    isScrolled: $isScrolled
+                )
+            }
+        }
+        .coordinateSpace(name: "artist_detail_scroll")
+        .overlay(alignment: .top) {
+            YMStickyDetailTopBar(
+                backTitle: "Назад",
+                title: briefInfo?.artist.name ?? artistName,
+                isScrolled: isScrolled
+            ) {
+                coordinator.pop()
+            }
         }
         .ymScreenBackground()
         .task(id: artistId) {
+            isScrolled = false
             loadArtistData()
         }
     }

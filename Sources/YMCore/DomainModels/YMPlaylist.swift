@@ -49,21 +49,36 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
     public let uid: String
     public let kind: Int
     public let title: String
+    public let description: String?
+    public let visibility: String?
+    public let revision: Int?
     public let trackCount: Int?
     public let coverUri: String?
     public let ogImage: String?
     public let tracks: [YMTrackShort]?
 
+    public var isPrivate: Bool {
+        visibility?.lowercased() == "private"
+    }
+
     enum CodingKeys: String, CodingKey {
         case uid
         case kind
         case title
+        case description
+        case descriptionFormatted
+        case visibility
+        case revision
         case trackCount
         case cover
         case coverUri
         case ogImage
         case tracks
         case owner
+    }
+
+    enum DescriptionKeys: String, CodingKey {
+        case text
     }
 
     enum CoverKeys: String, CodingKey {
@@ -80,6 +95,9 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
         uid: String,
         kind: Int,
         title: String,
+        description: String? = nil,
+        visibility: String? = nil,
+        revision: Int? = nil,
         trackCount: Int? = nil,
         coverUri: String? = nil,
         ogImage: String? = nil,
@@ -88,6 +106,9 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
         self.uid = uid
         self.kind = kind
         self.title = title
+        self.description = description
+        self.visibility = visibility
+        self.revision = revision
         self.trackCount = trackCount
         self.coverUri = coverUri
         self.ogImage = ogImage
@@ -108,6 +129,20 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
 
         self.kind = (try? container.decodeIfPresent(Int.self, forKey: .kind)) ?? 0
         self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "Плейлист"
+
+        if let descStr = try? container.decodeIfPresent(String.self, forKey: .description), !descStr.isEmpty {
+            self.description = descStr
+        } else if let descObj = try? container.nestedContainer(keyedBy: DescriptionKeys.self, forKey: .description),
+                  let descText = try? descObj.decodeIfPresent(String.self, forKey: .text), !descText.isEmpty {
+            self.description = descText
+        } else if let descFmt = try? container.decodeIfPresent(String.self, forKey: .descriptionFormatted), !descFmt.isEmpty {
+            self.description = descFmt
+        } else {
+            self.description = nil
+        }
+
+        self.visibility = try? container.decodeIfPresent(String.self, forKey: .visibility)
+        self.revision = try? container.decodeIfPresent(Int.self, forKey: .revision)
         self.trackCount = try? container.decodeIfPresent(Int.self, forKey: .trackCount)
         self.ogImage = try? container.decodeIfPresent(String.self, forKey: .ogImage)
 
@@ -133,6 +168,9 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
         try container.encode(uid, forKey: .uid)
         try container.encode(kind, forKey: .kind)
         try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encodeIfPresent(visibility, forKey: .visibility)
+        try container.encodeIfPresent(revision, forKey: .revision)
         try container.encodeIfPresent(trackCount, forKey: .trackCount)
         try container.encodeIfPresent(coverUri, forKey: .coverUri)
         try container.encodeIfPresent(ogImage, forKey: .ogImage)

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Bottom Player Bar anchored via safeAreaInset.
 /// Modern macOS dark glass design with balanced symmetrical controls,
@@ -11,10 +12,17 @@ public struct PlayerBarView: View {
     @UIState private var isFlameActive = false
     @UIState private var isMuted = false
     @UIState private var previousVolume: Float = 1.0
+    @UIState private var eqSettings = EqualizerSettings.shared
 
     public init() {}
 
+    private var isFullscreenNowPlaying: Bool {
+        coordinator.isLyricsPresented && coordinator.lyricsPosition == .right
+    }
+
     public var body: some View {
+        let nowPlayingStyle = isFullscreenNowPlaying
+
         HStack(spacing: 0) {
             // Left: Track cover, Title, Artist, Like
             leftTrackSection
@@ -37,25 +45,41 @@ public struct PlayerBarView: View {
         .frame(height: 76)
         .frame(maxWidth: .infinity)
         .background {
-            ZStack(alignment: .top) {
-                VisualEffectBlur(material: .headerView, blendingMode: .withinWindow)
-
+            if nowPlayingStyle {
+                // Seamless bottom dissolve over the fullscreen atmospheric backdrop:
+                // no hard border, no glowing box on bright album covers, just a gentle vertical scrim.
+                let scrimBase = YMTheme.isLight ? YMTheme.bg : Color.black
                 LinearGradient(
-                    colors: [
-                        YMTheme.playerBg.opacity(0.85),
-                        YMTheme.playerBg.opacity(0.96),
-                        YMTheme.playerBg
+                    stops: [
+                        .init(color: Color.clear, location: 0.0),
+                        .init(color: scrimBase.opacity(YMTheme.isLight ? 0.20 : 0.22), location: 0.42),
+                        .init(color: scrimBase.opacity(YMTheme.isLight ? 0.38 : 0.42), location: 1.0)
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
+                .padding(.top, -32)
+                .allowsHitTesting(false)
+            } else {
+                ZStack(alignment: .top) {
+                    VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
+                    YMTheme.playerBg.opacity(0.84)
+                }
             }
         }
         .overlay(alignment: .top) {
-            YMTheme.border
-                .frame(height: 1)
+            if !nowPlayingStyle {
+                YMTheme.border
+                    .frame(height: 1)
+            }
         }
-        .shadow(color: YMTheme.playerBarShadow, radius: 10, x: 0, y: -4)
+        .shadow(
+            color: nowPlayingStyle ? Color.clear : YMTheme.playerBarShadow,
+            radius: nowPlayingStyle ? 0 : 10,
+            x: 0,
+            y: nowPlayingStyle ? 0 : -4
+        )
+        .animation(.easeInOut(duration: 0.25), value: nowPlayingStyle)
     }
 
     // MARK: - Left Track Section
@@ -66,7 +90,9 @@ public struct PlayerBarView: View {
             if let track = audioEngine.currentTrack {
                 Button {
                     if let album = track.albums.first {
-                        coordinator.navigate(to: .album(id: album.id, title: album.title))
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                            coordinator.navigate(to: .album(id: album.id, title: album.title))
+                        }
                     }
                 } label: {
                     CachedCoverImage(
@@ -88,7 +114,9 @@ public struct PlayerBarView: View {
 
                     if let firstArtist = track.artists.first {
                         Button {
-                            coordinator.navigate(to: .artist(id: firstArtist.id, name: firstArtist.name))
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                                coordinator.navigate(to: .artist(id: firstArtist.id, name: firstArtist.name))
+                            }
                         } label: {
                             Text(track.artistsString)
                                 .font(.system(size: 11))
@@ -104,23 +132,22 @@ public struct PlayerBarView: View {
                             .lineLimit(1)
                     }
                 }
-                .frame(maxWidth: 160, alignment: .leading)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .layoutPriority(1)
 
                 // Heart / Like button
-                Button {
+                PlayerHoverIconButton(
+                    systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart",
+                    fontSize: windowState.isMiniWidth ? 12 : 13,
+                    foregroundColor: likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg60,
+                    isActive: false,
+                    buttonSize: windowState.isMiniWidth ? 24 : 28,
+                    helpText: likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Мне нравится"
+                ) {
                     Task {
                         await likesService.toggleLike(track: track)
                     }
-                } label: {
-                    Image(systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart")
-                        .font(.system(size: 13))
-                        .foregroundColor(likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg60)
-                        .padding(6)
-                        .background(Circle().fill(YMTheme.surfaceComponent))
                 }
-                .buttonStyle(.plain)
-                .help(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Мне нравится")
             } else {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(YMTheme.surfaceComponent)
@@ -129,7 +156,8 @@ public struct PlayerBarView: View {
                 Text("Ничего не играет")
                     .font(.system(size: 13))
                     .foregroundStyle(YMTheme.fg40)
-                    .frame(maxWidth: 160, alignment: .leading)
+                    .lineLimit(1)
+                    .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -144,18 +172,16 @@ public struct PlayerBarView: View {
                 if audioEngine.isWaveMode {
                     if !windowState.isMiniWidth {
                         // Button 1 (Leftmost): Dislike
-                        Button {
+                        PlayerHoverIconButton(
+                            systemName: "hand.thumbsdown.fill",
+                            fontSize: 12,
+                            foregroundColor: YMTheme.fg60,
+                            isActive: false,
+                            isDisabled: audioEngine.currentTrack == nil,
+                            helpText: "Меньше таких треков"
+                        ) {
                             audioEngine.applyWaveTuning(.lessLikeThis)
-                        } label: {
-                            Image(systemName: "hand.thumbsdown.fill")
-                                .font(.system(size: 12))
-                                .foregroundStyle(YMTheme.fg60)
-                                .padding(6)
-                                .background(Circle().fill(YMTheme.surfaceComponent))
                         }
-                        .buttonStyle(.plain)
-                        .disabled(audioEngine.currentTrack == nil)
-                        .help("Меньше таких треков")
                     }
 
                     // Button 2: Previous Track
@@ -169,7 +195,14 @@ public struct PlayerBarView: View {
 
                     if !windowState.isMiniWidth {
                         // Button 5 (Rightmost): Flame (More Like This)
-                        Button {
+                        PlayerHoverIconButton(
+                            systemName: "flame.fill",
+                            fontSize: 12,
+                            foregroundColor: isFlameActive ? Color.orange : YMTheme.accent,
+                            isActive: isFlameActive,
+                            isDisabled: audioEngine.currentTrack == nil,
+                            helpText: "Больше таких треков"
+                        ) {
                             audioEngine.applyWaveTuning(.moreLikeThis)
                             isFlameActive = true
                             Task {
@@ -178,32 +211,21 @@ public struct PlayerBarView: View {
                                     isFlameActive = false
                                 }
                             }
-                        } label: {
-                            Image(systemName: "flame.fill")
-                                .font(.system(size: 12))
-                                .foregroundStyle(isFlameActive ? Color.orange : YMTheme.accent)
-                                .padding(6)
-                                .background(Circle().fill(YMTheme.surfaceComponent))
                         }
-                        .buttonStyle(.plain)
-                        .disabled(audioEngine.currentTrack == nil)
-                        .help("Больше таких треков")
                     }
                 } else {
                     if !windowState.isMiniWidth {
                         // Button 1 (Leftmost): Shuffle
-                        Button {
+                        PlayerHoverIconButton(
+                            systemName: "shuffle",
+                            fontSize: 12,
+                            foregroundColor: audioEngine.isShuffleEnabled ? YMTheme.accent : YMTheme.fg60,
+                            isActive: audioEngine.isShuffleEnabled,
+                            isDisabled: audioEngine.currentTrack == nil && audioEngine.queue.isEmpty,
+                            helpText: audioEngine.isShuffleEnabled ? "Выключить перемешивание" : "Перемешать очередь"
+                        ) {
                             audioEngine.toggleShuffle()
-                        } label: {
-                            Image(systemName: "shuffle")
-                                .font(.system(size: 12))
-                                .foregroundStyle(audioEngine.isShuffleEnabled ? YMTheme.accent : YMTheme.fg60)
-                                .padding(6)
-                                .background(Circle().fill(audioEngine.isShuffleEnabled ? YMTheme.accent.opacity(0.18) : YMTheme.surfaceComponent))
                         }
-                        .buttonStyle(.plain)
-                        .disabled(audioEngine.currentTrack == nil && audioEngine.queue.isEmpty)
-                        .help(audioEngine.isShuffleEnabled ? "Выключить перемешивание" : "Перемешать очередь")
                     }
 
                     // Button 2: Previous Track
@@ -217,20 +239,18 @@ public struct PlayerBarView: View {
 
                     if !windowState.isMiniWidth {
                         // Button 5 (Rightmost): Start Wave from Current Track
-                        Button {
+                        PlayerHoverIconButton(
+                            systemName: "waveform.path.ecg",
+                            fontSize: 12,
+                            foregroundColor: YMTheme.fg60,
+                            isActive: false,
+                            isDisabled: audioEngine.currentTrack == nil,
+                            helpText: "Запустить Мою волну по текущему треку"
+                        ) {
                             if let track = audioEngine.currentTrack {
                                 audioEngine.startWave(forTrack: track)
                             }
-                        } label: {
-                            Image(systemName: "waveform.path.ecg")
-                                .font(.system(size: 12))
-                                .foregroundStyle(YMTheme.fg60)
-                                .padding(6)
-                                .background(Circle().fill(YMTheme.surfaceComponent))
                         }
-                        .buttonStyle(.plain)
-                        .disabled(audioEngine.currentTrack == nil)
-                        .help("Запустить Мою волну по текущему треку")
                     }
                 }
             }
@@ -247,17 +267,17 @@ public struct PlayerBarView: View {
 
     @ViewBuilder
     private var previousButton: some View {
-        Button {
+        PlayerHoverIconButton(
+            systemName: "backward.fill",
+            fontSize: windowState.isMiniWidth ? 12 : 13,
+            foregroundColor: audioEngine.currentTrack == nil ? YMTheme.fg40 : YMTheme.fg80,
+            isActive: false,
+            isDisabled: audioEngine.currentTrack == nil,
+            buttonSize: windowState.isMiniWidth ? 24 : 28,
+            helpText: "Предыдущий трек"
+        ) {
             audioEngine.previous()
-        } label: {
-            Image(systemName: "backward.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(audioEngine.currentTrack == nil ? YMTheme.fg40 : YMTheme.fg80)
-                .padding(6)
         }
-        .buttonStyle(.plain)
-        .disabled(audioEngine.currentTrack == nil)
-        .help("Предыдущий трек")
     }
 
     @ViewBuilder
@@ -268,11 +288,11 @@ public struct PlayerBarView: View {
             ZStack {
                 Circle()
                     .fill(YMTheme.accentFill)
-                    .frame(width: 38, height: 38)
-                    .shadow(color: YMTheme.accentFill.opacity(audioEngine.isPlaying ? 0.35 : 0.15), radius: 6, y: 1)
+                    .frame(width: windowState.isMiniWidth ? 34 : 38, height: windowState.isMiniWidth ? 34 : 38)
+                    .shadow(color: YMTheme.accentFill.opacity(audioEngine.isPlaying ? 0.30 : 0.14), radius: 6, y: 1)
 
                 Image(systemName: audioEngine.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: windowState.isMiniWidth ? 14 : 15, weight: .bold))
                     .foregroundColor(Color.black)
                     .offset(x: audioEngine.isPlaying ? 0 : 1)
             }
@@ -284,28 +304,35 @@ public struct PlayerBarView: View {
 
     @ViewBuilder
     private var nextButton: some View {
-        Button {
+        PlayerHoverIconButton(
+            systemName: "forward.fill",
+            fontSize: windowState.isMiniWidth ? 12 : 13,
+            foregroundColor: audioEngine.currentTrack == nil ? YMTheme.fg40 : YMTheme.fg80,
+            isActive: false,
+            isDisabled: audioEngine.currentTrack == nil,
+            buttonSize: windowState.isMiniWidth ? 24 : 28,
+            helpText: "Следующий трек"
+        ) {
             audioEngine.next()
-        } label: {
-            Image(systemName: "forward.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(audioEngine.currentTrack == nil ? YMTheme.fg40 : YMTheme.fg80)
-                .padding(6)
         }
-        .buttonStyle(.plain)
-        .disabled(audioEngine.currentTrack == nil)
-        .help("Следующий трек")
     }
 
     // MARK: - Right Controls Section
 
     @ViewBuilder
     private var rightControlsSection: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: windowState.isMiniWidth ? 6 : 10) {
             // Lyrics Button (available whenever track is loaded/playing)
             if let track = audioEngine.currentTrack {
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                PlayerHoverIconButton(
+                    systemName: coordinator.isLyricsPresented ? "quote.bubble.fill" : "quote.bubble",
+                    fontSize: windowState.isMiniWidth ? 11 : 12,
+                    foregroundColor: coordinator.isLyricsPresented ? YMTheme.accent : YMTheme.fg80,
+                    isActive: coordinator.isLyricsPresented,
+                    buttonSize: windowState.isMiniWidth ? 24 : 28,
+                    helpText: coordinator.isLyricsPresented ? "Скрыть текст песни" : "Показать текст песни"
+                ) {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
                         if coordinator.isLyricsPresented {
                             coordinator.isLyricsPresented = false
                             coordinator.lyricsTrack = nil
@@ -313,15 +340,21 @@ public struct PlayerBarView: View {
                             coordinator.showLyrics(for: track)
                         }
                     }
-                } label: {
-                    Image(systemName: coordinator.isLyricsPresented ? "quote.bubble.fill" : "quote.bubble")
-                        .font(.system(size: 12))
-                        .foregroundStyle(coordinator.isLyricsPresented ? YMTheme.accent : YMTheme.fg80)
-                        .padding(6)
-                        .background(Circle().fill(coordinator.isLyricsPresented ? YMTheme.accent.opacity(0.18) : YMTheme.surfaceComponent))
                 }
-                .buttonStyle(.plain)
-                .help(coordinator.isLyricsPresented ? "Скрыть текст песни" : "Показать текст песни")
+            }
+
+            // Equalizer Floating Card Button
+            PlayerHoverIconButton(
+                systemName: "slider.vertical.3",
+                fontSize: windowState.isMiniWidth ? 11 : 12,
+                foregroundColor: (eqSettings.isEnabled || coordinator.isEqualizerPresented) ? YMTheme.accent : YMTheme.fg80,
+                isActive: eqSettings.isEnabled || coordinator.isEqualizerPresented,
+                buttonSize: windowState.isMiniWidth ? 24 : 28,
+                helpText: eqSettings.isEnabled ? "Эквалайзер (включён)" : "Эквалайзер"
+            ) {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                    coordinator.isEqualizerPresented.toggle()
+                }
             }
 
             // Fixed-Width Quality Badge Menu (hidden in mini mode to prevent crowding)
@@ -329,33 +362,35 @@ public struct PlayerBarView: View {
                 AudioQualityMenu(audioEngine: audioEngine)
             }
 
-            // Volume Control
+            // Volume Control (slider hidden in mini mode so playback controls & scrubber stay spacious at 440pt)
             HStack(spacing: 6) {
-                Button {
+                PlayerHoverIconButton(
+                    systemName: volumeIcon,
+                    fontSize: windowState.isMiniWidth ? 11 : 12,
+                    foregroundColor: YMTheme.fg60,
+                    isActive: false,
+                    buttonSize: windowState.isMiniWidth ? 24 : 28,
+                    helpText: isMuted ? "Включить звук" : "Выключить звук"
+                ) {
                     toggleMute()
-                } label: {
-                    Image(systemName: volumeIcon)
-                        .font(.system(size: 12))
-                        .foregroundStyle(YMTheme.fg60)
-                        .frame(width: 16)
                 }
-                .buttonStyle(.plain)
-                .help(isMuted ? "Включить звук" : "Выключить звук")
 
-                YMSlider(
-                    value: Binding(
-                        get: { Double(audioEngine.volume) },
-                        set: {
-                            audioEngine.volume = Float($0)
-                            if $0 > 0 { isMuted = false }
-                        }
-                    ),
-                    in: 0...1,
-                    activeColor: YMTheme.fg,
-                    trackColor: YMTheme.surfaceComponentHover,
-                    height: 3
-                )
-                .frame(width: windowState.isMiniWidth ? 46 : 68)
+                if !windowState.isMiniWidth {
+                    YMSlider(
+                        value: Binding(
+                            get: { Double(audioEngine.volume) },
+                            set: {
+                                audioEngine.volume = Float($0)
+                                if $0 > 0 { isMuted = false }
+                            }
+                        ),
+                        in: 0...1,
+                        activeColor: YMTheme.fg,
+                        trackColor: YMTheme.surfaceComponentHover,
+                        height: 3
+                    )
+                    .frame(width: 68)
+                }
             }
         }
     }
@@ -531,5 +566,47 @@ private struct IsolatedProgressSlider: View {
                 .foregroundStyle(YMTheme.fg40)
                 .frame(width: 36, alignment: .leading)
         }
+    }
+}
+
+// MARK: - Clean Hover-Only Circular Icon Button
+
+/// Minimalist player bar icon button that stays uncluttered at rest and reveals a soft circular plate on hover.
+private struct PlayerHoverIconButton: View {
+    let systemName: String
+    let fontSize: CGFloat
+    let foregroundColor: Color
+    var isActive: Bool = false
+    var isDisabled: Bool = false
+    var buttonSize: CGFloat = 28
+    let helpText: String
+    let action: () -> Void
+
+    @UIState private var isHovered = false
+
+    private var plateColor: Color {
+        if isActive {
+            return YMTheme.accent.opacity(isHovered ? 0.22 : 0.14)
+        } else if isHovered && !isDisabled {
+            return YMTheme.surfaceComponentHover
+        } else {
+            return Color.clear
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: fontSize, weight: .medium))
+                .foregroundStyle(foregroundColor)
+                .frame(width: buttonSize, height: buttonSize)
+                .background(Circle().fill(plateColor))
+                .contentShape(Circle())
+                .animation(.easeInOut(duration: 0.14), value: isHovered)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { isHovered = $0 }
+        .help(helpText)
     }
 }

@@ -9,9 +9,11 @@ public struct AlbumDetailView: View {
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
     @UIState private var loadTask: Task<Void, Never>? = nil
+    @UIState private var isScrolled = false
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var coordinator = NavigationCoordinator.shared
+    @UIState private var windowState = WindowState.shared
     private let networkClient = YMNetworkClient.shared
 
     public init(albumId: String, albumTitle: String) {
@@ -20,36 +22,7 @@ public struct AlbumDetailView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            // Top Navigation Bar
-            HStack(spacing: 12) {
-                Button {
-                    coordinator.pop()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("Назад")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(YMTheme.surfaceComponent))
-                    .overlay(Capsule().strokeBorder(YMTheme.border, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut("[", modifiers: .command)
-
-                Text(album?.title ?? albumTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(YMTheme.fg60)
-
-                Spacer()
-            }
-            .padding(.top, 16)
-            .padding(.horizontal, 24)
-            .padding(.bottom, 12)
-
+        Group {
             if isLoading {
                 VStack(spacing: 16) {
                     ProgressView()
@@ -76,25 +49,26 @@ public struct AlbumDetailView: View {
             } else if let album = album {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
-                        // Hero Header
-                        HStack(alignment: .bottom, spacing: 24) {
+                        // Hero Header with atmospheric cover glow
+                        let coverSize: CGFloat = windowState.isCompactWidth ? 104 : 160
+                        HStack(alignment: .bottom, spacing: windowState.isCompactWidth ? 16 : 24) {
                             CachedCoverImage(
                                 coverUri: album.coverUri,
                                 size: .large,
-                                displaySize: 160,
-                                cornerRadius: YMTheme.cornerRadiusMedium
+                                displaySize: coverSize,
+                                cornerRadius: YMTheme.cornerRadiusLarge
                             )
-                            .frame(width: 160, height: 160)
-                            .shadow(color: .black.opacity(0.45), radius: 20, y: 10)
+                            .frame(width: coverSize, height: coverSize)
+                            .shadow(color: YMTheme.shadowColor, radius: 20, y: 10)
 
-                            VStack(alignment: .leading, spacing: 8) {
+                            VStack(alignment: .leading, spacing: windowState.isCompactWidth ? 6 : 8) {
                                 Text("АЛЬБОМ")
                                     .font(.system(size: 11, weight: .bold))
                                     .foregroundStyle(YMTheme.fg40)
                                     .tracking(1.2)
 
                                 Text(album.title)
-                                    .font(.system(size: 26, weight: .bold))
+                                    .font(.system(size: windowState.isCompactWidth ? 20 : 26, weight: .bold))
                                     .foregroundStyle(YMTheme.fg)
                                     .lineLimit(2)
 
@@ -105,8 +79,9 @@ public struct AlbumDetailView: View {
                                             coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
                                         } label: {
                                             Text(artist.name)
-                                                .font(.system(size: 14, weight: .semibold))
+                                                .font(.system(size: 13, weight: .semibold))
                                                 .foregroundStyle(YMTheme.accent)
+                                                .lineLimit(1)
                                         }
                                         .buttonStyle(.plain)
                                     }
@@ -115,26 +90,28 @@ public struct AlbumDetailView: View {
                                 Text(album.formattedInfo)
                                     .font(.caption)
                                     .foregroundStyle(YMTheme.fg60)
+                                    .lineLimit(1)
 
                                 // Action Bar
-                                HStack(spacing: 12) {
-                                    Button {
-                                        audioEngine.isWaveMode = false
-                                        audioEngine.assignQueue(album.allTracks, startingAt: 0)
-                                    } label: {
-                                        Label("Слушать альбом", systemImage: "play.fill")
-                                    }
-                                    .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 34))
+                                Button {
+                                    audioEngine.isWaveMode = false
+                                    audioEngine.assignQueue(album.allTracks, startingAt: 0)
+                                } label: {
+                                    Label(windowState.isMiniWidth ? "Слушать" : "Слушать альбом", systemImage: "play.fill")
                                 }
+                                .buttonStyle(YMGlassPillButtonStyle(primary: true, height: windowState.isMiniWidth ? 30 : 34))
                                 .padding(.top, 4)
                             }
 
-                            Spacer()
+                            Spacer(minLength: 0)
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 16)
+                        .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
+                        .padding(.top, 54)
+                        .padding(.bottom, windowState.isCompactWidth ? 14 : 20)
+                        .ymAmbientCoverGlow(coverUri: album.coverUri, opacity: 0.24)
 
                         Divider()
+                            .overlay(YMTheme.border)
                             .padding(.horizontal, 24)
                             .padding(.bottom, 8)
 
@@ -154,11 +131,29 @@ public struct AlbumDetailView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 90)
+                    .background(alignment: .top) {
+                        YMScrollTopSentinel(
+                            coordinateSpaceName: "album_detail_scroll",
+                            threshold: 84,
+                            isScrolled: $isScrolled
+                        )
+                    }
                 }
+                .coordinateSpace(name: "album_detail_scroll")
+            }
+        }
+        .overlay(alignment: .top) {
+            YMStickyDetailTopBar(
+                backTitle: "Назад",
+                title: album?.title ?? albumTitle,
+                isScrolled: isScrolled
+            ) {
+                coordinator.pop()
             }
         }
         .ymScreenBackground()
         .task(id: albumId) {
+            isScrolled = false
             loadAlbumData()
         }
     }

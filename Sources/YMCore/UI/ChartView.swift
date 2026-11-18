@@ -1,13 +1,17 @@
 import SwiftUI
+import AppKit
 
 /// Chart (Чарт) view showing the Top 100 most popular tracks in Yandex Music with positions, shifts, and rich actions.
 public struct ChartView: View {
     @UIState private var chartItems: [YMChartItem] = []
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
+    @UIState private var selectedTrackId: String? = nil
+    @UIState private var lastClickedTrackId: String? = nil
+    @UIState private var lastClickTimestamp: TimeInterval = 0
+    @UIState private var isScrolled = false
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var windowState = WindowState.shared
     private let networkClient = YMNetworkClient.shared
@@ -19,6 +23,11 @@ public struct ChartView: View {
     }
 
     public var body: some View {
+        let currentTrackId = audioEngine.currentTrack?.id
+        let isEnginePlaying = audioEngine.isPlaying
+        let isCompactWidth = windowState.isCompactWidth
+        let isMiniWidth = windowState.isMiniWidth
+
         Group {
             if isLoading {
                 VStack(spacing: 16) {
@@ -46,65 +55,54 @@ public struct ChartView: View {
             } else {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 0) {
-                        // Top Header
-                        HStack(alignment: .center, spacing: 16) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Чарт")
-                                    .font(.system(size: 28, weight: .bold))
-                                    .foregroundStyle(YMTheme.fg)
-
-                                Text("Топ треков, которые прямо сейчас слушают в Яндекс Музыке")
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(YMTheme.fg60)
+                        // Top Header (adaptive for narrow 440pt windows)
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .center, spacing: 16) {
+                                chartTitleBlock
+                                Spacer(minLength: 12)
+                                if !chartTracks.isEmpty {
+                                    chartPlayButton(height: 36)
+                                }
                             }
 
-                            Spacer()
-
-                            if !chartTracks.isEmpty {
-                                Button {
-                                    audioEngine.assignQueue(chartTracks, startingAt: 0)
-                                } label: {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "play.fill")
-                                            .font(.system(size: 12))
-                                        Text("Слушать чарт")
-                                            .font(.system(size: 13, weight: .semibold))
-                                    }
+                            VStack(alignment: .leading, spacing: 12) {
+                                chartTitleBlock
+                                if !chartTracks.isEmpty {
+                                    chartPlayButton(height: 32)
                                 }
-                                .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 36))
                             }
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.top, 24)
+                        .padding(.horizontal, isMiniWidth ? 16 : 24)
+                        .padding(.top, windowState.topChromeContentPadding)
                         .padding(.bottom, 16)
 
                         // Table Column Headers
-                        HStack(spacing: 12) {
+                        HStack(spacing: isMiniWidth ? 8 : 12) {
                             Text("#")
-                                .frame(width: 44, alignment: .center)
+                                .frame(width: isMiniWidth ? 40 : 48, alignment: .center)
 
                             Color.clear
                                 .frame(width: 40)
 
                             Text("ТРЕК")
-                                .frame(minWidth: windowState.isMiniWidth ? 120 : 180, alignment: .leading)
+                                .frame(minWidth: isMiniWidth ? 100 : 180, alignment: .leading)
 
                             Spacer()
 
-                            if !windowState.isCompactWidth {
+                            if !isCompactWidth {
                                 Text("АЛЬБОМ")
                                     .frame(width: 180, alignment: .leading)
                             }
 
                             Color.clear
-                                .frame(width: 32)
+                                .frame(width: isMiniWidth ? 28 : 32)
 
                             Text("ВРЕМЯ")
-                                .frame(width: 50, alignment: .trailing)
+                                .frame(width: isMiniWidth ? 42 : 50, alignment: .trailing)
                         }
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(YMTheme.fg40)
-                        .padding(.horizontal, 24)
+                        .padding(.horizontal, isMiniWidth ? 18 : 24)
                         .padding(.bottom, 8)
 
                         Divider()
@@ -115,19 +113,31 @@ public struct ChartView: View {
                         LazyVStack(spacing: 2) {
                             ForEach(Array(chartItems.enumerated()), id: \.element.id) { index, item in
                                 if let track = item.track {
+                                    let isCurrent = currentTrackId == track.id
                                     ChartTrackRow(
                                         item: item,
                                         track: track,
                                         index: index,
-                                        isPlaying: audioEngine.currentTrack?.id == track.id && audioEngine.isPlaying,
+                                        isCurrentTrack: isCurrent,
+                                        isPlaying: isCurrent && isEnginePlaying,
+                                        isSelected: selectedTrackId == track.id,
+                                        isCompactWidth: isCompactWidth,
+                                        isMiniWidth: isMiniWidth,
                                         onPlay: {
+                                            selectedTrackId = track.id
                                             audioEngine.assignQueue(chartTracks, startingAt: index)
+                                        },
+                                        onTapRow: {
+                                            handleRowTap(track: track, index: index)
                                         },
                                         onArtistSelect: { artist in
                                             coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
                                         },
                                         onAlbumSelect: { album in
                                             coordinator.navigate(to: .album(id: album.id, title: album.title))
+                                        },
+                                        onShowLyrics: {
+                                            coordinator.showLyrics(for: track)
                                         }
                                     )
                                 }
@@ -135,12 +145,18 @@ public struct ChartView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.bottom, 90)
-                        .onHover { isInside in
-                            if !isInside {
-                                TrackHoverManager.shared.clear()
-                            }
-                        }
                     }
+                    .background(alignment: .top) {
+                        YMScrollTopSentinel(
+                            coordinateSpaceName: "chart_scroll",
+                            threshold: 64,
+                            isScrolled: $isScrolled
+                        )
+                    }
+                }
+                .coordinateSpace(name: "chart_scroll")
+                .overlay(alignment: .top) {
+                    YMStickyTopBar(title: "Чарт", isVisible: isScrolled)
                 }
             }
         }
@@ -149,6 +165,51 @@ public struct ChartView: View {
             if chartItems.isEmpty {
                 loadChart()
             }
+        }
+    }
+
+    @ViewBuilder
+    private var chartTitleBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Чарт")
+                .font(.system(size: windowState.isCompactWidth ? 24 : 28, weight: .bold))
+                .foregroundStyle(YMTheme.fg)
+
+            Text("Топ треков, которые прямо сейчас слушают в Яндекс Музыке")
+                .font(.system(size: 13))
+                .foregroundStyle(YMTheme.fg60)
+                .lineLimit(2)
+        }
+    }
+
+    @ViewBuilder
+    private func chartPlayButton(height: CGFloat) -> some View {
+        Button {
+            audioEngine.assignQueue(chartTracks, startingAt: 0)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 12))
+                Text("Слушать чарт")
+                    .font(.system(size: 13, weight: .semibold))
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+        .buttonStyle(YMGlassPillButtonStyle(primary: true, height: height))
+    }
+
+    private func handleRowTap(track: YMTrack, index: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let clickCount = NSApp?.currentEvent?.clickCount ?? 1
+        let isDouble = clickCount >= 2
+            || (selectedTrackId == track.id
+                && lastClickedTrackId == track.id
+                && (now - lastClickTimestamp) <= NSEvent.doubleClickInterval)
+        selectedTrackId = track.id
+        lastClickedTrackId = track.id
+        lastClickTimestamp = now
+        if isDouble {
+            audioEngine.assignQueue(chartTracks, startingAt: index)
         }
     }
 
@@ -178,53 +239,64 @@ private struct ChartTrackRow: View {
     let item: YMChartItem
     let track: YMTrack
     let index: Int
+    let isCurrentTrack: Bool
     let isPlaying: Bool
+    let isSelected: Bool
+    let isCompactWidth: Bool
+    let isMiniWidth: Bool
     let onPlay: () -> Void
+    let onTapRow: () -> Void
     let onArtistSelect: (YMArtist) -> Void
     let onAlbumSelect: (YMAlbum) -> Void
+    let onShowLyrics: () -> Void
 
     @UIState private var likesService = LikesService.shared
-    @UIState private var audioEngine = AudioPlayerEngine.shared
-    @UIState private var coordinator = NavigationCoordinator.shared
-    @UIState private var windowState = WindowState.shared
-    @UIState private var hoverManager = TrackHoverManager.shared
+    private let hoverManager = TrackHoverManager.shared
 
     private var isHovered: Bool {
-        hoverManager.isHovered(trackId: track.id)
+        hoverManager.state(for: track.id).isHovered
     }
 
     private var position: Int {
         item.chart?.position ?? (index + 1)
     }
 
+    private func triggerPlaybackAction() {
+        if isCurrentTrack {
+            AudioPlayerEngine.shared.togglePlayPause()
+        } else {
+            onPlay()
+        }
+    }
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: isMiniWidth ? 8 : 12) {
             rankView
             coverAndPlayView
             titleAndArtistsView
-            Spacer()
-            if !windowState.isCompactWidth {
+            Spacer(minLength: 4)
+            if !isCompactWidth {
                 albumView
             }
             likeButtonView
             durationView
         }
         .padding(.vertical, 6)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, isMiniWidth ? 6 : 10)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isPlaying ? YMTheme.surfaceComponentHover : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(
+                    isSelected
+                        ? YMTheme.surfaceComponentHover
+                        : (isCurrentTrack ? YMTheme.accent.opacity(0.12) : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+                )
         )
         .contentShape(Rectangle())
-        .onHover { hovering in
-            if hovering {
-                hoverManager.setHovered(track.id)
-            } else if hoverManager.hoveredTrackId == track.id {
-                hoverManager.clear()
-            }
+        .onHover { isInside in
+            hoverManager.handleRowHover(trackId: track.id, isInside: isInside)
         }
-        .onTapGesture(count: 2) {
-            onPlay()
+        .onTapGesture {
+            onTapRow()
         }
         .contextMenu {
             rowContextMenu
@@ -233,78 +305,71 @@ private struct ChartTrackRow: View {
 
     @ViewBuilder
     private var rankView: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: isMiniWidth ? 2 : 3) {
             if position <= 3 {
                 Text("\(position)")
-                    .font(.system(size: 14, weight: .bold).monospacedDigit())
+                    .font(.system(size: isMiniWidth ? 13 : 14, weight: .bold).monospacedDigit())
                     .foregroundColor(YMTheme.accent)
-                    .frame(width: 22, alignment: .trailing)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(width: isMiniWidth ? 24 : 28, alignment: .trailing)
             } else {
                 Text("\(position)")
-                    .font(.system(size: 13, weight: isPlaying ? .bold : .medium).monospacedDigit())
-                    .foregroundStyle(isPlaying ? YMTheme.accent : YMTheme.fg60)
-                    .frame(width: 22, alignment: .trailing)
+                    .font(.system(size: isMiniWidth ? 12 : 13, weight: isCurrentTrack ? .bold : .medium).monospacedDigit())
+                    .foregroundStyle(isCurrentTrack ? YMTheme.accent : YMTheme.fg60)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .frame(width: isMiniWidth ? 24 : 28, alignment: .trailing)
             }
 
             shiftIndicator
-                .frame(width: 14, alignment: .center)
+                .frame(width: isMiniWidth ? 12 : 14, alignment: .center)
         }
-        .frame(width: 44)
+        .frame(width: isMiniWidth ? 40 : 48)
     }
 
     @ViewBuilder
     private var coverAndPlayView: some View {
-        ZStack {
-            CachedCoverImage(
-                coverUri: track.effectiveCoverUri,
-                size: .small,
-                displaySize: 40,
-                cornerRadius: 6
-            )
-
-            if isPlaying {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.black.opacity(0.6))
-                    .frame(width: 40, height: 40)
+        Button {
+            triggerPlaybackAction()
+        } label: {
+            ZStack {
+                CachedCoverImage(
+                    coverUri: track.effectiveCoverUri,
+                    size: .small,
+                    displaySize: 40,
+                    cornerRadius: 6
+                )
 
                 if isHovered {
-                    Button {
-                        audioEngine.togglePlayPause()
-                    } label: {
-                        Image(systemName: audioEngine.isPlaying ? "pause.fill" : "play.fill")
-                            .foregroundColor(YMTheme.accent)
-                            .font(.system(size: 14, weight: .bold))
-                    }
-                    .buttonStyle(.plain)
-                    .help(audioEngine.isPlaying ? "Пауза" : "Воспроизвести")
-                } else {
-                    YMPlayingEqualizerView(color: YMTheme.accent, barWidth: 2.5, maxHeight: 15, isPlaying: audioEngine.isPlaying)
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.black.opacity(0.55))
+                        .frame(width: 40, height: 40)
+
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
+                        .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
+                } else if isCurrentTrack {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.black.opacity(0.6))
+                        .frame(width: 40, height: 40)
+
+                    YMPlayingEqualizerView(color: YMTheme.accent, barWidth: 2.5, maxHeight: 15, isPlaying: isPlaying)
                 }
-            } else if isHovered {
-                Button {
-                    onPlay()
-                } label: {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.black.opacity(0.55))
-                            .frame(width: 40, height: 40)
-                        Image(systemName: "play.fill")
-                            .foregroundColor(Color.white)
-                            .font(.system(size: 13))
-                    }
-                }
-                .buttonStyle(.plain)
             }
+            .frame(width: 40, height: 40)
+            .contentShape(Rectangle())
         }
-        .frame(width: 40, height: 40)
+        .buttonStyle(.plain)
+        .help(isPlaying ? "Пауза" : "Воспроизвести трек")
     }
 
     @ViewBuilder
     private var titleAndArtistsView: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(track.displayTitle)
-                .font(.system(size: 13, weight: isPlaying ? .bold : .medium))
-                .foregroundStyle(isPlaying ? YMTheme.accent : YMTheme.fg)
+                .font(.system(size: 13, weight: isCurrentTrack ? .bold : .medium))
+                .foregroundStyle(isCurrentTrack ? YMTheme.accent : YMTheme.fg)
                 .lineLimit(1)
 
             HStack(spacing: 4) {
@@ -327,7 +392,7 @@ private struct ChartTrackRow: View {
                 }
             }
         }
-        .frame(minWidth: windowState.isMiniWidth ? 120 : 180, alignment: .leading)
+        .frame(minWidth: isMiniWidth ? 100 : 180, alignment: .leading)
     }
 
     @ViewBuilder
@@ -361,7 +426,7 @@ private struct ChartTrackRow: View {
                 .font(.system(size: 13))
         }
         .buttonStyle(.plain)
-        .frame(width: 32, alignment: .center)
+        .frame(width: isMiniWidth ? 28 : 32, alignment: .center)
         .help(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Нравится")
     }
 
@@ -370,7 +435,7 @@ private struct ChartTrackRow: View {
         Text(track.formattedDuration)
             .font(.system(size: 12).monospacedDigit())
             .foregroundStyle(YMTheme.fg40)
-            .frame(width: 50, alignment: .trailing)
+            .frame(width: isMiniWidth ? 42 : 50, alignment: .trailing)
     }
 
     @ViewBuilder
@@ -379,14 +444,14 @@ private struct ChartTrackRow: View {
             onPlay()
         }
         Button("Воспроизвести следующим") {
-            audioEngine.insertNext(track)
+            AudioPlayerEngine.shared.insertNext(track)
         }
         Button("Добавить в конец очереди") {
-            audioEngine.addToQueue([track])
+            AudioPlayerEngine.shared.addToQueue([track])
         }
         Divider()
         Button("Запустить Мою волну по треку") {
-            audioEngine.startWave(forTrack: track)
+            AudioPlayerEngine.shared.startWave(forTrack: track)
         }
         if let artist = track.artists.first {
             Button("Перейти к исполнителю: \(artist.name)") {
@@ -399,9 +464,10 @@ private struct ChartTrackRow: View {
             }
         }
         Button("Показать текст песни") {
-            coordinator.showLyrics(for: track)
+            onShowLyrics()
         }
         Divider()
+        AddToPlaylistContextMenu(track: track)
         Button(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Добавить в Мне нравится") {
             Task {
                 await likesService.toggleLike(track: track)
