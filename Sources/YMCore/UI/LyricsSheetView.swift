@@ -1,9 +1,35 @@
 import SwiftUI
 import AppKit
+import CoreImage
+
+// MARK: - Off-Main-Thread Pre-Blur Processor (Zero Live GPU Blur During Scroll)
+
+private enum BackdropBlurProcessor {
+    private static let ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false
+    ])
+
+    /// Applies `CIGaussianBlur` once to a small 100x100 cover CGImage (~40 KB, <1 ms)
+    /// so SwiftUI draws a static pre-blurred image with zero per-frame GPU blur cost.
+    static func makeBlurredCGImage(from cgImage: CGImage, radius: Double = 14.0) -> CGImage? {
+        let input = CIImage(cgImage: cgImage)
+        let extent = input.extent
+        guard !extent.isEmpty else { return nil }
+
+        let clamped = input.clampedToExtent()
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
+        filter.setValue(clamped, forKey: kCIInputImageKey)
+        filter.setValue(radius, forKey: kCIInputRadiusKey)
+
+        guard let output = filter.outputImage?.cropped(to: extent) else { return nil }
+        return ciContext.createCGImage(output, from: extent)
+    }
+}
 
 /// Fullscreen "Now Playing" synchronized lyrics experience inspired by Apple Music.
-/// Features an opaque atmospheric blurred-cover backdrop, adaptive two-column layout,
-/// clipping-free 120 FPS karaoke line transitions, manual scroll auto-pause,
+/// Features an opaque pre-blurred atmospheric cover backdrop, adaptive two-column layout,
+/// isolated 120 FPS karaoke list with Equatable rows, manual scroll auto-pause,
 /// and instant mode switching to the compact above-player lyrics bar.
 public struct LyricsSheetView: View {
     @UIState private var coordinator = NavigationCoordinator.shared
@@ -14,14 +40,11 @@ public struct LyricsSheetView: View {
 
     @UIState private var syncedLyrics: YMSyncedLyrics? = nil
     @UIState private var supplement: YMTrackSupplement? = nil
-    @UIState private var activeLineIndex: Int? = nil
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
 
-    @UIState private var backdropImage: NSImage? = nil
-    @UIState private var isUserScrollingLyrics = false
-    @UIState private var isInitialScrollPositioned = false
-    @UIState private var resumeAutoScrollTask: Task<Void, Never>? = nil
+    @UIState private var blurredBackdropImage: NSImage? = nil
+    @UIState private var blurredBackdropUri: String? = nil
 
     private let networkClient = YMNetworkClient.shared
 
@@ -60,13 +83,6 @@ public struct LyricsSheetView: View {
             }
             .padding(.bottom, 76)
         }
-        .background {
-            // Isolated time observer prevents LyricsSheetView.body from re-evaluating on every playback timer tick
-            LyricsTimeObserverView(
-                syncedLyrics: syncedLyrics,
-                activeLineIndex: $activeLineIndex
-            )
-        }
         .task(id: currentTrack?.id) {
             await loadLyricsAsync()
         }
@@ -74,15 +90,13 @@ public struct LyricsSheetView: View {
             await loadBackdropImageAsync()
         }
         .onDisappear {
-            resumeAutoScrollTask?.cancel()
-            resumeAutoScrollTask = nil
             if !coordinator.isLyricsPresented {
                 coordinator.lyricsTrack = nil
             }
         }
     }
 
-    // MARK: - Atmospheric Backdrop
+    // MARK: - Atmospheric Backdrop (Pre-Blurred Once Per Track)
 
     @ViewBuilder
     private var atmosphericBackdrop: some View {
@@ -93,19 +107,19 @@ public struct LyricsSheetView: View {
             // Opaque base prevents the underlying track list from bleeding through
             baseColor
 
-            if let image = backdropImage {
+            if let image = blurredBackdropImage {
                 GeometryReader { geo in
                     Image(nsImage: image)
                         .resizable()
+                        .interpolation(.medium)
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geo.size.width, height: geo.size.height)
-                        .scaleEffect(1.25)
-                        .blur(radius: 80)
-                        .opacity(isLight ? 0.22 : 0.32)
+                        .scaleEffect(1.12)
+                        .opacity(isLight ? 0.24 : 0.34)
                         .clipped()
                 }
                 .allowsHitTesting(false)
-                .animation(.easeInOut(duration: 0.45), value: currentTrack?.effectiveCoverUri)
+                .animation(.easeInOut(duration: 0.40), value: blurredBackdropUri)
             }
 
             // Symmetrical soft contrast gradient preserving high text legibility across bright & dark album art
@@ -401,8 +415,12 @@ public struct LyricsSheetView: View {
             } else if let error = errorMessage {
                 errorView(error)
             } else if let synced = syncedLyrics, !synced.isEmpty {
-                syncedKaraokeView(synced: synced)
-                    .mask(lyricsEdgeFadeMask)
+                SyncedKaraokeListView(
+                    synced: synced,
+                    themeId: themeManager.currentTheme.rawValue
+                )
+                .id(currentTrack?.id ?? "")
+                .mask(lyricsEdgeFadeMask)
             } else if let lyrics = supplement?.lyrics, !lyrics.displayText.isEmpty {
                 staticLyricsView(text: lyrics.displayText)
                     .mask(lyricsEdgeFadeMask)
@@ -423,94 +441,6 @@ public struct LyricsSheetView: View {
             startPoint: .top,
             endPoint: .bottom
         )
-    }
-
-    // MARK: - Synced Karaoke View
-
-    @ViewBuilder
-    private func syncedKaraokeView(synced: YMSyncedLyrics) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 14) {
-                    Color.clear
-                        .frame(height: 84)
-
-                    ForEach(synced.lines) { line in
-                        let isActive = line.id == activeLineIndex
-                        let isPast = (activeLineIndex != nil) && (line.id < activeLineIndex!)
-
-                        KaraokeLineRow(
-                            line: line,
-                            isActive: isActive,
-                            isPast: isPast,
-                            onSelect: {
-                                resumeAutoScrollTask?.cancel()
-                                resumeAutoScrollTask = nil
-                                isUserScrollingLyrics = false
-                                audioEngine.seek(to: line.time)
-                                withAnimation(.easeOut(duration: 0.25)) {
-                                    activeLineIndex = line.id
-                                }
-                                withAnimation(.spring(response: 0.35, dampingFraction: 0.80)) {
-                                    proxy.scrollTo(line.id, anchor: .center)
-                                }
-                            }
-                        )
-                        .id(line.id)
-                    }
-
-                    Color.clear
-                        .frame(height: 160)
-                }
-                .padding(.horizontal, 16)
-            }
-            .opacity(isInitialScrollPositioned ? 1 : 0)
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 2)
-                    .onChanged { _ in
-                        pauseAutoScrollTemporarily()
-                    }
-            )
-            .onChange(of: activeLineIndex) { _, newActiveIndex in
-                guard let id = newActiveIndex, !isUserScrollingLyrics else { return }
-                if !isInitialScrollPositioned {
-                    var noAnim = Transaction()
-                    noAnim.disablesAnimations = true
-                    withTransaction(noAnim) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                    isInitialScrollPositioned = true
-                } else {
-                    withAnimation(.easeInOut(duration: 0.35)) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                }
-            }
-            .onAppear {
-                let targetId = activeLineIndex ?? synced.activeLineIndex(for: audioEngine.progressTracker.currentTime)
-                var noAnim = Transaction()
-                noAnim.disablesAnimations = true
-                if let id = targetId {
-                    if activeLineIndex != id {
-                        withTransaction(noAnim) {
-                            activeLineIndex = id
-                        }
-                    }
-                    withTransaction(noAnim) {
-                        proxy.scrollTo(id, anchor: .center)
-                    }
-                    // Confirm exact center offset after first layout pass, still with animations disabled
-                    DispatchQueue.main.async {
-                        withTransaction(noAnim) {
-                            proxy.scrollTo(id, anchor: .center)
-                        }
-                        isInitialScrollPositioned = true
-                    }
-                } else {
-                    isInitialScrollPositioned = true
-                }
-            }
-        }
     }
 
     // MARK: - Static Lyrics Fallback View
@@ -587,26 +517,40 @@ public struct LyricsSheetView: View {
         coordinator.navigate(to: route)
     }
 
-    private func pauseAutoScrollTemporarily() {
-        isUserScrollingLyrics = true
-        resumeAutoScrollTask?.cancel()
-        resumeAutoScrollTask = Task {
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard !Task.isCancelled else { return }
-            isUserScrollingLyrics = false
-            resumeAutoScrollTask = nil
-        }
-    }
-
     private func loadBackdropImageAsync() async {
         guard let coverUri = currentTrack?.effectiveCoverUri, !coverUri.isEmpty else {
-            backdropImage = nil
+            blurredBackdropImage = nil
+            blurredBackdropUri = nil
             return
         }
+        if blurredBackdropUri == coverUri && blurredBackdropImage != nil {
+            return
+        }
+
         let requestedUri = coverUri
-        let image = await ImagePipeline.shared.image(for: requestedUri, size: .small)
+        guard let smallImage = await ImagePipeline.shared.image(for: requestedUri, size: .small),
+              let cgImage = smallImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return
+        }
         guard !Task.isCancelled, currentTrack?.effectiveCoverUri == requestedUri else { return }
-        backdropImage = image
+
+        // Pre-blur the 100x100 bitmap once off the main thread (~40 KB, <1 ms)
+        let blurredCG: CGImage? = await Task.detached(priority: .userInitiated) {
+            BackdropBlurProcessor.makeBlurredCGImage(from: cgImage, radius: 14.0)
+        }.value
+
+        guard !Task.isCancelled, currentTrack?.effectiveCoverUri == requestedUri else { return }
+
+        if let blurredCG {
+            blurredBackdropImage = NSImage(
+                cgImage: blurredCG,
+                size: NSSize(width: blurredCG.width, height: blurredCG.height)
+            )
+            blurredBackdropUri = requestedUri
+        } else {
+            blurredBackdropImage = smallImage
+            blurredBackdropUri = requestedUri
+        }
     }
 
     private func loadLyricsAsync() async {
@@ -614,8 +558,6 @@ public struct LyricsSheetView: View {
             isLoading = false
             syncedLyrics = nil
             supplement = nil
-            activeLineIndex = nil
-            isInitialScrollPositioned = false
             errorMessage = "Сейчас ничего не воспроизводится."
             return
         }
@@ -625,18 +567,12 @@ public struct LyricsSheetView: View {
         errorMessage = nil
         syncedLyrics = nil
         supplement = nil
-        activeLineIndex = nil
-        isInitialScrollPositioned = false
-        isUserScrollingLyrics = false
-        resumeAutoScrollTask?.cancel()
-        resumeAutoScrollTask = nil
 
-        // 1. Attempt to fetch synced LRC lyrics
+        // 1. Attempt to fetch synced LRC lyrics (cached in memory for instant mode switching)
         do {
             if let synced = try await networkClient.fetchTrackLyricsLRC(trackId: requestedTrackId), !synced.isEmpty {
                 guard !Task.isCancelled, currentTrack?.id == requestedTrackId else { return }
                 self.syncedLyrics = synced
-                self.activeLineIndex = synced.activeLineIndex(for: audioEngine.progressTracker.currentTime)
                 self.isLoading = false
                 return
             }
@@ -663,12 +599,141 @@ public struct LyricsSheetView: View {
     }
 }
 
+// MARK: - Isolated Synced Karaoke List Subview
+
+/// Isolates `activeLineIndex` and `LyricsTimeObserverView` from `LyricsSheetView`,
+/// so advancing to the next lyric line never re-evaluates the backdrop, artwork, or header,
+/// and `Equatable` `KaraokeLineRow`s ensure only the 2 changing lines re-render.
+private struct SyncedKaraokeListView: View {
+    let synced: YMSyncedLyrics
+    let themeId: String
+
+    @UIState private var activeLineIndex: Int?
+    @UIState private var isUserScrollingLyrics = false
+    @UIState private var isInitialScrollPositioned = false
+    @UIState private var resumeAutoScrollTask: Task<Void, Never>? = nil
+
+    init(synced: YMSyncedLyrics, themeId: String) {
+        self.synced = synced
+        self.themeId = themeId
+        let initialIndex = synced.activeLineIndex(for: AudioPlayerEngine.shared.progressTracker.currentTime)
+        self._activeLineIndex = UIState(initialValue: initialIndex)
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 14) {
+                    Color.clear
+                        .frame(height: 84)
+
+                    ForEach(synced.lines) { line in
+                        let isActive = line.id == activeLineIndex
+                        let isPast = (activeLineIndex != nil) && (line.id < activeLineIndex!)
+
+                        KaraokeLineRow(
+                            line: line,
+                            isActive: isActive,
+                            isPast: isPast,
+                            themeId: themeId,
+                            onSelect: {
+                                resumeAutoScrollTask?.cancel()
+                                resumeAutoScrollTask = nil
+                                isUserScrollingLyrics = false
+                                AudioPlayerEngine.shared.seek(to: line.time)
+                                activeLineIndex = line.id
+                                withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                                    proxy.scrollTo(line.id, anchor: .center)
+                                }
+                            }
+                        )
+                        .equatable()
+                        .id(line.id)
+                    }
+
+                    Color.clear
+                        .frame(height: 160)
+                }
+                .padding(.horizontal, 16)
+            }
+            .opacity(isInitialScrollPositioned ? 1 : 0)
+            .background {
+                LyricsTimeObserverView(
+                    syncedLyrics: synced,
+                    activeLineIndex: $activeLineIndex
+                )
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { _ in
+                        pauseAutoScrollTemporarily()
+                    }
+            )
+            .onChange(of: activeLineIndex) { _, newActiveIndex in
+                guard let id = newActiveIndex, !isUserScrollingLyrics else { return }
+                if !isInitialScrollPositioned {
+                    var noAnim = Transaction()
+                    noAnim.disablesAnimations = true
+                    withTransaction(noAnim) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                    isInitialScrollPositioned = true
+                } else {
+                    withAnimation(.easeInOut(duration: 0.32)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
+            }
+            .onAppear {
+                let targetId = activeLineIndex ?? synced.activeLineIndex(for: AudioPlayerEngine.shared.progressTracker.currentTime)
+                var noAnim = Transaction()
+                noAnim.disablesAnimations = true
+                if let id = targetId {
+                    if activeLineIndex != id {
+                        withTransaction(noAnim) {
+                            activeLineIndex = id
+                        }
+                    }
+                    withTransaction(noAnim) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                    // Confirm exact center offset after initial VStack geometry settles, without animation
+                    DispatchQueue.main.async {
+                        withTransaction(noAnim) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                        isInitialScrollPositioned = true
+                    }
+                } else {
+                    isInitialScrollPositioned = true
+                }
+            }
+            .onDisappear {
+                resumeAutoScrollTask?.cancel()
+                resumeAutoScrollTask = nil
+            }
+        }
+    }
+
+    private func pauseAutoScrollTemporarily() {
+        isUserScrollingLyrics = true
+        resumeAutoScrollTask?.cancel()
+        resumeAutoScrollTask = Task {
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            isUserScrollingLyrics = false
+            resumeAutoScrollTask = nil
+        }
+    }
+}
+
 // MARK: - Isolated Playback Time Observer
 
-/// Dedicated 0x0 observer view isolating `PlaybackProgressTracker.currentTime` subscriptions
-/// so the parent lyrics view only redraws when `activeLineIndex` actually changes.
+/// Dedicated 0x0 observer view isolating `PlaybackProgressTracker.currentTime` subscriptions.
+/// Updates `activeLineIndex` directly without a global `withAnimation` transaction so only
+/// local row transitions and `proxy.scrollTo` animate.
 private struct LyricsTimeObserverView: View {
-    let syncedLyrics: YMSyncedLyrics?
+    let syncedLyrics: YMSyncedLyrics
     @Binding var activeLineIndex: Int?
     @UIState private var progressTracker = AudioPlayerEngine.shared.progressTracker
 
@@ -676,29 +741,31 @@ private struct LyricsTimeObserverView: View {
         Color.clear
             .frame(width: 0, height: 0)
             .onChange(of: progressTracker.currentTime) { _, newTime in
-                let newIndex = syncedLyrics?.activeLineIndex(for: newTime)
+                let newIndex = syncedLyrics.activeLineIndex(for: newTime)
                 if newIndex != activeLineIndex {
-                    if activeLineIndex == nil {
-                        activeLineIndex = newIndex
-                    } else {
-                        withAnimation(.easeOut(duration: 0.25)) {
-                            activeLineIndex = newIndex
-                        }
-                    }
+                    activeLineIndex = newIndex
                 }
             }
     }
 }
 
-// MARK: - Karaoke Line Row Subview
+// MARK: - Equatable Karaoke Line Row Subview (Zero Offscreen Shadow Passes)
 
-private struct KaraokeLineRow: View {
+private struct KaraokeLineRow: View, Equatable {
     let line: SyncedLyricLine
     let isActive: Bool
     let isPast: Bool
+    let themeId: String
     let onSelect: () -> Void
 
     @UIState private var isHovered = false
+
+    nonisolated static func == (lhs: KaraokeLineRow, rhs: KaraokeLineRow) -> Bool {
+        lhs.line == rhs.line
+            && lhs.isActive == rhs.isActive
+            && lhs.isPast == rhs.isPast
+            && lhs.themeId == rhs.themeId
+    }
 
     // Identical base font metrics guarantee words never re-wrap or clip past trailing bounds
     private static let baseFont = Font.system(size: 22, weight: .bold, design: .rounded)
@@ -730,19 +797,13 @@ private struct KaraokeLineRow: View {
             Text(line.text)
                 .font(Self.baseFont)
                 .foregroundStyle(textColor)
-                .shadow(
-                    color: isActive ? YMTheme.accent.opacity(YMTheme.isLight ? 0.20 : 0.34) : Color.clear,
-                    radius: 8,
-                    x: 0,
-                    y: 0
-                )
                 .multilineTextAlignment(.leading)
                 .lineSpacing(5)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .scaleEffect(textScale, anchor: .leading)
-                .animation(.easeOut(duration: 0.25), value: isActive)
-                .animation(.easeInOut(duration: 0.15), value: isHovered)
+                .animation(.easeOut(duration: 0.22), value: isActive)
+                .animation(.easeInOut(duration: 0.14), value: isHovered)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
                 .contentShape(Rectangle())
