@@ -29,8 +29,8 @@
 **Пример использования приложения 
 (для демонстрации интерфейса и работы приложения использовал демо-режим):**
 
-* YT - youtu.be/ZT5YoA6_Bh8
-* Rutube - rutube.ru/video/private/23f5147750fb1b2ef85442b82ccd6f92/?p=MVH2f_1figfwCZUdZo-eiA
+* [YouTube](https://www.youtube.com/watch?v=ZT5YoA6_Bh8)
+* [Rutube](https://rutube.ru/video/private/23f5147750fb1b2ef85442b82ccd6f92/?p=MVH2f_1figfwCZUdZo-eiA)
 
 ---
 
