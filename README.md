@@ -53,9 +53,9 @@
 
 Скачайте архив последней версии со страницы [Releases](https://github.com/GTE159/YandexMusicMac/releases):
 
-* **`flow~-v2.0.1-universal.zip`** — Универсальная версия (работает нативно и на Apple Silicon, и на Intel).
-* **`flow~-v2.0.1-arm64.zip`** — Специально под Apple Silicon.
-* **`flow~-v2.0.1-x86_64.zip`** — Для Mac на процессорах Intel.
+* **`flow~-v2.0.2-universal.zip`** — Универсальная версия (работает нативно и на Apple Silicon, и на Intel).
+* **`flow~-v2.0.2-arm64.zip`** — Специально под Apple Silicon.
+* **`flow~-v2.0.2-x86_64.zip`** — Для Mac на процессорах Intel.
 
 Распакуйте архив и переместите `flow~.app` в папку `/Applications` («Программы»).
 
