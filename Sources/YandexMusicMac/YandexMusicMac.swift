@@ -100,7 +100,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.titlebarAppearsTransparent = true
             window.minSize = NSSize(width: 440, height: 320)
             window.toolbar = nil
-            window.isMovableByWindowBackground = true
+            // Не перетаскиваем окно за произвольную точку: AppKit перехватывает mouseDown раньше SwiftUI,
+            // из-за чего ломались кастомные ползунки (громкость, прогресс, crossfade) и поля ввода.
+            // Окно перетаскивается через явные зоны YMWindowDragHandle в верхней панели и нижнем баре.
+            window.isMovableByWindowBackground = false
             YMThemeManager.shared.updateWindowAppearance()
             WindowState.shared.update(from: window)
         }

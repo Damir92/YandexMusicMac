@@ -45,26 +45,32 @@ public struct PlayerBarView: View {
         .frame(height: 76)
         .frame(maxWidth: .infinity)
         .background {
-            if nowPlayingStyle {
-                // Seamless bottom dissolve over the fullscreen atmospheric backdrop:
-                // no hard border, no glowing box on bright album covers, just a gentle vertical scrim.
-                let scrimBase = YMTheme.isLight ? YMTheme.bg : Color.black
-                LinearGradient(
-                    stops: [
-                        .init(color: Color.clear, location: 0.0),
-                        .init(color: scrimBase.opacity(YMTheme.isLight ? 0.20 : 0.22), location: 0.42),
-                        .init(color: scrimBase.opacity(YMTheme.isLight ? 0.38 : 0.42), location: 1.0)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .padding(.top, -32)
-                .allowsHitTesting(false)
-            } else {
-                ZStack(alignment: .top) {
-                    VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
-                    YMTheme.playerBg.opacity(0.84)
+            ZStack {
+                if nowPlayingStyle {
+                    // Seamless bottom dissolve over the fullscreen atmospheric backdrop:
+                    // no hard border, no glowing box on bright album covers, just a gentle vertical scrim.
+                    let scrimBase = YMTheme.isLight ? YMTheme.bg : Color.black
+                    LinearGradient(
+                        stops: [
+                            .init(color: Color.clear, location: 0.0),
+                            .init(color: scrimBase.opacity(YMTheme.isLight ? 0.20 : 0.22), location: 0.42),
+                            .init(color: scrimBase.opacity(YMTheme.isLight ? 0.38 : 0.42), location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .padding(.top, -32)
+                    .allowsHitTesting(false)
+                } else {
+                    ZStack(alignment: .top) {
+                        VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
+                        YMTheme.playerBg.opacity(0.84)
+                    }
                 }
+
+                // Свободные участки бара двигают окно; элементы управления лежат выше
+                // и получают клики первыми, поэтому ползунки работают нормально.
+                YMWindowDragHandle()
             }
         }
         .overlay(alignment: .top) {
