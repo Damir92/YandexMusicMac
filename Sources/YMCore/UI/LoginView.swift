@@ -51,7 +51,9 @@ public struct LoginView: View {
                         .font(.subheadline)
                         .foregroundStyle(YMTheme.fg60)
                 }
+                .frame(maxWidth: .infinity)
                 .padding(.top, 24)
+                .background(YMWindowDragHandle())
 
                 // Error display banner
                 if let error = authService.errorMessage {
