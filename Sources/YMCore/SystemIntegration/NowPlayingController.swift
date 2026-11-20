@@ -126,11 +126,29 @@ public final class NowPlayingController {
     /// Sets downsampled artwork into the active nowPlayingInfo dictionary
     private func setArtwork(image: NSImage) {
         guard var currentInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo else { return }
-        let artwork = MPMediaItemArtwork(boundsSize: CGSize(width: 300, height: 300)) { _ in
-            return image
+        // Snapshot to immutable `Data` so the artwork closure never captures actor state
+        if let imageData = image.tiffRepresentation {
+            currentInfo[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: imageData)
+        } else {
+            currentInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
         }
-        currentInfo[MPMediaItemPropertyArtwork] = artwork
         MPNowPlayingInfoCenter.default().nowPlayingInfo = currentInfo
+    }
+
+    /// Builds `MPMediaItemArtwork` outside of the main actor.
+    ///
+    /// MediaPlayer calls the artwork request handler on its own serial queue
+    /// (`*/accessQueue`) while converting `nowPlayingInfo` into a MediaRemote dictionary.
+    /// A handler created inside a `@MainActor` method inherits main-actor isolation, so the
+    /// call trips Swift's executor check (`dispatch_assert_queue_fail` / EXC_BREAKPOINT)
+    /// and the app crashes right after playback starts. Keeping the factory `nonisolated`
+    /// and passing only `Sendable` `Data` makes the handler safe from any queue.
+    private nonisolated static func makeArtwork(from imageData: Data) -> MPMediaItemArtwork {
+        let bounds = CGSize(width: 300, height: 300)
+        return MPMediaItemArtwork(boundsSize: bounds) { @Sendable _ in
+            // Decode lazily on whichever queue MediaPlayer asks for the image
+            NSImage(data: imageData) ?? NSImage(size: bounds)
+        }
     }
 
     /// Clears Now Playing center when playback is stopped
