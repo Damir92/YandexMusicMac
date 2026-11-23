@@ -247,9 +247,11 @@ private struct VerticalEQBandControl: View {
                             isDragging = false
                         }
                 )
-                .onTapGesture(count: 2) {
-                    onChange(0.0)
-                }
+                .highPriorityGesture(
+                    TapGesture(count: 2).onEnded {
+                        onChange(0.0)
+                    }
+                )
             }
             .frame(height: trackHeight)
 

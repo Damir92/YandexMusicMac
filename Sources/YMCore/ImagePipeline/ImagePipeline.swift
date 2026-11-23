@@ -1,6 +1,32 @@
 import Foundation
 import AppKit
 
+/// Thread-safe wrapper around Foundation's NSCache, which is internally thread-safe.
+private final class ImageMemoryCache: @unchecked Sendable {
+    private let cache = NSCache<NSString, NSImage>()
+
+    init(maxCost: Int, countLimit: Int = 250) {
+        cache.totalCostLimit = maxCost
+        cache.countLimit = countLimit
+    }
+
+    func setMaxMemoryCost(mb: Int) {
+        cache.totalCostLimit = max(5, mb) * 1024 * 1024
+    }
+
+    func object(forKey key: NSString) -> NSImage? {
+        cache.object(forKey: key)
+    }
+
+    func setObject(_ obj: NSImage, forKey key: NSString, cost: Int) {
+        cache.setObject(obj, forKey: key, cost: cost)
+    }
+
+    func removeAllObjects() {
+        cache.removeAllObjects()
+    }
+}
+
 /// MainActor-isolated image cache pipeline with configurable RAM cost limit (default 15 MB)
 /// and off-main-thread hardware-accelerated downsampling via ImageIO (`CGImage` crosses
 /// concurrency boundaries cleanly across macOS 14/15/27 SDKs without requiring `NSImage: Sendable`).
@@ -8,19 +34,23 @@ import AppKit
 public final class ImagePipeline {
     public static let shared = ImagePipeline()
 
-    private let memoryCache: NSCache<NSString, NSImage>
+    private let memoryCache: ImageMemoryCache
     private var inFlightTasks: [String: Task<(CGImage, Int)?, Never>] = [:]
 
     public init(maxMemoryCost: Int = 15 * 1024 * 1024) {
-        let cache = NSCache<NSString, NSImage>()
-        cache.totalCostLimit = maxMemoryCost
-        cache.countLimit = 250 // Жесткий потолок количества обложек в ОЗУ
-        self.memoryCache = cache
+        self.memoryCache = ImageMemoryCache(maxCost: maxMemoryCost)
+    }
+
+    /// Synchronous, thread-safe RAM cache lookup for zero-flicker fast path in SwiftUI views
+    public nonisolated func cachedImage(for coverUri: String, size: YMCoverSize) -> NSImage? {
+        guard !coverUri.isEmpty else { return nil }
+        let keyString = "\(coverUri)_\(size.rawValue)"
+        return memoryCache.object(forKey: keyString as NSString)
     }
 
     /// Dynamically adjusts the memory cache cost limit in megabytes
     public func setMaxMemoryCost(mb: Int) {
-        memoryCache.totalCostLimit = max(5, mb) * 1024 * 1024
+        memoryCache.setMaxMemoryCost(mb: mb)
     }
 
     /// Fetches image from cache or downloads and downsamples asynchronously off the main thread
@@ -78,10 +108,14 @@ public final class ImagePipeline {
     }
 
     public func clearCache() {
+        for task in inFlightTasks.values {
+            task.cancel()
+        }
+        inFlightTasks.removeAll()
         memoryCache.removeAllObjects()
     }
 
     public func clearMemoryCache() {
-        memoryCache.removeAllObjects()
+        clearCache()
     }
 }

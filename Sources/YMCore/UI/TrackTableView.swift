@@ -53,41 +53,79 @@ public struct TrackTableView: View {
             }
 
             LazyVStack(spacing: 2) {
-                ForEach(Array(tracks.enumerated()), id: \.element.id) { index, track in
-                    let isCurrent = currentTrackId == track.id
-                    ModernTrackRow(
-                        track: track,
-                        index: index,
-                        isCurrentTrack: isCurrent,
-                        isPlaying: isCurrent && isEnginePlaying,
-                        isSelected: selectedTrackId == track.id,
-                        showAlbum: showAlbum,
-                        isCompactWidth: isCompactWidth,
-                        isMiniWidth: isMiniWidth,
-                        onPlay: {
-                            selectedTrackId = track.id
-                            onPlayTrack(track)
-                        },
-                        onTapRow: {
-                            handleRowTap(track: track)
-                        },
-                        onArtistSelect: { artist in
-                            coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
-                        },
-                        onAlbumSelect: { album in
-                            coordinator.navigate(to: .album(id: album.id, title: album.title))
-                        },
-                        onShowLyrics: {
-                            coordinator.showLyrics(for: track)
-                        },
-                        onRemoveFromPlaylist: onRemoveFromPlaylist.map { handler in
-                            { handler(track, index) }
+                ForEach(tracks.indices, id: \.self) { index in
+                    let track = tracks[index]
+                    if track.isSpacer {
+                        Color.clear.frame(height: 16)
+                    } else if track.isPlaceholder {
+                        HStack(spacing: isMiniWidth ? 8 : 12) {
+                            Text("\(index + 1)")
+                                .font(.system(size: 12, weight: .medium).monospacedDigit())
+                                .foregroundStyle(YMTheme.fg40.opacity(0.5))
+                                .frame(width: isMiniWidth ? 30 : 38, alignment: .center)
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(YMTheme.surfaceComponent)
+                                .frame(width: 40, height: 40)
+                            VStack(alignment: .leading, spacing: 4) {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(YMTheme.surfaceComponent)
+                                    .frame(width: 120, height: 12)
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(YMTheme.surfaceComponent.opacity(0.6))
+                                    .frame(width: 80, height: 10)
+                            }
+                            .frame(minWidth: isMiniWidth ? 100 : 180, alignment: .leading)
+                            Spacer(minLength: 4)
+                            Color.clear.frame(width: isMiniWidth ? 42 : 50)
                         }
-                    )
-                    .onAppear {
-                        onTrackAppear?(track)
-                        if index >= tracks.count - 6 {
-                            onLoadMore?()
+                        .padding(.vertical, 5)
+                        .padding(.horizontal, isMiniWidth ? 6 : 10)
+                        .onAppear {
+                            onTrackAppear?(track)
+                            if index >= tracks.count - 6 {
+                                onLoadMore?()
+                            }
+                        }
+                    } else {
+                        let isCurrent = currentTrackId == track.id
+                        let rowHoverId = "\(index)_\(track.id)"
+                        ModernTrackRow(
+                            track: track,
+                            index: index,
+                            rowHoverId: rowHoverId,
+                            isCurrentTrack: isCurrent,
+                            isPlaying: isCurrent && isEnginePlaying,
+                            isSelected: selectedTrackId == track.id,
+                            showAlbum: showAlbum,
+                            isCompactWidth: isCompactWidth,
+                            isMiniWidth: isMiniWidth,
+                            themeKey: YMTheme.themeRevisionKey,
+                            onPlay: {
+                                selectedTrackId = track.id
+                                onPlayTrack(track)
+                            },
+                            onTapRow: {
+                                handleRowTap(track: track)
+                            },
+                            onArtistSelect: { artist in
+                                coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
+                            },
+                            onAlbumSelect: { album in
+                                coordinator.navigate(to: .album(id: album.id, title: album.title))
+                            },
+                            onShowLyrics: {
+                                coordinator.showLyrics(for: track)
+                            },
+                            onRemoveFromPlaylist: onRemoveFromPlaylist.map { handler in
+                                { handler(track, index) }
+                            }
+                        )
+                        .equatable()
+                        .onAppear {
+                            onTrackAppear?(track)
+                            if index >= tracks.count - 6 {
+                                onLoadMore?()
+                            }
                         }
                     }
                 }
@@ -167,15 +205,82 @@ extension TrackPlayingCoverOverlay: @preconcurrency Equatable {
     }
 }
 
+private struct TrackRowBackgroundOverlay: View {
+    let rowHoverId: String
+    let isSelected: Bool
+    let isCurrentTrack: Bool
+
+    var body: some View {
+        let isHovered = TrackHoverManager.shared.state(for: rowHoverId).isHovered
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(
+                    isSelected
+                        ? YMTheme.surfaceComponentHover
+                        : (isCurrentTrack
+                            ? YMTheme.accent.opacity(YMTheme.isLight ? 0.12 : 0.09)
+                            : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+                )
+
+            if isCurrentTrack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(YMTheme.accent.opacity(0.24), lineWidth: 1)
+            }
+        }
+    }
+}
+
+private struct TrackRowCoverView: View {
+    let track: YMTrack
+    let rowHoverId: String
+    let isCurrentTrack: Bool
+    let isPlaying: Bool
+    let onPlayAction: () -> Void
+
+    var body: some View {
+        let isHovered = TrackHoverManager.shared.state(for: rowHoverId).isHovered
+        Button {
+            onPlayAction()
+        } label: {
+            ZStack {
+                CachedCoverImage(
+                    coverUri: track.effectiveCoverUri,
+                    size: .small,
+                    displaySize: 40,
+                    cornerRadius: 6
+                )
+
+                if isHovered {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.black.opacity(0.55))
+                        .frame(width: 40, height: 40)
+
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
+                        .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
+                } else if isCurrentTrack {
+                    TrackPlayingCoverOverlay(isPlaying: isPlaying)
+                }
+            }
+            .frame(width: 40, height: 40)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isPlaying ? "Пауза" : "Воспроизвести трек")
+    }
+}
+
 private struct ModernTrackRow: View {
     let track: YMTrack
     let index: Int
+    let rowHoverId: String
     let isCurrentTrack: Bool
     let isPlaying: Bool
     let isSelected: Bool
     let showAlbum: Bool
     let isCompactWidth: Bool
     let isMiniWidth: Bool
+    let themeKey: String
     let onPlay: () -> Void
     let onTapRow: () -> Void
     let onArtistSelect: (YMArtist) -> Void
@@ -183,12 +288,7 @@ private struct ModernTrackRow: View {
     let onShowLyrics: () -> Void
     let onRemoveFromPlaylist: (() -> Void)?
 
-    @UIState private var likesService = LikesService.shared
     private let hoverManager = TrackHoverManager.shared
-
-    private var isHovered: Bool {
-        hoverManager.state(for: track.id).isHovered
-    }
 
     private func triggerPlaybackAction() {
         if isCurrentTrack {
@@ -208,35 +308,14 @@ private struct ModernTrackRow: View {
                 .minimumScaleFactor(0.8)
                 .frame(width: isMiniWidth ? 30 : 38, alignment: .center)
 
-            // Cover thumbnail (always clickable regardless of hover state)
-            Button {
-                triggerPlaybackAction()
-            } label: {
-                ZStack {
-                    CachedCoverImage(
-                        coverUri: track.effectiveCoverUri,
-                        size: .small,
-                        displaySize: 40,
-                        cornerRadius: 6
-                    )
-
-                    if isHovered {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.black.opacity(0.55))
-                            .frame(width: 40, height: 40)
-
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                            .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
-                            .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
-                    } else if isCurrentTrack {
-                        TrackPlayingCoverOverlay(isPlaying: isPlaying)
-                    }
-                }
-                .frame(width: 40, height: 40)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(isPlaying ? "Пауза" : "Воспроизвести трек")
+            // Cover thumbnail with isolated hover/play overlay
+            TrackRowCoverView(
+                track: track,
+                rowHoverId: rowHoverId,
+                isCurrentTrack: isCurrentTrack,
+                isPlaying: isPlaying,
+                onPlayAction: triggerPlaybackAction
+            )
 
             // Title & Artists
             VStack(alignment: .leading, spacing: 2) {
@@ -246,25 +325,26 @@ private struct ModernTrackRow: View {
                     .lineLimit(1)
 
                 if !track.artists.isEmpty {
+                    let artistsToDisplay = Array(track.artists.prefix(4))
                     HStack(spacing: 4) {
-                        ForEach(track.artists) { artist in
-                            Button {
+                        ForEach(artistsToDisplay) { artist in
+                            YMHoverLinkText(
+                                text: artist.name,
+                                font: .system(size: 12),
+                                baseColor: YMTheme.fg60,
+                                hoverColor: YMTheme.fg
+                            ) {
                                 onArtistSelect(artist)
-                            } label: {
-                                Text(artist.name)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(YMTheme.fg60)
-                                    .lineLimit(1)
                             }
-                            .buttonStyle(.plain)
 
-                            if artist.id != track.artists.last?.id {
+                            if artist.id != artistsToDisplay.last?.id {
                                 Text("•")
                                     .font(.system(size: 8))
                                     .foregroundStyle(YMTheme.fg40)
                             }
                         }
                     }
+                    .clipped()
                 } else {
                     Text(track.artistsString)
                         .font(.system(size: 12))
@@ -279,15 +359,14 @@ private struct ModernTrackRow: View {
             // Album
             if showAlbum && !isCompactWidth {
                 if let album = track.albums.first {
-                    Button {
+                    YMHoverLinkText(
+                        text: album.title,
+                        font: .system(size: 12),
+                        baseColor: YMTheme.fg60,
+                        hoverColor: YMTheme.fg
+                    ) {
                         onAlbumSelect(album)
-                    } label: {
-                        Text(album.title)
-                            .font(.system(size: 12))
-                            .foregroundStyle(YMTheme.fg60)
-                            .lineLimit(1)
                     }
-                    .buttonStyle(.plain)
                     .frame(width: 180, alignment: .leading)
                 } else {
                     Color.clear
@@ -296,18 +375,7 @@ private struct ModernTrackRow: View {
             }
 
             // Like Heart Button
-            Button {
-                Task {
-                    await likesService.toggleLike(track: track)
-                }
-            } label: {
-                Image(systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart")
-                    .foregroundColor(likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg40)
-                    .font(.system(size: 13))
-            }
-            .buttonStyle(.plain)
-            .frame(width: isMiniWidth ? 28 : 32, alignment: .center)
-            .help(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Мне нравится")
+            YMLikeHeartButton(track: track, buttonWidth: isMiniWidth ? 28 : 32)
 
             // Duration
             Text(track.formattedDuration)
@@ -318,16 +386,21 @@ private struct ModernTrackRow: View {
         .padding(.vertical, 5)
         .padding(.horizontal, isMiniWidth ? 6 : 10)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(
-                    isSelected
-                        ? YMTheme.surfaceComponentHover
-                        : (isCurrentTrack ? YMTheme.accent.opacity(0.12) : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+            ZStack(alignment: .leading) {
+                TrackRowBackgroundOverlay(
+                    rowHoverId: rowHoverId,
+                    isSelected: isSelected,
+                    isCurrentTrack: isCurrentTrack
                 )
+                TrackHoverAnchor(trackId: rowHoverId)
+            }
         )
         .contentShape(Rectangle())
-        .onHover { isInside in
-            hoverManager.handleRowHover(trackId: track.id, isInside: isInside)
+        .onAppear {
+            hoverManager.rowDidAppear(trackId: rowHoverId)
+        }
+        .onDisappear {
+            hoverManager.rowDidDisappear(trackId: rowHoverId)
         }
         .onTapGesture {
             onTapRow()
@@ -366,11 +439,7 @@ private struct ModernTrackRow: View {
                     onRemoveFromPlaylist()
                 }
             }
-            Button(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Добавить в Мне нравится") {
-                Task {
-                    await likesService.toggleLike(track: track)
-                }
-            }
+            LikeContextMenuItem(track: track)
         }
     }
 }
@@ -378,12 +447,16 @@ private struct ModernTrackRow: View {
 extension ModernTrackRow: @preconcurrency Equatable {
     static func == (lhs: ModernTrackRow, rhs: ModernTrackRow) -> Bool {
         lhs.track.id == rhs.track.id &&
+        lhs.track.isPlaceholder == rhs.track.isPlaceholder &&
+        lhs.track.displayTitle == rhs.track.displayTitle &&
         lhs.index == rhs.index &&
+        lhs.rowHoverId == rhs.rowHoverId &&
         lhs.isCurrentTrack == rhs.isCurrentTrack &&
         lhs.isPlaying == rhs.isPlaying &&
         lhs.isSelected == rhs.isSelected &&
         lhs.showAlbum == rhs.showAlbum &&
         lhs.isCompactWidth == rhs.isCompactWidth &&
-        lhs.isMiniWidth == rhs.isMiniWidth
+        lhs.isMiniWidth == rhs.isMiniWidth &&
+        lhs.themeKey == rhs.themeKey
     }
 }

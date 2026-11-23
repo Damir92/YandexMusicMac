@@ -13,6 +13,7 @@ public struct YMSlider: View {
     @UIState private var isHovered = false
     @UIState private var isDragging = false
     @UIState private var dragLocationRatio: CGFloat? = nil
+    @UIState private var dragResetTask: Task<Void, Never>? = nil
 
     public init(
         value: Binding<Double>,
@@ -55,6 +56,7 @@ public struct YMSlider: View {
                 Capsule()
                     .fill(activeColor)
                     .frame(width: max(0, width * normalizedProgress), height: barHeight)
+                    .shadow(color: isDragging ? activeColor.opacity(0.35) : .clear, radius: 4)
 
                 // Knob Handle (expands on hover/drag)
                 if isHovered || isDragging {
@@ -67,12 +69,15 @@ public struct YMSlider: View {
                         .transition(.scale.combined(with: .opacity))
                 }
             }
+            .animation(.spring(response: 0.22, dampingFraction: 0.8), value: isHovered || isDragging)
             .frame(maxHeight: .infinity, alignment: .center)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
                         guard width > 0 else { return }
+                        dragResetTask?.cancel()
+                        dragResetTask = nil
                         if !isDragging {
                             isDragging = true
                             onEditingChanged?(true)
@@ -94,7 +99,9 @@ public struct YMSlider: View {
                         dragLocationRatio = clampedRatio
                         isDragging = false
                         onEditingChanged?(false)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        dragResetTask = Task {
+                            try? await Task.sleep(nanoseconds: 80_000_000)
+                            guard !Task.isCancelled, !isDragging else { return }
                             dragLocationRatio = nil
                         }
                     }
@@ -104,6 +111,15 @@ public struct YMSlider: View {
         .onHover { inside in
             withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
                 isHovered = inside
+            }
+        }
+        .onDisappear {
+            dragResetTask?.cancel()
+            dragResetTask = nil
+            if isDragging {
+                isDragging = false
+                dragLocationRatio = nil
+                onEditingChanged?(false)
             }
         }
     }

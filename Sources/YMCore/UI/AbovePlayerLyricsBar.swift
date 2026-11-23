@@ -7,7 +7,6 @@ public struct AbovePlayerLyricsBar: View {
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var windowState = WindowState.shared
-    @UIState private var themeManager = YMThemeManager.shared
     @UIState private var syncedLyrics: YMSyncedLyrics? = nil
     @UIState private var activeLineIndex: Int? = nil
     @UIState private var isLoading = true
@@ -21,6 +20,11 @@ public struct AbovePlayerLyricsBar: View {
         coordinator.lyricsTrack ?? audioEngine.currentTrack
     }
 
+    private var isShowingPlayingTrack: Bool {
+        guard let shown = currentTrack, let playing = audioEngine.currentTrack else { return false }
+        return shown.id == playing.id
+    }
+
     private var prevLine: SyncedLyricLine? {
         guard let idx = activeLineIndex, let synced = syncedLyrics, idx > 0, idx - 1 < synced.lines.count else {
             return nil
@@ -29,18 +33,21 @@ public struct AbovePlayerLyricsBar: View {
     }
 
     private var currLine: SyncedLyricLine? {
-        guard let synced = syncedLyrics, !synced.isEmpty else { return nil }
-        if let idx = activeLineIndex, idx < synced.lines.count {
-            return synced.lines[idx]
+        guard let synced = syncedLyrics, !synced.isEmpty, let idx = activeLineIndex, idx < synced.lines.count else {
+            return nil
         }
-        return synced.lines.first
+        return synced.lines[idx]
     }
 
     private var nextLine: SyncedLyricLine? {
         guard let synced = syncedLyrics, !synced.isEmpty else { return nil }
-        let nextIdx = (activeLineIndex ?? 0) + 1
-        guard nextIdx < synced.lines.count else { return nil }
-        return synced.lines[nextIdx]
+        if let idx = activeLineIndex {
+            let nextIdx = idx + 1
+            guard nextIdx < synced.lines.count else { return nil }
+            return synced.lines[nextIdx]
+        } else {
+            return synced.lines.first
+        }
     }
 
     private var baseGradientColor: Color {
@@ -54,7 +61,9 @@ public struct AbovePlayerLyricsBar: View {
                 // Line 1: Previous Line
                 if let prev = prevLine {
                     Button {
-                        audioEngine.seek(to: prev.time)
+                        if isShowingPlayingTrack {
+                            audioEngine.seek(to: prev.time)
+                        }
                     } label: {
                         Text(prev.text)
                             .font(.system(size: 11, weight: .medium, design: .rounded))
@@ -86,6 +95,12 @@ public struct AbovePlayerLyricsBar: View {
                         .lineLimit(1)
                         .multilineTextAlignment(.center)
                         .id(curr.id)
+                } else if syncedLyrics != nil && activeLineIndex == nil {
+                    Text("•••")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .foregroundStyle(YMTheme.fg60)
+                        .lineLimit(1)
+                        .multilineTextAlignment(.center)
                 } else if let error = errorMessage {
                     Text(error)
                         .font(.system(size: 12, weight: .medium))
@@ -103,7 +118,9 @@ public struct AbovePlayerLyricsBar: View {
                 // Line 3: Next Line
                 if let next = nextLine {
                     Button {
-                        audioEngine.seek(to: next.time)
+                        if isShowingPlayingTrack {
+                            audioEngine.seek(to: next.time)
+                        }
                     } label: {
                         Text(next.text)
                             .font(.system(size: 11, weight: .medium, design: .rounded))
@@ -153,6 +170,7 @@ public struct AbovePlayerLyricsBar: View {
                         .background(Circle().fill(YMTheme.surfaceComponent))
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
                 .help("Закрыть текст песни (Esc)")
             }
             .padding(.trailing, windowState.isCompactWidth ? 12 : 20)
@@ -175,10 +193,12 @@ public struct AbovePlayerLyricsBar: View {
                 )
 
                 // Isolated time observer avoids redrawing the bar on every playback timer tick
-                AbovePlayerLyricsTimeObserver(
-                    syncedLyrics: syncedLyrics,
-                    activeLineIndex: $activeLineIndex
-                )
+                if isShowingPlayingTrack {
+                    AbovePlayerLyricsTimeObserver(
+                        syncedLyrics: syncedLyrics,
+                        activeLineIndex: $activeLineIndex
+                    )
+                }
             }
         }
         .task(id: currentTrack?.id) {
@@ -205,7 +225,7 @@ public struct AbovePlayerLyricsBar: View {
             if let synced = try await networkClient.fetchTrackLyricsLRC(trackId: requestedTrackId), !synced.isEmpty {
                 guard !Task.isCancelled, currentTrack?.id == requestedTrackId else { return }
                 self.syncedLyrics = synced
-                self.activeLineIndex = synced.activeLineIndex(for: audioEngine.progressTracker.currentTime)
+                self.activeLineIndex = isShowingPlayingTrack ? synced.activeLineIndex(for: audioEngine.progressTracker.currentTime) : nil
                 self.isLoading = false
                 return
             }
@@ -244,9 +264,7 @@ private struct AbovePlayerLyricsTimeObserver: View {
             .onChange(of: progressTracker.currentTime) { _, newTime in
                 let newIndex = syncedLyrics?.activeLineIndex(for: newTime)
                 if newIndex != activeLineIndex {
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        activeLineIndex = newIndex
-                    }
+                    activeLineIndex = newIndex
                 }
             }
     }

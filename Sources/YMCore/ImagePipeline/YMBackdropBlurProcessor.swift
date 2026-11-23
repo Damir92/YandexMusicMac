@@ -20,6 +20,7 @@ public final class YMBackdropBlurProcessor {
 
     private nonisolated static let ciBox = SendableCIContextBox()
     private let memoryCache: NSCache<NSString, NSImage>
+    private var inFlightTasks: [String: Task<CGImage?, Never>] = [:]
 
     public init() {
         let cache = NSCache<NSString, NSImage>()
@@ -33,9 +34,24 @@ public final class YMBackdropBlurProcessor {
     public func blurredImage(for coverUri: String?, radius: Double = 16.0) async -> NSImage? {
         guard let coverUri = coverUri, !coverUri.isEmpty else { return nil }
 
-        let cacheKey = "\(coverUri)_\(Int(radius))" as NSString
+        let keyString = "\(coverUri)_\(Int(radius))"
+        let cacheKey = keyString as NSString
         if let cached = memoryCache.object(forKey: cacheKey) {
             return cached
+        }
+
+        if let existingTask = inFlightTasks[keyString] {
+            if let blurredCG = await existingTask.value {
+                if let cached = memoryCache.object(forKey: cacheKey) {
+                    return cached
+                }
+                let result = NSImage(
+                    cgImage: blurredCG,
+                    size: NSSize(width: blurredCG.width, height: blurredCG.height)
+                )
+                return result
+            }
+            return nil
         }
 
         guard let smallImage = await ImagePipeline.shared.image(for: coverUri, size: .small),
@@ -44,9 +60,14 @@ public final class YMBackdropBlurProcessor {
         }
         guard !Task.isCancelled else { return nil }
 
-        let blurredCG: CGImage? = await Task.detached(priority: .userInitiated) {
-            Self.makeBlurredCGImage(from: cgImage, radius: radius)
-        }.value
+        let task = Task.detached(priority: .userInitiated) { () -> CGImage? in
+            guard !Task.isCancelled else { return nil }
+            return Self.makeBlurredCGImage(from: cgImage, radius: radius)
+        }
+
+        inFlightTasks[keyString] = task
+        let blurredCG = await task.value
+        inFlightTasks.removeValue(forKey: keyString)
 
         guard let blurredCG, !Task.isCancelled else { return nil }
 
@@ -75,6 +96,10 @@ public final class YMBackdropBlurProcessor {
     }
 
     public func clearCache() {
+        for task in inFlightTasks.values {
+            task.cancel()
+        }
+        inFlightTasks.removeAll()
         memoryCache.removeAllObjects()
     }
 }

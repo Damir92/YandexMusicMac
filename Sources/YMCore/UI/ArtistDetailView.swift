@@ -6,13 +6,13 @@ public struct ArtistDetailView: View {
     public let artistName: String
 
     @UIState private var briefInfo: YMArtistBriefInfo? = nil
+    @UIState private var cachedPopularTracks: [YMTrack] = []
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
     @UIState private var loadTask: Task<Void, Never>? = nil
     @UIState private var isScrolled = false
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var windowState = WindowState.shared
     private let networkClient = YMNetworkClient.shared
@@ -143,7 +143,7 @@ public struct ArtistDetailView: View {
                                 .padding(.horizontal, 24)
 
                             TrackTableView(
-                                tracks: Array(info.popularTracks.prefix(10)),
+                                tracks: cachedPopularTracks,
                                 onPlayTrack: { track in
                                     audioEngine.isWaveMode = false
                                     if let index = info.popularTracks.firstIndex(where: { $0.id == track.id }) {
@@ -165,7 +165,7 @@ public struct ArtistDetailView: View {
                                 .padding(.horizontal, 24)
 
                             ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 16) {
+                                LazyHStack(spacing: 16) {
                                     ForEach(info.albums) { album in
                                         YMAlbumCard(album: album) {
                                             // Play album
@@ -195,7 +195,7 @@ public struct ArtistDetailView: View {
                                 .padding(.horizontal, 24)
 
                             ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 16) {
+                                LazyHStack(spacing: 16) {
                                     ForEach(info.alsoAlbums) { album in
                                         YMAlbumCard(album: album) {
                                             Task {
@@ -224,7 +224,7 @@ public struct ArtistDetailView: View {
                                 .padding(.horizontal, 24)
 
                             ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 20) {
+                                LazyHStack(spacing: 20) {
                                     ForEach(info.similarArtists) { similar in
                                         YMArtistCard(artist: similar) {
                                             coordinator.navigate(to: .artist(id: similar.id, name: similar.name))
@@ -262,13 +262,16 @@ public struct ArtistDetailView: View {
             }
             .padding(.bottom, 24)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "artist_detail_scroll",
-                    threshold: 84,
-                    isScrolled: $isScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "artist_detail_scroll",
+                        threshold: 84,
+                        isScrolled: $isScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 84, isScrolled: $isScrolled)
         .coordinateSpace(name: "artist_detail_scroll")
         .overlay(alignment: .top) {
             YMStickyDetailTopBar(
@@ -284,6 +287,10 @@ public struct ArtistDetailView: View {
             isScrolled = false
             loadArtistData()
         }
+        .onDisappear {
+            loadTask?.cancel()
+            loadTask = nil
+        }
     }
 
     private func loadArtistData() {
@@ -298,6 +305,7 @@ public struct ArtistDetailView: View {
                 await MainActor.run {
                     guard self.artistId == targetArtistId else { return }
                     self.briefInfo = info
+                    self.cachedPopularTracks = Array(info.popularTracks.prefix(10))
                     self.isLoading = false
                 }
             } catch {

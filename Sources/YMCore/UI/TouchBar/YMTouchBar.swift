@@ -8,51 +8,61 @@ public struct YMPlaybackTouchBar: ViewModifier {
     public init() {}
 
     public func body(content: Content) -> some View {
+        let currentTrack = audioEngine.currentTrack
+        let isPlaying = audioEngine.isPlaying
+        let isWaveMode = audioEngine.isWaveMode
+        let isLiked = currentTrack.map { likesService.isLiked(trackId: $0.id) } ?? false
+
         content
             .touchBar {
-                // Previous Button
                 Button {
                     audioEngine.previous()
                 } label: {
                     Image(systemName: "backward.fill")
                 }
-                .disabled(audioEngine.currentTrack == nil)
+                .accessibilityLabel("Предыдущий трек")
+                .disabled(currentTrack == nil)
 
-                // Play / Pause Button
                 Button {
                     audioEngine.togglePlayPause()
                 } label: {
-                    Image(systemName: audioEngine.isPlaying ? "pause.fill" : "play.fill")
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                 }
-                .disabled(audioEngine.currentTrack == nil)
+                .accessibilityLabel(isPlaying ? "Пауза" : "Воспроизведение")
+                .disabled(currentTrack == nil)
 
-                // Next Button
                 Button {
                     audioEngine.next()
                 } label: {
                     Image(systemName: "forward.fill")
                 }
-                .disabled(audioEngine.currentTrack == nil)
+                .accessibilityLabel("Следующий трек")
+                .disabled(currentTrack == nil)
 
-                // Current Track Info & Heart
-                if let track = audioEngine.currentTrack {
+                if let track = currentTrack {
                     Text("\(track.displayTitle) — \(track.artistsString)")
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 220)
 
                     Button {
                         Task {
                             await likesService.toggleLike(track: track)
                         }
                     } label: {
-                        Image(systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart")
+                        Image(systemName: isLiked ? "heart.fill" : "heart")
+                            .foregroundStyle(isLiked ? YMTheme.heartRed : .primary)
                     }
+                    .accessibilityLabel(isLiked ? "Удалить из Мне нравится" : "Мне нравится")
 
-                    if audioEngine.isWaveMode {
+                    if isWaveMode {
                         Button {
                             audioEngine.applyWaveTuning(.moreLikeThis)
                         } label: {
                             Image(systemName: "flame.fill")
+                                .foregroundStyle(YMTheme.accent)
                         }
+                        .accessibilityLabel("Больше таких треков")
                     }
                 }
             }

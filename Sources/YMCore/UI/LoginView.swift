@@ -166,9 +166,11 @@ public struct LoginView: View {
 
                         Button {
                             let tokenToSubmit = manualInput
-                            manualInput = ""
                             Task {
                                 await authService.submitManualToken(tokenToSubmit)
+                                if authService.isAuthenticated {
+                                    manualInput = ""
+                                }
                             }
                         } label: {
                             HStack(spacing: 8) {
@@ -303,6 +305,7 @@ private struct OAuthInterceptionWebView: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate {
         let parent: OAuthInterceptionWebView
+        private weak var webView: WKWebView?
         private var urlObservation: NSKeyValueObservation?
         private var hasExtractedToken = false
 
@@ -311,12 +314,11 @@ private struct OAuthInterceptionWebView: NSViewRepresentable {
         }
 
         func startObserving(webView: WKWebView) {
-            urlObservation = webView.observe(\.url, options: [.new]) { [weak self] wv, _ in
+            self.webView = webView
+            urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, _ in
                 Task { @MainActor [weak self] in
-                    guard let self = self, !self.hasExtractedToken else { return }
-                    if let urlString = wv.url?.absoluteString {
-                        self.interceptIfNeeded(urlString, webView: wv)
-                    }
+                    guard let self = self, !self.hasExtractedToken, let urlString = self.webView?.url?.absoluteString else { return }
+                    self.interceptIfNeeded(urlString, webView: self.webView)
                 }
             }
         }
@@ -324,6 +326,7 @@ private struct OAuthInterceptionWebView: NSViewRepresentable {
         func stopObserving() {
             urlObservation?.invalidate()
             urlObservation = nil
+            webView = nil
         }
 
         private func interceptIfNeeded(_ urlString: String, webView: WKWebView?) {
@@ -350,6 +353,14 @@ private struct OAuthInterceptionWebView: NSViewRepresentable {
             if let urlString = webView.url?.absoluteString {
                 interceptIfNeeded(urlString, webView: webView)
             }
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            parent.isLoading = false
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            parent.isLoading = false
         }
 
         func webView(

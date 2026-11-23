@@ -34,7 +34,7 @@ public enum ImageDownsampler: Sendable {
             return nil
         }
 
-        let targetSize = NSSize(width: maxPixelSize, height: maxPixelSize)
+        let targetSize = NSSize(width: downsampledCGImage.width, height: downsampledCGImage.height)
         return NSImage(cgImage: downsampledCGImage, size: targetSize)
     }
 

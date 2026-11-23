@@ -19,45 +19,71 @@ public struct YMAlbumCard: View {
     }
 
     public var body: some View {
-        Button {
-            onSelect?()
-        } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                ZStack(alignment: .bottomTrailing) {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .bottomTrailing) {
+                ZStack {
                     CachedCoverImage(
                         coverUri: album.coverUri,
                         size: .medium,
                         displaySize: 150,
                         cornerRadius: YMTheme.cornerRadiusMedium
                     )
-                    .frame(width: 150, height: 150)
-                    .ymCardHover(cornerRadius: YMTheme.cornerRadiusMedium, scale: 1.04)
+                    .scaleEffect(isHovered ? 1.05 : 1.0)
 
-                    // Play button overlay on hover
-                    if isHovered, let onPlay = onPlay {
-                        Button {
-                            onPlay()
-                        } label: {
-                            Image(systemName: "play.fill")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.black)
-                                .frame(width: 36, height: 36)
-                                .background(Circle().fill(YMTheme.accent))
-                                .shadow(color: .black.opacity(0.4), radius: 8, y: 4)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(8)
-                        .transition(.scale.combined(with: .opacity))
+                    if isHovered {
+                        LinearGradient(
+                            colors: [Color.clear, Color.black.opacity(0.42)],
+                            startPoint: .center,
+                            endPoint: .bottom
+                        )
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
                     }
                 }
-                .onHover { isHovered = $0 }
+                .frame(width: 150, height: 150)
+                .clipShape(RoundedRectangle(cornerRadius: YMTheme.cornerRadiusMedium, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: YMTheme.cornerRadiusMedium, style: .continuous)
+                        .strokeBorder(isHovered ? YMTheme.borderHover : YMTheme.border, lineWidth: 1)
+                        .allowsHitTesting(false)
+                )
+                .shadow(
+                    color: YMTheme.shadowColor,
+                    radius: isHovered ? 12 : 3,
+                    y: isHovered ? 6 : 1
+                )
+                .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isHovered)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(album.title)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(isHovered ? YMTheme.accent : YMTheme.fg)
+                // Play button overlay on hover
+                if isHovered, let onPlay = onPlay {
+                    Button {
+                        onPlay()
+                    } label: {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 36, height: 36)
+                            .background(Circle().fill(YMTheme.accent))
+                            .shadow(color: .black.opacity(0.4), radius: 8, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .transition(.scale.combined(with: .opacity))
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(album.title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(isHovered ? YMTheme.accent : YMTheme.fg)
+                    .lineLimit(1)
+
+                if let artists = album.artists, !artists.isEmpty {
+                    Text(artists.map(\.name).joined(separator: ", "))
+                        .font(.caption)
+                        .foregroundStyle(YMTheme.fg60)
                         .lineLimit(1)
-
+                } else {
                     HStack(spacing: 4) {
                         if let year = album.year {
                             Text(String(year))
@@ -70,10 +96,21 @@ public struct YMAlbumCard: View {
                     .foregroundStyle(YMTheme.fg40)
                     .lineLimit(1)
                 }
-                .frame(width: 150, alignment: .leading)
             }
+            .frame(width: 150, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onSelect?()
+        }
+        .onHover { inside in
+            if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+            if isHovered != inside { isHovered = inside }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false }
+        }
+        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -127,6 +164,12 @@ public struct YMArtistCard: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
+        .onHover { inside in
+            if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+            if isHovered != inside { isHovered = inside }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false }
+        }
     }
 }

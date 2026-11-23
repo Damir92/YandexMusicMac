@@ -46,7 +46,7 @@ public struct YMSearchAlbumsBlock: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.total = try? container.decodeIfPresent(Int.self, forKey: .total)
-        self.results = (try? container.decodeIfPresent([YMAlbum].self, forKey: .results)) ?? []
+        self.results = FlexibleArrayDecoder.decodeLossy(YMAlbum.self, from: container, forKey: .results)
     }
 
     public init(total: Int? = nil, results: [YMAlbum] = []) {
@@ -114,7 +114,7 @@ public struct YMSearchArtistsBlock: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.total = try? container.decodeIfPresent(Int.self, forKey: .total)
-        self.results = (try? container.decodeIfPresent([YMArtist].self, forKey: .results)) ?? []
+        self.results = FlexibleArrayDecoder.decodeLossy(YMArtist.self, from: container, forKey: .results)
     }
 
     public init(total: Int? = nil, results: [YMArtist] = []) {
@@ -148,22 +148,7 @@ public struct YMSearchTracksBlock: Codable, Sendable {
         self.total = try? container.decodeIfPresent(Int.self, forKey: .total)
         self.perPage = try? container.decodeIfPresent(Int.self, forKey: .perPage)
         self.order = try? container.decodeIfPresent(Int.self, forKey: .order)
-
-        if let tracks = try? container.decodeIfPresent([YMTrack].self, forKey: .results) {
-            self.results = tracks
-        } else if var arrContainer = try? container.nestedUnkeyedContainer(forKey: .results) {
-            var validTracks: [YMTrack] = []
-            while !arrContainer.isAtEnd {
-                if let track = try? arrContainer.decode(YMTrack.self) {
-                    validTracks.append(track)
-                } else {
-                    _ = try? arrContainer.decode(DummyTrackSkipper.self)
-                }
-            }
-            self.results = validTracks
-        } else {
-            self.results = []
-        }
+        self.results = FlexibleArrayDecoder.decodeLossy(YMTrack.self, from: container, forKey: .results)
     }
 }
 
@@ -176,24 +161,10 @@ public struct YMArtistTracksResponse: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.tracks = (try? container.decodeIfPresent([YMTrack].self, forKey: .tracks)) ?? []
+        self.tracks = FlexibleArrayDecoder.decodeLossy(YMTrack.self, from: container, forKey: .tracks)
     }
 
     public init(tracks: [YMTrack] = []) {
         self.tracks = tracks
-    }
-}
-
-private struct DummyTrackSkipper: Decodable {
-    init(from decoder: Decoder) throws {
-        _ = try? decoder.container(keyedBy: DynamicCodingKey.self)
-        _ = try? decoder.singleValueContainer()
-    }
-
-    private struct DynamicCodingKey: CodingKey {
-        var stringValue: String
-        init?(stringValue: String) { self.stringValue = stringValue }
-        var intValue: Int?
-        init?(intValue: Int) { self.intValue = intValue; self.stringValue = "\(intValue)" }
     }
 }

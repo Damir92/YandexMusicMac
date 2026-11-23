@@ -58,6 +58,11 @@ public final class YMThemeManager {
 
     private let themeKey = "ym_app_theme_preference"
 
+    public private(set) var resolvedPalette: YMThemePalette = .graphite
+
+    @ObservationIgnored private var distributedObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var appearanceObservation: NSKeyValueObservation?
+
     public var currentTheme: YMAppTheme {
         didSet {
             UserDefaults.standard.set(currentTheme.rawValue, forKey: themeKey)
@@ -72,9 +77,51 @@ public final class YMThemeManager {
         } else {
             self.currentTheme = .dark
         }
+        refreshResolvedPalette()
+
+        distributedObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                self.updateWindowAppearance()
+                DispatchQueue.main.async {
+                    self.refreshResolvedPalette()
+                }
+            }
+        }
+
+        if let app = NSApp {
+            appearanceObservation = app.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+                MainActor.assumeIsolated {
+                    guard let self = self else { return }
+                    if self.currentTheme == .system {
+                        self.refreshResolvedPalette()
+                    }
+                }
+            }
+        }
         // Do not call updateWindowAppearance() here:
         // YMThemeManager.shared is accessed during App.init, before NSApplication is fully running.
         // AppDelegate calls updateWindowAppearance() on launch once windows are ready.
+    }
+
+    public func cleanup() {
+        if let distributedObserver {
+            DistributedNotificationCenter.default().removeObserver(distributedObserver)
+            self.distributedObserver = nil
+        }
+        appearanceObservation?.invalidate()
+        appearanceObservation = nil
+    }
+
+    public func refreshResolvedPalette() {
+        let next = YMTheme.palette(for: currentTheme)
+        if resolvedPalette != next {
+            resolvedPalette = next
+        }
     }
 
     public func setTheme(_ theme: YMAppTheme) {
@@ -82,16 +129,36 @@ public final class YMThemeManager {
     }
 
     public func updateWindowAppearance() {
+        guard let app = NSApp else {
+            refreshResolvedPalette()
+            return
+        }
+
+        if appearanceObservation == nil {
+            appearanceObservation = app.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+                MainActor.assumeIsolated {
+                    guard let self = self else { return }
+                    if self.currentTheme == .system {
+                        self.refreshResolvedPalette()
+                    }
+                }
+            }
+        }
+
         let appKitAppearance: NSAppearance? = switch currentTheme {
         case .system: nil
         case .dark, .midnight: NSAppearance(named: .darkAqua)
         case .light, .latte: NSAppearance(named: .aqua)
         }
 
-        // Use NSApplication.shared (always safe, avoids implicitly unwrapped NSApp nil during early launch)
-        NSApplication.shared.appearance = appKitAppearance
-        for window in NSApplication.shared.windows where !(window is NSPanel) {
-            window.appearance = appKitAppearance
+        if app.appearance?.name != appKitAppearance?.name {
+            app.appearance = appKitAppearance
         }
+        for window in app.windows where !(window is NSPanel) {
+            if window.appearance?.name != appKitAppearance?.name {
+                window.appearance = appKitAppearance
+            }
+        }
+        refreshResolvedPalette()
     }
 }

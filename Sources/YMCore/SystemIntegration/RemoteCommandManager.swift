@@ -8,6 +8,7 @@ public final class RemoteCommandManager {
 
     private weak var playerEngine: AudioPlayerEngine?
     public var onLikeToggled: (@Sendable () -> Void)?
+    nonisolated(unsafe) private var commandTargets: [(MPRemoteCommand, Any)] = []
 
     public init(playerEngine: AudioPlayerEngine = AudioPlayerEngine.shared) {
         self.playerEngine = playerEngine
@@ -15,86 +16,81 @@ public final class RemoteCommandManager {
     }
 
     deinit {
-        let commandCenter = MPRemoteCommandCenter.shared()
-        let commands = [
-            commandCenter.playCommand,
-            commandCenter.pauseCommand,
-            commandCenter.togglePlayPauseCommand,
-            commandCenter.nextTrackCommand,
-            commandCenter.previousTrackCommand,
-            commandCenter.changePlaybackPositionCommand,
-            commandCenter.likeCommand
-        ]
-        for command in commands {
-            command.isEnabled = false
-            command.removeTarget(nil)
+        for (command, target) in commandTargets {
+            command.removeTarget(target)
         }
+    }
+
+    public func unregisterCommands() {
+        for (command, target) in commandTargets {
+            command.removeTarget(target)
+        }
+        commandTargets.removeAll()
     }
 
     public func configure(with engine: AudioPlayerEngine) {
         self.playerEngine = engine
     }
 
+    public func updateLikeState(isLiked: Bool) {
+        MPRemoteCommandCenter.shared().likeCommand.isActive = isLiked
+    }
+
     private func setupCommands() {
+        unregisterCommands()
+
         let commandCenter = MPRemoteCommandCenter.shared()
-        let commands = [
-            commandCenter.playCommand,
-            commandCenter.pauseCommand,
-            commandCenter.togglePlayPauseCommand,
-            commandCenter.nextTrackCommand,
-            commandCenter.previousTrackCommand,
-            commandCenter.changePlaybackPositionCommand,
-            commandCenter.likeCommand
-        ]
-        for command in commands {
-            command.removeTarget(nil)
-        }
 
         // Play / Pause / Toggle
         commandCenter.playCommand.isEnabled = true
-        commandCenter.playCommand.addTarget { [weak self] _ in
+        let playTarget = commandCenter.playCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.playerEngine?.play()
             }
             return .success
         }
+        commandTargets.append((commandCenter.playCommand, playTarget))
 
         commandCenter.pauseCommand.isEnabled = true
-        commandCenter.pauseCommand.addTarget { [weak self] _ in
+        let pauseTarget = commandCenter.pauseCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.playerEngine?.pause()
             }
             return .success
         }
+        commandTargets.append((commandCenter.pauseCommand, pauseTarget))
 
         commandCenter.togglePlayPauseCommand.isEnabled = true
-        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+        let toggleTarget = commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.playerEngine?.togglePlayPause()
             }
             return .success
         }
+        commandTargets.append((commandCenter.togglePlayPauseCommand, toggleTarget))
 
         // Track navigation
         commandCenter.nextTrackCommand.isEnabled = true
-        commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+        let nextTarget = commandCenter.nextTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.playerEngine?.next()
             }
             return .success
         }
+        commandTargets.append((commandCenter.nextTrackCommand, nextTarget))
 
         commandCenter.previousTrackCommand.isEnabled = true
-        commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+        let prevTarget = commandCenter.previousTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.playerEngine?.previous()
             }
             return .success
         }
+        commandTargets.append((commandCenter.previousTrackCommand, prevTarget))
 
         // Seek scrubber
         commandCenter.changePlaybackPositionCommand.isEnabled = true
-        commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+        let seekTarget = commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent else {
                 return .commandFailed
             }
@@ -105,19 +101,22 @@ public final class RemoteCommandManager {
             }
             return .success
         }
+        commandTargets.append((commandCenter.changePlaybackPositionCommand, seekTarget))
 
         // Like command
         commandCenter.likeCommand.isEnabled = true
         commandCenter.likeCommand.localizedTitle = "Мне нравится"
-        commandCenter.likeCommand.addTarget { [weak self] _ in
+        let likeTarget = commandCenter.likeCommand.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 if let onLikeToggled = self?.onLikeToggled {
                     onLikeToggled()
                 } else if let currentTrack = self?.playerEngine?.currentTrack {
                     await LikesService.shared.toggleLike(track: currentTrack)
+                    self?.updateLikeState(isLiked: LikesService.shared.isLiked(trackId: currentTrack.id))
                 }
             }
             return .success
         }
+        commandTargets.append((commandCenter.likeCommand, likeTarget))
     }
 }

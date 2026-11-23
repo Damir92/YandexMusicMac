@@ -28,11 +28,11 @@ public struct MainSplitView: View {
     @UIState private var authService = AuthService.shared
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var rotorService = RotorService.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var playlistsService = PlaylistsService.shared
     @UIState private var windowState = WindowState.shared
     @UIState private var themeManager = YMThemeManager.shared
     @UIState private var columnVisibility: NavigationSplitViewVisibility = .all
+    @UIState private var keyEventMonitor: Any? = nil
 
     public init() {}
 
@@ -43,13 +43,13 @@ public struct MainSplitView: View {
     public var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebarContent
-                .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 280)
+                .navigationSplitViewColumnWidth(min: 216, ideal: 236, max: 290)
+                .toolbar(removing: .sidebarToggle)
         } detail: {
             detailContent
         }
         .navigationSplitViewStyle(.balanced)
         .preferredColorScheme(themeManager.currentTheme.colorScheme)
-        .toolbar(.hidden, for: .windowToolbar)
         .frame(minWidth: 440, minHeight: 320)
         .sheet(isPresented: $audioEngine.isSubscriptionRequiredPresented) {
             SubscriptionRequiredSheetView(isPresented: $audioEngine.isSubscriptionRequiredPresented)
@@ -76,6 +76,12 @@ public struct MainSplitView: View {
             setupKeyboardMonitor()
             Task {
                 await playlistsService.ensureLoaded()
+            }
+        }
+        .onDisappear {
+            if let monitor = keyEventMonitor {
+                NSEvent.removeMonitor(monitor)
+                keyEventMonitor = nil
             }
         }
         .onChange(of: columnVisibility) { _, newVisibility in
@@ -114,11 +120,7 @@ public struct MainSplitView: View {
                         badgeColor: YMTheme.accent
                     )
 
-                    sidebarButton(
-                        section: .favorites,
-                        badge: likesService.likedTrackIds.isEmpty ? nil : formatLikedCount(likesService.likedTrackIds.count),
-                        badgeColor: YMTheme.fg60
-                    )
+                    sidebarButton(section: .favorites)
 
                     sidebarButton(section: .playlists)
                 }
@@ -264,7 +266,7 @@ public struct MainSplitView: View {
                 coordinator.selectSection(section)
             }
         } label: {
-            HStack(spacing: 10) {
+            HStack(spacing: 9) {
                 Image(systemName: section.iconName)
                     .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
                     .foregroundColor(
@@ -277,12 +279,18 @@ public struct MainSplitView: View {
                     .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
                     .foregroundStyle(isSelected ? YMTheme.fg : YMTheme.fg80)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
 
-                Spacer(minLength: 6)
+                Spacer(minLength: 4)
 
-                if let badge = badge {
+                if section == .favorites {
+                    SidebarFavoritesBadge()
+                } else if let badge = badge {
                     Text(badge)
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(
@@ -290,10 +298,12 @@ public struct MainSplitView: View {
                                 .fill(badgeColor == YMTheme.accent ? YMTheme.accent.opacity(0.18) : YMTheme.surfaceComponent)
                         )
                         .foregroundStyle(badgeColor)
+                        .layoutPriority(2)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.leading, 11)
+            .padding(.trailing, 10)
+            .padding(.vertical, 7)
             .background(
                 ZStack {
                     if isSelected {
@@ -301,19 +311,14 @@ public struct MainSplitView: View {
                             .fill(YMTheme.surfaceComponentHover)
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(YMTheme.accent.opacity(0.10))
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(YMTheme.border, lineWidth: 1)
                     }
                 }
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private func formatLikedCount(_ count: Int) -> String {
-        if count >= 1000 {
-            return "\(count / 1000) \(count % 1000)"
-        }
-        return "\(count)"
     }
 
     // MARK: - Detail Content
@@ -383,7 +388,7 @@ public struct MainSplitView: View {
                                 )
                         }
                         .buttonStyle(.plain)
-                        .padding(.leading, windowState.isFullScreen ? 16 : 84)
+                        .padding(.leading, (windowState.isFullScreen || columnVisibility != .detailOnly) ? 16 : 84)
                         .padding(.top, windowState.isFullScreen ? 14 : 10)
                         .help("Показать/скрыть боковое меню")
                     }
@@ -471,7 +476,6 @@ public struct MainSplitView: View {
         }
         .ignoresSafeArea(.container, edges: .top)
         .navigationTitle("")
-        .toolbar(.hidden, for: .windowToolbar)
         .background(YMTheme.bg.ignoresSafeArea())
     }
 
@@ -497,31 +501,73 @@ public struct MainSplitView: View {
     }
 
     private func setupKeyboardMonitor() {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // If the user is currently editing text in a search field or text view, preserve native cursor navigation
-            if let responder = NSApp.keyWindow?.firstResponder,
-               responder is NSTextView || responder is NSText {
-                return event
-            }
-
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let keyCode = event.keyCode
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags.isEmpty && event.keyCode == 53 && NavigationCoordinator.shared.isEqualizerPresented {
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                    NavigationCoordinator.shared.isEqualizerPresented = false
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard let keyWindow = NSApp.keyWindow, WindowState.shared.isValidAppWindow(keyWindow) else {
+                    return false
                 }
-                return nil
-            }
-            // Bare Left Arrow (123) and Right Arrow (124) without Command/Option/Control
-            if flags.isEmpty {
-                if event.keyCode == 123 { // Left Arrow
-                    audioEngine.seekRelative(by: -5.0)
-                    return nil
-                } else if event.keyCode == 124 { // Right Arrow
-                    audioEngine.seekRelative(by: 5.0)
-                    return nil
+                // If the user is currently editing text in a search field or text view, preserve native cursor navigation
+                if let responder = keyWindow.firstResponder,
+                   responder is NSTextView || responder is NSText {
+                    return false
                 }
+
+                if flags.isEmpty && keyCode == 53 && NavigationCoordinator.shared.isEqualizerPresented {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
+                        NavigationCoordinator.shared.isEqualizerPresented = false
+                    }
+                    return true
+                }
+                // Bare Left Arrow (123) and Right Arrow (124) without Command/Option/Control
+                if flags.isEmpty {
+                    if keyCode == 123 { // Left Arrow
+                        audioEngine.seekRelative(by: -5.0)
+                        return true
+                    } else if keyCode == 124 { // Right Arrow
+                        audioEngine.seekRelative(by: 5.0)
+                        return true
+                    }
+                }
+                return false
             }
-            return event
+            return handled ? nil : event
+        }
+    }
+}
+
+// MARK: - Isolated Sidebar Favorites Badge
+
+private struct SidebarFavoritesBadge: View {
+    @UIState private var likesService = LikesService.shared
+
+    var body: some View {
+        let count = likesService.likedTrackIds.count
+        if count > 0 {
+            Text(formatLikedCount(count))
+                .font(.system(size: 10.5, weight: .semibold).monospacedDigit())
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(YMTheme.surfaceComponent)
+                )
+                .foregroundStyle(YMTheme.fg60)
+                .layoutPriority(2)
+        }
+    }
+
+    private func formatLikedCount(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            return String(format: "%d\u{00A0}%03d\u{00A0}%03d", count / 1_000_000, (count / 1000) % 1000, count % 1000)
+        } else if count >= 1000 {
+            return String(format: "%d\u{00A0}%03d", count / 1000, count % 1000)
+        } else {
+            return "\(count)"
         }
     }
 }

@@ -27,10 +27,13 @@ public struct YMArtist: Codable, Sendable, Identifiable, Hashable {
         case various
         case composer
         case cover
+        case coverUri
+        case ogImage
     }
 
     enum CoverKeys: String, CodingKey {
         case uri
+        case prefix
     }
 
     public init(from decoder: Decoder) throws {
@@ -46,11 +49,16 @@ public struct YMArtist: Codable, Sendable, Identifiable, Hashable {
         self.various = try? container.decodeIfPresent(Bool.self, forKey: .various)
         self.composer = try? container.decodeIfPresent(Bool.self, forKey: .composer)
 
+        var resolvedCover: String? = nil
         if let coverContainer = try? container.nestedContainer(keyedBy: CoverKeys.self, forKey: .cover) {
-            self.coverUri = try? coverContainer.decodeIfPresent(String.self, forKey: .uri)
-        } else {
-            self.coverUri = nil
+            resolvedCover = (try? coverContainer.decodeIfPresent(String.self, forKey: .uri))
+                ?? (try? coverContainer.decodeIfPresent(String.self, forKey: .prefix))
         }
+        if resolvedCover == nil {
+            resolvedCover = (try? container.decodeIfPresent(String.self, forKey: .coverUri))
+                ?? (try? container.decodeIfPresent(String.self, forKey: .ogImage))
+        }
+        self.coverUri = resolvedCover
     }
 
     public func encode(to encoder: Encoder) throws {

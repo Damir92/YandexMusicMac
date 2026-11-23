@@ -6,10 +6,10 @@ import AppKit
 /// fixed-width quality pills, and isolated PlaybackProgressTracker redraw boundaries.
 public struct PlayerBarView: View {
     @UIState private var audioEngine = AudioPlayerEngine.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var windowState = WindowState.shared
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var isFlameActive = false
+    @UIState private var flameResetTask: Task<Void, Never>? = nil
     @UIState private var isMuted = false
     @UIState private var previousVolume: Float = 1.0
     @UIState private var eqSettings = EqualizerSettings.shared
@@ -38,7 +38,7 @@ public struct PlayerBarView: View {
 
             // Right: Lyrics, Fixed-width Quality Badge & Volume Control
             rightControlsSection
-                .frame(minWidth: windowState.isMiniWidth ? 55 : (windowState.isCompactWidth ? 110 : 160), maxWidth: 250, alignment: .trailing)
+                .frame(minWidth: windowState.isMiniWidth ? 84 : (windowState.isCompactWidth ? 110 : 160), maxWidth: 250, alignment: .trailing)
         }
         .padding(.horizontal, windowState.isCompactWidth ? 12 : 20)
         .padding(.vertical, 8)
@@ -70,7 +70,7 @@ public struct PlayerBarView: View {
 
                 // Свободные участки бара двигают окно; элементы управления лежат выше
                 // и получают клики первыми, поэтому ползунки работают нормально.
-                YMWindowDragHandle()
+                YMWindowDragHandle(allowsDoubleClickZoom: false)
             }
         }
         .overlay(alignment: .top) {
@@ -86,6 +86,15 @@ public struct PlayerBarView: View {
             y: nowPlayingStyle ? 0 : -4
         )
         .animation(.easeInOut(duration: 0.25), value: nowPlayingStyle)
+        .onChange(of: audioEngine.volume) { _, newVolume in
+            if newVolume > 0.001 && isMuted {
+                isMuted = false
+            }
+        }
+        .onDisappear {
+            flameResetTask?.cancel()
+            flameResetTask = nil
+        }
     }
 
     // MARK: - Left Track Section
@@ -118,22 +127,29 @@ public struct PlayerBarView: View {
                         .foregroundStyle(YMTheme.fg)
                         .lineLimit(1)
 
-                    if !track.artists.isEmpty {
+                    if windowState.isMiniWidth {
+                        Text(track.artistsString)
+                            .font(.system(size: 11))
+                            .foregroundStyle(YMTheme.fg60)
+                            .lineLimit(1)
+                    } else if !track.artists.isEmpty {
+                        let displayedArtists = Array(track.artists.prefix(3))
                         HStack(spacing: 4) {
-                            ForEach(track.artists) { artist in
+                            ForEach(displayedArtists) { artist in
                                 PlayerBarArtistButton(artist: artist) {
                                     withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
                                         coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
                                     }
                                 }
 
-                                if artist.id != track.artists.last?.id {
+                                if artist.id != displayedArtists.last?.id {
                                     Text("•")
                                         .font(.system(size: 8))
                                         .foregroundStyle(YMTheme.fg40)
                                 }
                             }
                         }
+                        .clipped()
                     } else {
                         Text(track.artistsString)
                             .font(.system(size: 11))
@@ -145,18 +161,7 @@ public struct PlayerBarView: View {
                 .layoutPriority(1)
 
                 // Heart / Like button
-                PlayerHoverIconButton(
-                    systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart",
-                    fontSize: windowState.isMiniWidth ? 12 : 13,
-                    foregroundColor: likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg60,
-                    isActive: false,
-                    buttonSize: windowState.isMiniWidth ? 24 : 28,
-                    helpText: likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Мне нравится"
-                ) {
-                    Task {
-                        await likesService.toggleLike(track: track)
-                    }
-                }
+                PlayerBarLikeButton(track: track)
             } else {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(YMTheme.surfaceComponent)
@@ -214,8 +219,10 @@ public struct PlayerBarView: View {
                         ) {
                             audioEngine.applyWaveTuning(.moreLikeThis)
                             isFlameActive = true
-                            Task {
+                            flameResetTask?.cancel()
+                            flameResetTask = Task {
                                 try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                guard !Task.isCancelled else { return }
                                 await MainActor.run {
                                     isFlameActive = false
                                 }
@@ -395,17 +402,19 @@ public struct PlayerBarView: View {
                         ),
                         in: 0...1,
                         activeColor: YMTheme.fg,
-                        trackColor: YMTheme.surfaceComponentHover,
+                        trackColor: YMTheme.borderHover,
                         height: 3
                     )
                     .frame(width: 68)
+                    .frame(minHeight: 20)
+                    .contentShape(Rectangle())
                 }
             }
         }
     }
 
     private var volumeIcon: String {
-        if isMuted || audioEngine.volume == 0 {
+        if audioEngine.volume <= 0.001 || isMuted {
             return "speaker.slash.fill"
         } else if audioEngine.volume < 0.33 {
             return "speaker.wave.1.fill"
@@ -418,10 +427,12 @@ public struct PlayerBarView: View {
 
     private func toggleMute() {
         if isMuted {
-            audioEngine.volume = previousVolume > 0 ? previousVolume : 0.5
+            audioEngine.volume = previousVolume > 0.001 ? previousVolume : 0.5
             isMuted = false
         } else {
-            previousVolume = audioEngine.volume
+            if audioEngine.volume > 0.001 {
+                previousVolume = audioEngine.volume
+            }
             audioEngine.volume = 0
             isMuted = true
         }
@@ -431,8 +442,8 @@ public struct PlayerBarView: View {
 // MARK: - Audio Quality Dropdown Menu (Fixed Width, No Icon)
 
 private struct AudioQualityMenu: View {
-    @Bindable var audioEngine: AudioPlayerEngine
-    @Bindable var qualitySettings = AudioQualitySettings.shared
+    let audioEngine: AudioPlayerEngine
+    private let qualitySettings = AudioQualitySettings.shared
 
     var body: some View {
         Menu {
@@ -594,6 +605,8 @@ private struct IsolatedProgressSlider: View {
                     }
                 }
             )
+            .frame(minHeight: 20)
+            .contentShape(Rectangle())
 
             FormattedTimeLabel(
                 totalSeconds: Int(progressTracker.duration),
@@ -665,5 +678,30 @@ private struct PlayerBarArtistButton: View {
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .help("Перейти к исполнителю: \(artist.name)")
+    }
+}
+
+// MARK: - Isolated Player Bar Like Button
+
+private struct PlayerBarLikeButton: View {
+    let track: YMTrack
+
+    @UIState private var likesService = LikesService.shared
+    @UIState private var windowState = WindowState.shared
+
+    var body: some View {
+        let isLiked = likesService.isLiked(trackId: track.id)
+        PlayerHoverIconButton(
+            systemName: isLiked ? "heart.fill" : "heart",
+            fontSize: windowState.isMiniWidth ? 12 : 13,
+            foregroundColor: isLiked ? YMTheme.heartRed : YMTheme.fg60,
+            isActive: false,
+            buttonSize: windowState.isMiniWidth ? 24 : 28,
+            helpText: isLiked ? "Удалить из Мне нравится" : "Мне нравится"
+        ) {
+            Task {
+                await likesService.toggleLike(track: track)
+            }
+        }
     }
 }

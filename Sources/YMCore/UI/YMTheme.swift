@@ -3,7 +3,8 @@ import AppKit
 
 /// Structured color palette for each application theme, ensuring balanced contrast,
 /// cohesive surfaces, and soft hierarchy across dark and light variants.
-public struct YMThemePalette: Sendable {
+public struct YMThemePalette: Sendable, Equatable {
+    public let id: String
     public let isLight: Bool
     public let bg: Color
     public let sidebarBg: Color
@@ -22,8 +23,53 @@ public struct YMThemePalette: Sendable {
     public let shadowColor: Color
     public let playerBarShadow: Color
 
+    public init(
+        id: String = "",
+        isLight: Bool,
+        bg: Color,
+        sidebarBg: Color,
+        playerBg: Color,
+        surface: Color,
+        surfaceHigh: Color,
+        surfaceComponent: Color,
+        surfaceComponentHover: Color,
+        border: Color,
+        borderHover: Color,
+        fg: Color,
+        fg80: Color,
+        fg60: Color,
+        fg40: Color,
+        accent: Color,
+        shadowColor: Color,
+        playerBarShadow: Color
+    ) {
+        self.id = id
+        self.isLight = isLight
+        self.bg = bg
+        self.sidebarBg = sidebarBg
+        self.playerBg = playerBg
+        self.surface = surface
+        self.surfaceHigh = surfaceHigh
+        self.surfaceComponent = surfaceComponent
+        self.surfaceComponentHover = surfaceComponentHover
+        self.border = border
+        self.borderHover = borderHover
+        self.fg = fg
+        self.fg80 = fg80
+        self.fg60 = fg60
+        self.fg40 = fg40
+        self.accent = accent
+        self.shadowColor = shadowColor
+        self.playerBarShadow = playerBarShadow
+    }
+
+    public static func == (lhs: YMThemePalette, rhs: YMThemePalette) -> Bool {
+        lhs.id == rhs.id
+    }
+
     /// Soft graphite dark theme (#141519) with warm gold accent (#F2C12E)
     public static let graphite = YMThemePalette(
+        id: "graphite",
         isLight: false,
         bg: Color(red: 20 / 255, green: 21 / 255, blue: 25 / 255),             // #141519
         sidebarBg: Color(red: 24 / 255, green: 25 / 255, blue: 30 / 255),      // #18191E
@@ -45,6 +91,7 @@ public struct YMThemePalette: Sendable {
 
     /// Deep muted slate-blue night theme (#111622) with warm gold accent (#F5C43D)
     public static let midnight = YMThemePalette(
+        id: "midnight",
         isLight: false,
         bg: Color(red: 17 / 255, green: 22 / 255, blue: 34 / 255),             // #111622
         sidebarBg: Color(red: 21 / 255, green: 27 / 255, blue: 41 / 255),      // #151B29
@@ -66,6 +113,7 @@ public struct YMThemePalette: Sendable {
 
     /// Airy warm alabaster light theme (#F4F3EF) with amber accent (#C47600)
     public static let light = YMThemePalette(
+        id: "light",
         isLight: true,
         bg: Color(red: 244 / 255, green: 243 / 255, blue: 239 / 255),          // #F4F3EF
         sidebarBg: Color(red: 234 / 255, green: 232 / 255, blue: 226 / 255),   // #EAE8E2
@@ -87,6 +135,7 @@ public struct YMThemePalette: Sendable {
 
     /// Soft cream-sand light theme (#EDE7DC) with warm terracotta-amber accent (#B86214)
     public static let latte = YMThemePalette(
+        id: "latte",
         isLight: true,
         bg: Color(red: 237 / 255, green: 231 / 255, blue: 220 / 255),          // #EDE7DC
         sidebarBg: Color(red: 227 / 255, green: 219 / 255, blue: 205 / 255),   // #E3DBCD
@@ -111,10 +160,19 @@ public struct YMThemePalette: Sendable {
 @MainActor
 public enum YMTheme {
     private static var isSystemAppearanceLight: Bool {
-        if let appearance = NSApp?.effectiveAppearance {
-            return appearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
+        // Если приложению НЕ навязан явный appearance, effectiveAppearance — самый точный источник.
+        if let app = NSApp, app.appearance == nil {
+            return app.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
         }
-        return false
+        // Если у приложения сейчас форсирована .dark/.light тема, читаем глобальную настройку macOS:
+        // при тёмной теме macOS ключ "AppleInterfaceStyle" равен "Dark", при светлой — отсутствует.
+        let style = UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?["AppleInterfaceStyle"] as? String
+        return style?.lowercased() != "dark"
+    }
+
+    /// Stable theme revision key indicating both theme rawValue and resolved light/dark variant.
+    public static var themeRevisionKey: String {
+        "\(YMThemeManager.shared.currentTheme.rawValue)_\(YMThemeManager.shared.resolvedPalette.isLight ? "L" : "D")"
     }
 
     /// Resolves the concrete color palette for any given `YMAppTheme`.
@@ -135,7 +193,7 @@ public enum YMTheme {
 
     /// Active palette for the currently selected theme.
     public static var palette: YMThemePalette {
-        palette(for: YMThemeManager.shared.currentTheme)
+        YMThemeManager.shared.resolvedPalette
     }
 
     /// Whether the active theme is a light palette (`.light`, `.latte`, or light `.system`).
@@ -196,6 +254,7 @@ public struct YMAmbientCoverGlowModifier: ViewModifier {
     let opacity: Double
 
     @UIState private var glowImage: NSImage? = nil
+    @UIState private var loadedUri: String? = nil
 
     public init(coverUri: String?, opacity: Double = 0.22) {
         self.coverUri = coverUri
@@ -224,17 +283,19 @@ public struct YMAmbientCoverGlowModifier: ViewModifier {
                         )
                         .clipped()
                         .allowsHitTesting(false)
-                        .animation(.easeInOut(duration: 0.35), value: coverUri)
+                        .animation(.easeInOut(duration: 0.35), value: loadedUri)
                 }
             }
             .task(id: coverUri ?? "") {
                 guard let uri = coverUri, !uri.isEmpty else {
                     glowImage = nil
+                    loadedUri = nil
                     return
                 }
                 let blurred = await YMBackdropBlurProcessor.shared.blurredImage(for: uri, radius: 16.0)
                 guard !Task.isCancelled else { return }
                 glowImage = blurred
+                loadedUri = uri
             }
     }
 }
@@ -302,7 +363,11 @@ public struct YMCardHoverModifier: ViewModifier {
             )
             .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isHovered)
             .onHover { inside in
-                isHovered = inside
+                if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+                if isHovered != inside { isHovered = inside }
+            }
+            .onDisappear {
+                if isHovered { isHovered = false }
             }
     }
 }
@@ -347,6 +412,12 @@ public struct YMGlassPillButtonStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.96 : hover ? 1.02 : 1.0)
             .animation(.spring(response: 0.25, dampingFraction: 0.7), value: hover)
             .animation(.spring(response: 0.2, dampingFraction: 0.6), value: configuration.isPressed)
-            .onHover { hover = $0 }
+            .onHover { inside in
+                if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+                if hover != inside { hover = inside }
+            }
+            .onDisappear {
+                if hover { hover = false }
+            }
     }
 }

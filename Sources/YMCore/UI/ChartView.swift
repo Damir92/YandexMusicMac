@@ -4,6 +4,8 @@ import AppKit
 /// Chart (Чарт) view showing the Top 100 most popular tracks in Yandex Music with positions, shifts, and rich actions.
 public struct ChartView: View {
     @UIState private var chartItems: [YMChartItem] = []
+    @UIState private var cachedChartEntries: [(item: YMChartItem, track: YMTrack)] = []
+    @UIState private var cachedChartTracks: [YMTrack] = []
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
     @UIState private var selectedTrackId: String? = nil
@@ -19,7 +21,10 @@ public struct ChartView: View {
     public init() {}
 
     private var chartTracks: [YMTrack] {
-        chartItems.compactMap(\.track)
+        if !cachedChartTracks.isEmpty {
+            return cachedChartTracks
+        }
+        return chartItems.compactMap(\.track)
     }
 
     public var body: some View {
@@ -111,49 +116,56 @@ public struct ChartView: View {
                             .padding(.bottom, 6)
 
                         LazyVStack(spacing: 2) {
-                            ForEach(Array(chartItems.enumerated()), id: \.element.id) { index, item in
-                                if let track = item.track {
-                                    let isCurrent = currentTrackId == track.id
-                                    ChartTrackRow(
-                                        item: item,
-                                        track: track,
-                                        index: index,
-                                        isCurrentTrack: isCurrent,
-                                        isPlaying: isCurrent && isEnginePlaying,
-                                        isSelected: selectedTrackId == track.id,
-                                        isCompactWidth: isCompactWidth,
-                                        isMiniWidth: isMiniWidth,
-                                        onPlay: {
-                                            selectedTrackId = track.id
-                                            audioEngine.assignQueue(chartTracks, startingAt: index)
-                                        },
-                                        onTapRow: {
-                                            handleRowTap(track: track, index: index)
-                                        },
-                                        onArtistSelect: { artist in
-                                            coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
-                                        },
-                                        onAlbumSelect: { album in
-                                            coordinator.navigate(to: .album(id: album.id, title: album.title))
-                                        },
-                                        onShowLyrics: {
-                                            coordinator.showLyrics(for: track)
-                                        }
-                                    )
-                                }
+                            ForEach(cachedChartEntries.indices, id: \.self) { index in
+                                let entry = cachedChartEntries[index]
+                                let isCurrent = currentTrackId == entry.track.id
+                                let rowHoverId = "chart_\(index)_\(entry.track.id)"
+                                ChartTrackRow(
+                                    item: entry.item,
+                                    track: entry.track,
+                                    index: index,
+                                    rowHoverId: rowHoverId,
+                                    isCurrentTrack: isCurrent,
+                                    isPlaying: isCurrent && isEnginePlaying,
+                                    isSelected: selectedTrackId == entry.track.id,
+                                    isCompactWidth: isCompactWidth,
+                                    isMiniWidth: isMiniWidth,
+                                    themeKey: YMTheme.themeRevisionKey,
+                                    onPlay: {
+                                        selectedTrackId = entry.track.id
+                                        audioEngine.isWaveMode = false
+                                        audioEngine.assignQueue(chartTracks, startingAt: index)
+                                    },
+                                    onTapRow: {
+                                        handleRowTap(track: entry.track, index: index)
+                                    },
+                                    onArtistSelect: { artist in
+                                        coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
+                                    },
+                                    onAlbumSelect: { album in
+                                        coordinator.navigate(to: .album(id: album.id, title: album.title))
+                                    },
+                                    onShowLyrics: {
+                                        coordinator.showLyrics(for: entry.track)
+                                    }
+                                )
+                                .equatable()
                             }
                         }
                         .padding(.horizontal, 14)
                         .padding(.bottom, 90)
                     }
                     .background(alignment: .top) {
-                        YMScrollTopSentinel(
-                            coordinateSpaceName: "chart_scroll",
-                            threshold: 64,
-                            isScrolled: $isScrolled
-                        )
+                        if #unavailable(macOS 15.0) {
+                            YMScrollTopSentinel(
+                                coordinateSpaceName: "chart_scroll",
+                                threshold: 64,
+                                isScrolled: $isScrolled
+                            )
+                        }
                     }
                 }
+                .ymTrackScrollOffset(threshold: 64, isScrolled: $isScrolled)
                 .coordinateSpace(name: "chart_scroll")
                 .overlay(alignment: .top) {
                     YMStickyTopBar(title: "Чарт", isVisible: isScrolled)
@@ -185,6 +197,7 @@ public struct ChartView: View {
     @ViewBuilder
     private func chartPlayButton(height: CGFloat) -> some View {
         Button {
+            audioEngine.isWaveMode = false
             audioEngine.assignQueue(chartTracks, startingAt: 0)
         } label: {
             HStack(spacing: 6) {
@@ -209,6 +222,7 @@ public struct ChartView: View {
         lastClickedTrackId = track.id
         lastClickTimestamp = now
         if isDouble {
+            audioEngine.isWaveMode = false
             audioEngine.assignQueue(chartTracks, startingAt: index)
         }
     }
@@ -219,8 +233,15 @@ public struct ChartView: View {
         Task {
             do {
                 let items = try await networkClient.fetchChart()
+                let validEntries = items.compactMap { item -> (item: YMChartItem, track: YMTrack)? in
+                    guard let track = item.track else { return nil }
+                    return (item: item, track: track)
+                }
+                let tracks = validEntries.map(\.track)
                 await MainActor.run {
                     self.chartItems = items
+                    self.cachedChartEntries = validEntries
+                    self.cachedChartTracks = tracks
                     self.isLoading = false
                 }
             } catch {
@@ -256,27 +277,89 @@ extension ChartPlayingCoverOverlay: @preconcurrency Equatable {
     }
 }
 
+private struct ChartRowBackgroundOverlay: View {
+    let rowHoverId: String
+    let isSelected: Bool
+    let isCurrentTrack: Bool
+
+    var body: some View {
+        let isHovered = TrackHoverManager.shared.state(for: rowHoverId).isHovered
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(
+                    isSelected
+                        ? YMTheme.surfaceComponentHover
+                        : (isCurrentTrack
+                            ? YMTheme.accent.opacity(YMTheme.isLight ? 0.12 : 0.09)
+                            : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+                )
+
+            if isCurrentTrack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(YMTheme.accent.opacity(0.24), lineWidth: 1)
+            }
+        }
+    }
+}
+
+private struct ChartRowCoverView: View {
+    let track: YMTrack
+    let rowHoverId: String
+    let isCurrentTrack: Bool
+    let isPlaying: Bool
+    let onPlayAction: () -> Void
+
+    var body: some View {
+        let isHovered = TrackHoverManager.shared.state(for: rowHoverId).isHovered
+        Button {
+            onPlayAction()
+        } label: {
+            ZStack {
+                CachedCoverImage(
+                    coverUri: track.effectiveCoverUri,
+                    size: .small,
+                    displaySize: 40,
+                    cornerRadius: 6
+                )
+
+                if isHovered {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.black.opacity(0.55))
+                        .frame(width: 40, height: 40)
+
+                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                        .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
+                        .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
+                } else if isCurrentTrack {
+                    ChartPlayingCoverOverlay(isPlaying: isPlaying)
+                }
+            }
+            .frame(width: 40, height: 40)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isPlaying ? "Пауза" : "Воспроизвести трек")
+    }
+}
+
 private struct ChartTrackRow: View {
     let item: YMChartItem
     let track: YMTrack
     let index: Int
+    let rowHoverId: String
     let isCurrentTrack: Bool
     let isPlaying: Bool
     let isSelected: Bool
     let isCompactWidth: Bool
     let isMiniWidth: Bool
+    let themeKey: String
     let onPlay: () -> Void
     let onTapRow: () -> Void
     let onArtistSelect: (YMArtist) -> Void
     let onAlbumSelect: (YMAlbum) -> Void
     let onShowLyrics: () -> Void
 
-    @UIState private var likesService = LikesService.shared
     private let hoverManager = TrackHoverManager.shared
-
-    private var isHovered: Bool {
-        hoverManager.state(for: track.id).isHovered
-    }
 
     private var position: Int {
         item.chart?.position ?? (index + 1)
@@ -305,16 +388,21 @@ private struct ChartTrackRow: View {
         .padding(.vertical, 6)
         .padding(.horizontal, isMiniWidth ? 6 : 10)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(
-                    isSelected
-                        ? YMTheme.surfaceComponentHover
-                        : (isCurrentTrack ? YMTheme.accent.opacity(0.12) : (isHovered ? YMTheme.surfaceComponent : Color.clear))
+            ZStack(alignment: .leading) {
+                ChartRowBackgroundOverlay(
+                    rowHoverId: rowHoverId,
+                    isSelected: isSelected,
+                    isCurrentTrack: isCurrentTrack
                 )
+                TrackHoverAnchor(trackId: rowHoverId)
+            }
         )
         .contentShape(Rectangle())
-        .onHover { isInside in
-            hoverManager.handleRowHover(trackId: track.id, isInside: isInside)
+        .onAppear {
+            hoverManager.rowDidAppear(trackId: rowHoverId)
+        }
+        .onDisappear {
+            hoverManager.rowDidDisappear(trackId: rowHoverId)
         }
         .onTapGesture {
             onTapRow()
@@ -351,34 +439,13 @@ private struct ChartTrackRow: View {
 
     @ViewBuilder
     private var coverAndPlayView: some View {
-        Button {
-            triggerPlaybackAction()
-        } label: {
-            ZStack {
-                CachedCoverImage(
-                    coverUri: track.effectiveCoverUri,
-                    size: .small,
-                    displaySize: 40,
-                    cornerRadius: 6
-                )
-
-                if isHovered {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.black.opacity(0.55))
-                        .frame(width: 40, height: 40)
-
-                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                        .foregroundColor(isCurrentTrack ? YMTheme.accent : Color.white)
-                        .font(.system(size: isCurrentTrack ? 14 : 13, weight: isCurrentTrack ? .bold : .regular))
-                } else if isCurrentTrack {
-                    ChartPlayingCoverOverlay(isPlaying: isPlaying)
-                }
-            }
-            .frame(width: 40, height: 40)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(isPlaying ? "Пауза" : "Воспроизвести трек")
+        ChartRowCoverView(
+            track: track,
+            rowHoverId: rowHoverId,
+            isCurrentTrack: isCurrentTrack,
+            isPlaying: isPlaying,
+            onPlayAction: triggerPlaybackAction
+        )
     }
 
     @ViewBuilder
@@ -389,24 +456,32 @@ private struct ChartTrackRow: View {
                 .foregroundStyle(isCurrentTrack ? YMTheme.accent : YMTheme.fg)
                 .lineLimit(1)
 
-            HStack(spacing: 4) {
-                ForEach(track.artists) { artist in
-                    Button {
-                        onArtistSelect(artist)
-                    } label: {
-                        Text(artist.name)
-                            .font(.system(size: 12))
-                            .foregroundStyle(YMTheme.fg60)
-                            .lineLimit(1)
-                    }
-                    .buttonStyle(.plain)
+            if !track.artists.isEmpty {
+                let artistsToDisplay = Array(track.artists.prefix(4))
+                HStack(spacing: 4) {
+                    ForEach(artistsToDisplay) { artist in
+                        YMHoverLinkText(
+                            text: artist.name,
+                            font: .system(size: 12),
+                            baseColor: YMTheme.fg60,
+                            hoverColor: YMTheme.fg
+                        ) {
+                            onArtistSelect(artist)
+                        }
 
-                    if artist.id != track.artists.last?.id {
-                        Text("•")
-                            .font(.system(size: 8))
-                            .foregroundStyle(YMTheme.fg40)
+                        if artist.id != artistsToDisplay.last?.id {
+                            Text("•")
+                                .font(.system(size: 8))
+                                .foregroundStyle(YMTheme.fg40)
+                        }
                     }
                 }
+                .clipped()
+            } else {
+                Text(track.artistsString)
+                    .font(.system(size: 12))
+                    .foregroundStyle(YMTheme.fg60)
+                    .lineLimit(1)
             }
         }
         .frame(minWidth: isMiniWidth ? 100 : 180, alignment: .leading)
@@ -415,15 +490,14 @@ private struct ChartTrackRow: View {
     @ViewBuilder
     private var albumView: some View {
         if let album = track.albums.first {
-            Button {
+            YMHoverLinkText(
+                text: album.title,
+                font: .system(size: 12),
+                baseColor: YMTheme.fg60,
+                hoverColor: YMTheme.fg
+            ) {
                 onAlbumSelect(album)
-            } label: {
-                Text(album.title)
-                    .font(.system(size: 12))
-                    .foregroundStyle(YMTheme.fg60)
-                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
             .frame(width: 180, alignment: .leading)
         } else {
             Color.clear
@@ -433,18 +507,7 @@ private struct ChartTrackRow: View {
 
     @ViewBuilder
     private var likeButtonView: some View {
-        Button {
-            Task {
-                await likesService.toggleLike(track: track)
-            }
-        } label: {
-            Image(systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart")
-                .foregroundColor(likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg40)
-                .font(.system(size: 13))
-        }
-        .buttonStyle(.plain)
-        .frame(width: isMiniWidth ? 28 : 32, alignment: .center)
-        .help(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Нравится")
+        YMLikeHeartButton(track: track, buttonWidth: isMiniWidth ? 28 : 32)
     }
 
     @ViewBuilder
@@ -485,11 +548,7 @@ private struct ChartTrackRow: View {
         }
         Divider()
         AddToPlaylistContextMenu(track: track)
-        Button(likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Добавить в Мне нравится") {
-            Task {
-                await likesService.toggleLike(track: track)
-            }
-        }
+        LikeContextMenuItem(track: track)
     }
 
     @ViewBuilder
@@ -522,10 +581,12 @@ extension ChartTrackRow: @preconcurrency Equatable {
     static func == (lhs: ChartTrackRow, rhs: ChartTrackRow) -> Bool {
         lhs.track.id == rhs.track.id &&
         lhs.index == rhs.index &&
+        lhs.rowHoverId == rhs.rowHoverId &&
         lhs.isCurrentTrack == rhs.isCurrentTrack &&
         lhs.isPlaying == rhs.isPlaying &&
         lhs.isSelected == rhs.isSelected &&
         lhs.isCompactWidth == rhs.isCompactWidth &&
-        lhs.isMiniWidth == rhs.isMiniWidth
+        lhs.isMiniWidth == rhs.isMiniWidth &&
+        lhs.themeKey == rhs.themeKey
     }
 }

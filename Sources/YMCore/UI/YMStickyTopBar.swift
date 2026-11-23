@@ -7,23 +7,60 @@ import AppKit
 /// and standard macOS titlebar zoom on double click.
 /// Placed in `.background(...)` behind interactive controls so buttons remain 100% clickable.
 public struct YMWindowDragHandle: NSViewRepresentable {
-    public init() {}
-
-    public func makeNSView(context: Context) -> YMWindowDragNSView {
-        YMWindowDragNSView()
+    public var allowsDoubleClickZoom: Bool
+    public init(allowsDoubleClickZoom: Bool = true) {
+        self.allowsDoubleClickZoom = allowsDoubleClickZoom
     }
-
-    public func updateNSView(_ nsView: YMWindowDragNSView, context: Context) {}
+    public func makeNSView(context: Context) -> YMWindowDragNSView {
+        let view = YMWindowDragNSView()
+        view.allowsDoubleClickZoom = allowsDoubleClickZoom
+        return view
+    }
+    public func updateNSView(_ nsView: YMWindowDragNSView, context: Context) {
+        nsView.allowsDoubleClickZoom = allowsDoubleClickZoom
+    }
 }
 
 public final class YMWindowDragNSView: NSView {
+    public var allowsDoubleClickZoom: Bool = true
     public override var mouseDownCanMoveWindow: Bool { false }
-
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     public override func mouseDown(with event: NSEvent) {
+        guard let window, !window.styleMask.contains(.fullScreen) else { return }
         if event.clickCount == 2 {
-            window?.performZoom(nil)
+            guard allowsDoubleClickZoom else { return }
+            switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+            case "None":
+                return
+            case "Minimize":
+                window.performMiniaturize(nil)
+            default:
+                window.performZoom(nil)
+            }
         } else {
-            window?.performDrag(with: event)
+            window.performDrag(with: event)
+        }
+    }
+}
+
+public extension View {
+    @ViewBuilder
+    func ymTrackScrollOffset(threshold: CGFloat, isScrolled: Binding<Bool>) -> some View {
+        if #available(macOS 15.0, *) {
+            self.onScrollGeometryChange(for: Bool.self) { geo in
+                let y = geo.contentOffset.y + geo.contentInsets.top
+                let hysteresis: CGFloat = 6
+                return isScrolled.wrappedValue
+                    ? (y > threshold - hysteresis)
+                    : (y > threshold + hysteresis)
+            } action: { _, newValue in
+                if isScrolled.wrappedValue != newValue {
+                    isScrolled.wrappedValue = newValue
+                }
+            }
+            .ymTrackHoverScroll()
+        } else {
+            self
         }
     }
 }
@@ -92,61 +129,67 @@ public struct YMStickyTopBar: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .top) {
-            // Stable drag handle that stays in place without being destroyed/recreated on scroll
-            YMWindowDragHandle()
-                .frame(maxWidth: .infinity)
-                .frame(height: isVisible ? 42 : (windowState.needsTopChromeClearance ? 44 : 24))
+        let height: CGFloat = isVisible ? 42 : (windowState.needsTopChromeClearance ? 44 : 24)
 
-            // Compact frosted glass sticky bar when scrolled past hero
-            HStack(spacing: 8) {
-                Text(title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(YMTheme.fg)
-                    .lineLimit(1)
-
-                if showLiveDot {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(YMTheme.accent)
-                            .frame(width: 6, height: 6)
-                        Text("в эфире")
-                            .font(.system(size: 10.5, weight: .bold))
-                            .foregroundStyle(YMTheme.accent)
-                    }
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(YMTheme.accent.opacity(0.14)))
-                }
-
-                Spacer(minLength: 8)
-            }
-            .allowsHitTesting(false)
-            .padding(.leading, windowState.topToolbarLeadingInset)
-            .padding(.trailing, 24)
-            .frame(height: 42)
-            .frame(maxWidth: .infinity)
-            .background {
+        ZStack(alignment: .topLeading) {
+            // 1. Frosted glass background layer strictly non-hit-testing
+            if isVisible {
                 ZStack(alignment: .bottom) {
                     VisualEffectBlur(
                         material: .headerView,
                         blendingMode: .withinWindow,
-                        state: isVisible ? .followsWindowActiveState : .inactive
+                        state: .followsWindowActiveState
                     )
-                        .opacity(isVisible ? 1 : 0)
-                    YMTheme.bg.opacity(isVisible ? (YMTheme.isLight ? 0.78 : 0.74) : 0)
+                    YMTheme.bg.opacity(YMTheme.isLight ? 0.78 : 0.74)
                     YMTheme.border.frame(height: 1)
-                        .opacity(isVisible ? 1 : 0)
                 }
+                .frame(height: 42)
+                .frame(maxWidth: .infinity)
                 .ignoresSafeArea(.container, edges: .top)
+                .shadow(color: YMTheme.shadowColor.opacity(0.45), radius: 8, y: 2)
+                .transition(.opacity)
+                .allowsHitTesting(false)
             }
-            .shadow(color: YMTheme.shadowColor.opacity(isVisible ? 0.45 : 0), radius: 8, y: 2)
-            .opacity(isVisible ? 1 : 0)
-            .offset(y: isVisible ? 0 : -6)
-            .allowsHitTesting(isVisible)
-            .animation(.easeOut(duration: 0.22), value: isVisible)
+
+            // 2. Window Drag Handle on top of background
+            YMWindowDragHandle()
+                .frame(maxWidth: .infinity)
+                .frame(height: height)
+
+            // 3. Compact sticky bar title & badge on top of drag handle, strictly non-hit-testing
+            if isVisible {
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(YMTheme.fg)
+                        .lineLimit(1)
+
+                    if showLiveDot {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(YMTheme.accent)
+                                .frame(width: 6, height: 6)
+                            Text("в эфире")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundStyle(YMTheme.accent)
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(YMTheme.accent.opacity(0.14)))
+                    }
+
+                    Spacer(minLength: 8)
+                }
+                .padding(.leading, windowState.topToolbarLeadingInset)
+                .padding(.trailing, 24)
+                .frame(height: 42)
+                .frame(maxWidth: .infinity)
+                .transition(.opacity.combined(with: .offset(y: -6)))
+                .allowsHitTesting(false)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .top)
+        .animation(.easeOut(duration: 0.22), value: isVisible)
     }
 }
 
@@ -210,17 +253,21 @@ public struct YMStickyDetailTopBar: View {
         .frame(maxWidth: .infinity)
         .background {
             ZStack(alignment: .bottom) {
-                VisualEffectBlur(
-                    material: .headerView,
-                    blendingMode: .withinWindow,
-                    state: isScrolled ? .followsWindowActiveState : .inactive
-                )
-                    .opacity(isScrolled ? 1 : 0)
-                YMTheme.bg.opacity(isScrolled ? (YMTheme.isLight ? 0.78 : 0.74) : 0)
+                if isScrolled {
+                    ZStack(alignment: .bottom) {
+                        VisualEffectBlur(
+                            material: .headerView,
+                            blendingMode: .withinWindow,
+                            state: .followsWindowActiveState
+                        )
+                        YMTheme.bg.opacity(YMTheme.isLight ? 0.78 : 0.74)
+                        YMTheme.border.frame(height: 1)
+                    }
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+                }
+
                 YMWindowDragHandle()
-                YMTheme.border
-                    .frame(height: 1)
-                    .opacity(isScrolled ? 1 : 0)
             }
             .ignoresSafeArea(.container, edges: .top)
             .animation(.easeOut(duration: 0.20), value: isScrolled)

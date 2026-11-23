@@ -6,6 +6,7 @@ public struct AlbumDetailView: View {
     public let albumTitle: String
 
     @UIState private var album: YMAlbumWithTracks? = nil
+    @UIState private var cachedAllTracks: [YMTrack] = []
     @UIState private var isLoading = true
     @UIState private var errorMessage: String? = nil
     @UIState private var loadTask: Task<Void, Never>? = nil
@@ -95,7 +96,7 @@ public struct AlbumDetailView: View {
                                 // Action Bar
                                 Button {
                                     audioEngine.isWaveMode = false
-                                    audioEngine.assignQueue(album.allTracks, startingAt: 0)
+                                    audioEngine.assignQueue(cachedAllTracks, startingAt: 0)
                                 } label: {
                                     Label(windowState.isMiniWidth ? "Слушать" : "Слушать альбом", systemImage: "play.fill")
                                 }
@@ -117,11 +118,11 @@ public struct AlbumDetailView: View {
 
                         // Tracklist Table
                         TrackTableView(
-                            tracks: album.allTracks,
+                            tracks: cachedAllTracks,
                             onPlayTrack: { selectedTrack in
                                 audioEngine.isWaveMode = false
-                                if let index = album.allTracks.firstIndex(where: { $0.id == selectedTrack.id }) {
-                                    audioEngine.assignQueue(album.allTracks, startingAt: index)
+                                if let index = cachedAllTracks.firstIndex(where: { $0.id == selectedTrack.id }) {
+                                    audioEngine.assignQueue(cachedAllTracks, startingAt: index)
                                 } else {
                                     audioEngine.assignQueue([selectedTrack], startingAt: 0)
                                 }
@@ -132,13 +133,16 @@ public struct AlbumDetailView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 90)
                     .background(alignment: .top) {
-                        YMScrollTopSentinel(
-                            coordinateSpaceName: "album_detail_scroll",
-                            threshold: 84,
-                            isScrolled: $isScrolled
-                        )
+                        if #unavailable(macOS 15.0) {
+                            YMScrollTopSentinel(
+                                coordinateSpaceName: "album_detail_scroll",
+                                threshold: 84,
+                                isScrolled: $isScrolled
+                            )
+                        }
                     }
                 }
+                .ymTrackScrollOffset(threshold: 84, isScrolled: $isScrolled)
                 .coordinateSpace(name: "album_detail_scroll")
             }
         }
@@ -156,6 +160,10 @@ public struct AlbumDetailView: View {
             isScrolled = false
             loadAlbumData()
         }
+        .onDisappear {
+            loadTask?.cancel()
+            loadTask = nil
+        }
     }
 
     private func loadAlbumData() {
@@ -170,6 +178,7 @@ public struct AlbumDetailView: View {
                 await MainActor.run {
                     guard self.albumId == targetAlbumId else { return }
                     self.album = fetched
+                    self.cachedAllTracks = fetched.allTracks
                     self.isLoading = false
                 }
             } catch {

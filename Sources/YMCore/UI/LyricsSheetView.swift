@@ -11,7 +11,6 @@ import CoreImage
 public struct LyricsSheetView: View {
     @UIState private var coordinator = NavigationCoordinator.shared
     @UIState private var audioEngine = AudioPlayerEngine.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var themeManager = YMThemeManager.shared
     @UIState private var windowState = WindowState.shared
 
@@ -24,13 +23,19 @@ public struct LyricsSheetView: View {
     @UIState private var blurredBackdropUri: String? = nil
 
     private let networkClient = YMNetworkClient.shared
+    private let explicitTrack: YMTrack?
 
     public init(track: YMTrack? = nil) {
-        // Parameter retained for backward compatibility; coordinator & audioEngine determine the current track
+        self.explicitTrack = track
     }
 
     private var currentTrack: YMTrack? {
-        coordinator.lyricsTrack ?? audioEngine.currentTrack
+        explicitTrack ?? coordinator.lyricsTrack ?? audioEngine.currentTrack
+    }
+
+    private var isShowingPlayingTrack: Bool {
+        guard let shown = currentTrack, let playing = audioEngine.currentTrack else { return false }
+        return shown.id == playing.id
     }
 
     private var headerContextTitle: String {
@@ -222,8 +227,9 @@ public struct LyricsSheetView: View {
                             .frame(maxWidth: 280)
 
                         if !track.artists.isEmpty {
+                            let prefixArtists = Array(track.artists.prefix(4))
                             HStack(spacing: 4) {
-                                ForEach(track.artists) { artist in
+                                ForEach(prefixArtists) { artist in
                                     Button {
                                         navigateAndDismiss(to: .artist(id: artist.id, name: artist.name))
                                     } label: {
@@ -234,7 +240,7 @@ public struct LyricsSheetView: View {
                                     }
                                     .buttonStyle(.plain)
 
-                                    if artist.id != track.artists.last?.id {
+                                    if artist.id != prefixArtists.last?.id {
                                         Text("•")
                                             .font(.system(size: 10))
                                             .foregroundStyle(YMTheme.fg40)
@@ -242,6 +248,7 @@ public struct LyricsSheetView: View {
                                 }
                             }
                             .frame(maxWidth: 280)
+                            .clipped()
                         } else if !track.artistsString.isEmpty {
                             Text(track.artistsString)
                                 .font(.system(size: 14, weight: .medium))
@@ -263,34 +270,7 @@ public struct LyricsSheetView: View {
                             .frame(maxWidth: 260)
                         }
 
-                        let isLiked = likesService.isLiked(trackId: track.id)
-                        Button {
-                            Task {
-                                await likesService.toggleLike(track: track)
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: isLiked ? "heart.fill" : "heart")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundColor(isLiked ? YMTheme.heartRed : YMTheme.fg80)
-                                Text(isLiked ? "В коллекции" : "Нравится")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(YMTheme.fg80)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(YMTheme.surfaceComponent)
-                                    .overlay(
-                                        Capsule(style: .continuous)
-                                            .strokeBorder(YMTheme.border, lineWidth: 1)
-                                    )
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.top, 6)
-                        .help(isLiked ? "Удалить из Мне нравится" : "Добавить в Мне нравится")
+                        LyricsLikeButton(track: track, compact: false)
                     }
                 } else {
                     VStack(spacing: 12) {
@@ -338,8 +318,9 @@ public struct LyricsSheetView: View {
                             .lineLimit(1)
 
                         if !track.artists.isEmpty {
+                            let prefixArtists = Array(track.artists.prefix(4))
                             HStack(spacing: 4) {
-                                ForEach(track.artists) { artist in
+                                ForEach(prefixArtists) { artist in
                                     Button {
                                         navigateAndDismiss(to: .artist(id: artist.id, name: artist.name))
                                     } label: {
@@ -351,13 +332,14 @@ public struct LyricsSheetView: View {
                                     .buttonStyle(.plain)
                                     .help("Перейти к исполнителю: \(artist.name)")
 
-                                    if artist.id != track.artists.last?.id {
+                                    if artist.id != prefixArtists.last?.id {
                                         Text("•")
                                             .font(.system(size: 8))
                                             .foregroundStyle(YMTheme.fg40)
                                     }
                                 }
                             }
+                            .clipped()
                         } else if !track.artistsString.isEmpty {
                             Text(track.artistsString)
                                 .font(.system(size: 12, weight: .medium))
@@ -369,20 +351,7 @@ public struct LyricsSheetView: View {
 
                     Spacer()
 
-                    let isLiked = likesService.isLiked(trackId: track.id)
-                    Button {
-                        Task {
-                            await likesService.toggleLike(track: track)
-                        }
-                    } label: {
-                        Image(systemName: isLiked ? "heart.fill" : "heart")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(isLiked ? YMTheme.heartRed : YMTheme.fg60)
-                            .frame(width: 32, height: 32)
-                            .background(Circle().fill(YMTheme.surfaceComponent))
-                    }
-                    .buttonStyle(.plain)
-                    .help(isLiked ? "Удалить из Мне нравится" : "Добавить в Мне нравится")
+                    LyricsLikeButton(track: track, compact: true)
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 14)
@@ -405,7 +374,9 @@ public struct LyricsSheetView: View {
             } else if let synced = syncedLyrics, !synced.isEmpty {
                 SyncedKaraokeListView(
                     synced: synced,
-                    themeId: themeManager.currentTheme.rawValue
+                    themeId: themeManager.currentTheme.rawValue,
+                    themeKey: YMTheme.themeRevisionKey,
+                    isPlayingThisTrack: isShowingPlayingTrack
                 )
                 .id(currentTrack?.id ?? "")
                 .mask(lyricsEdgeFadeMask)
@@ -577,16 +548,23 @@ public struct LyricsSheetView: View {
 private struct SyncedKaraokeListView: View {
     let synced: YMSyncedLyrics
     let themeId: String
+    let themeKey: String
+    let isPlayingThisTrack: Bool
 
     @UIState private var activeLineIndex: Int?
     @UIState private var isUserScrollingLyrics = false
     @UIState private var isInitialScrollPositioned = false
     @UIState private var resumeAutoScrollTask: Task<Void, Never>? = nil
+    @UIState private var initialScrollTask: Task<Void, Never>? = nil
 
-    init(synced: YMSyncedLyrics, themeId: String) {
+    init(synced: YMSyncedLyrics, themeId: String, themeKey: String, isPlayingThisTrack: Bool) {
         self.synced = synced
         self.themeId = themeId
-        let initialIndex = synced.activeLineIndex(for: AudioPlayerEngine.shared.progressTracker.currentTime)
+        self.themeKey = themeKey
+        self.isPlayingThisTrack = isPlayingThisTrack
+        let initialIndex = isPlayingThisTrack
+            ? synced.activeLineIndex(for: AudioPlayerEngine.shared.progressTracker.currentTime)
+            : nil
         self._activeLineIndex = UIState(initialValue: initialIndex)
     }
 
@@ -598,15 +576,17 @@ private struct SyncedKaraokeListView: View {
                         .frame(height: 84)
 
                     ForEach(synced.lines) { line in
-                        let isActive = line.id == activeLineIndex
-                        let isPast = (activeLineIndex != nil) && (line.id < activeLineIndex!)
+                        let isActive = isPlayingThisTrack && (line.id == activeLineIndex)
+                        let isPast = isPlayingThisTrack && (activeLineIndex != nil) && (line.id < activeLineIndex!)
 
                         KaraokeLineRow(
                             line: line,
                             isActive: isActive,
                             isPast: isPast,
                             themeId: themeId,
+                            themeKey: themeKey,
                             onSelect: {
+                                guard isPlayingThisTrack else { return }
                                 resumeAutoScrollTask?.cancel()
                                 resumeAutoScrollTask = nil
                                 isUserScrollingLyrics = false
@@ -628,10 +608,12 @@ private struct SyncedKaraokeListView: View {
             }
             .opacity(isInitialScrollPositioned ? 1 : 0)
             .background {
-                LyricsTimeObserverView(
-                    syncedLyrics: synced,
-                    activeLineIndex: $activeLineIndex
-                )
+                if isPlayingThisTrack {
+                    LyricsTimeObserverView(
+                        syncedLyrics: synced,
+                        activeLineIndex: $activeLineIndex
+                    )
+                }
             }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 2)
@@ -639,6 +621,12 @@ private struct SyncedKaraokeListView: View {
                         pauseAutoScrollTemporarily()
                     }
             )
+            .onReceive(NotificationCenter.default.publisher(for: NSScrollView.willStartLiveScrollNotification)) { _ in
+                pauseAutoScrollTemporarily()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSScrollView.didLiveScrollNotification)) { _ in
+                pauseAutoScrollTemporarily()
+            }
             .onChange(of: activeLineIndex) { _, newActiveIndex in
                 guard let id = newActiveIndex, !isUserScrollingLyrics else { return }
                 if !isInitialScrollPositioned {
@@ -655,6 +643,10 @@ private struct SyncedKaraokeListView: View {
                 }
             }
             .onAppear {
+                guard isPlayingThisTrack else {
+                    isInitialScrollPositioned = true
+                    return
+                }
                 let targetId = activeLineIndex ?? synced.activeLineIndex(for: AudioPlayerEngine.shared.progressTracker.currentTime)
                 var noAnim = Transaction()
                 noAnim.disablesAnimations = true
@@ -667,9 +659,13 @@ private struct SyncedKaraokeListView: View {
                     withTransaction(noAnim) {
                         proxy.scrollTo(id, anchor: .center)
                     }
-                    // Confirm exact center offset after initial VStack geometry settles, without animation
-                    DispatchQueue.main.async {
-                        withTransaction(noAnim) {
+                    initialScrollTask?.cancel()
+                    initialScrollTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        guard !Task.isCancelled else { return }
+                        var noAnimInner = Transaction()
+                        noAnimInner.disablesAnimations = true
+                        withTransaction(noAnimInner) {
                             proxy.scrollTo(id, anchor: .center)
                         }
                         isInitialScrollPositioned = true
@@ -679,6 +675,8 @@ private struct SyncedKaraokeListView: View {
                 }
             }
             .onDisappear {
+                initialScrollTask?.cancel()
+                initialScrollTask = nil
                 resumeAutoScrollTask?.cancel()
                 resumeAutoScrollTask = nil
             }
@@ -686,6 +684,7 @@ private struct SyncedKaraokeListView: View {
     }
 
     private func pauseAutoScrollTemporarily() {
+        guard isPlayingThisTrack else { return }
         isUserScrollingLyrics = true
         resumeAutoScrollTask?.cancel()
         resumeAutoScrollTask = Task {
@@ -726,6 +725,7 @@ private struct KaraokeLineRow: View, Equatable {
     let isActive: Bool
     let isPast: Bool
     let themeId: String
+    let themeKey: String
     let onSelect: () -> Void
 
     @UIState private var isHovered = false
@@ -735,6 +735,7 @@ private struct KaraokeLineRow: View, Equatable {
             && lhs.isActive == rhs.isActive
             && lhs.isPast == rhs.isPast
             && lhs.themeId == rhs.themeId
+            && lhs.themeKey == rhs.themeKey
     }
 
     // Identical base font metrics guarantee words never re-wrap or clip past trailing bounds
@@ -779,6 +780,68 @@ private struct KaraokeLineRow: View, Equatable {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
+        .onHover { inside in
+            if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+            if isHovered != inside { isHovered = inside }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false }
+        }
+    }
+}
+
+// MARK: - Isolated Lyrics Like Button
+
+private struct LyricsLikeButton: View {
+    let track: YMTrack
+    let compact: Bool
+
+    @UIState private var likesService = LikesService.shared
+
+    var body: some View {
+        let isLiked = likesService.isLiked(trackId: track.id)
+        if compact {
+            Button {
+                Task {
+                    await likesService.toggleLike(track: track)
+                }
+            } label: {
+                Image(systemName: isLiked ? "heart.fill" : "heart")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(isLiked ? YMTheme.heartRed : YMTheme.fg60)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(YMTheme.surfaceComponent))
+            }
+            .buttonStyle(.plain)
+            .help(isLiked ? "Удалить из Мне нравится" : "Добавить в Мне нравится")
+        } else {
+            Button {
+                Task {
+                    await likesService.toggleLike(track: track)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isLiked ? "heart.fill" : "heart")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(isLiked ? YMTheme.heartRed : YMTheme.fg80)
+                    Text(isLiked ? "В коллекции" : "Нравится")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(YMTheme.fg80)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(YMTheme.surfaceComponent)
+                        .overlay(
+                            Capsule(style: .continuous)
+                                .strokeBorder(YMTheme.border, lineWidth: 1)
+                        )
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 6)
+            .help(isLiked ? "Удалить из Мне нравится" : "Добавить в Мне нравится")
+        }
     }
 }

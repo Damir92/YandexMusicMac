@@ -52,6 +52,13 @@ public final class AudioPlayerEngine {
 
     private static let volumeDefaultsKey = "ym_audio_player_volume"
 
+    private static var isRunningTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
+        ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil ||
+        ProcessInfo.processInfo.processName.localizedCaseInsensitiveContains("test") ||
+        ProcessInfo.processInfo.arguments.contains(where: { $0.localizedCaseInsensitiveContains("test") })
+    }
+
     /// Reactive stored volume property (0.0...1.0) persisted in UserDefaults so keyboard shortcuts (`⌘↑` / `⌘↓`)
     /// immediately update `PlayerBarView`'s `YMSlider` without requiring pointer hover.
     public var volume: Float {
@@ -61,9 +68,28 @@ public final class AudioPlayerEngine {
                 volume = clamped
                 return
             }
-            UserDefaults.standard.set(clamped, forKey: Self.volumeDefaultsKey)
             applyEffectiveVolumes()
+            if Self.isRunningTests {
+                UserDefaults.standard.set(clamped, forKey: Self.volumeDefaultsKey)
+            } else {
+                volumePersistTask?.cancel()
+                volumePersistTask = Task {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    guard !Task.isCancelled else { return }
+                    UserDefaults.standard.set(clamped, forKey: Self.volumeDefaultsKey)
+                }
+            }
         }
+    }
+
+    private var actualPlaybackTime: Double {
+        if player.currentItem != nil {
+            let sec = CMTimeGetSeconds(player.currentTime())
+            if sec.isFinite && sec >= 0 {
+                return sec
+            }
+        }
+        return max(lastObservedPlaybackTime, progressTracker.currentTime)
     }
 
     // Telemetry and UI event hooks
@@ -82,10 +108,13 @@ public final class AudioPlayerEngine {
     @ObservationIgnored private var outgoingFadeGain: Float = 0.0
     @ObservationIgnored private var crossfadeElapsedSeconds: Double = 0.0
     @ObservationIgnored private var crossfadeTotalDuration: Double = 0.0
+    @ObservationIgnored private var crossfadeWaitSeconds: Double = 0.0
 
     @ObservationIgnored private var timeObserverToken: Any?
     @ObservationIgnored private var itemEndObserver: (any NSObjectProtocol)?
     @ObservationIgnored private var itemFailedObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var itemErrorLogObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var itemStalledObserver: (any NSObjectProtocol)?
     @ObservationIgnored private var itemStatusObserver: NSKeyValueObservation?
     @ObservationIgnored private var sleepObserver: (any NSObjectProtocol)?
     @ObservationIgnored private var wakeObserver: (any NSObjectProtocol)?
@@ -95,7 +124,12 @@ public final class AudioPlayerEngine {
     @ObservationIgnored private var hasPrefetchedNextTrack: Bool = false
     @ObservationIgnored private var prefetchTask: Task<Void, Never>?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
-    @ObservationIgnored private var nextPreloadedStream: (trackId: String, stream: YMNetworkClient.YMResolvedAudioStream)?
+    @ObservationIgnored private var eqMixTask: Task<Void, Never>?
+    @ObservationIgnored private var volumePersistTask: Task<Void, Never>?
+    @ObservationIgnored private var nextPreloadedStream: (trackId: String, stream: YMNetworkClient.YMResolvedAudioStream, fetchedAt: Date)?
+    @ObservationIgnored private var currentStreamFetchedAt: Date = .distantPast
+    @ObservationIgnored private var sleepTimestamp: Date?
+    @ObservationIgnored private var failedItemsHandled: Set<ObjectIdentifier> = []
     @ObservationIgnored private var currentStreamRetryCount = 0
     @ObservationIgnored private let maxStreamRetries = 2
 
@@ -104,6 +138,8 @@ public final class AudioPlayerEngine {
     @ObservationIgnored private var accumulatedPlayedSeconds: Double = 0
     @ObservationIgnored private var lastObservedPlaybackTime: Double = 0
     @ObservationIgnored private var lastPublishedProgressTime: Double = 0
+    @ObservationIgnored private var lastSyncedDurationTrackId: String?
+    @ObservationIgnored private var lastSyncedDuration: Double = 0
     @ObservationIgnored private var suppressNextSkipTelemetry: Bool = false
     @ObservationIgnored private var pendingWaveAdvance: Bool = false
 
@@ -140,6 +176,16 @@ public final class AudioPlayerEngine {
 
     public func cleanup() {
         cancelCrossfade(stopOutgoing: true)
+        loadTask?.cancel()
+        loadTask = nil
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        queueContinuationTask?.cancel()
+        queueContinuationTask = nil
+        eqMixTask?.cancel()
+        eqMixTask = nil
+        volumePersistTask?.cancel()
+        volumePersistTask = nil
         cleanupObservers()
     }
 
@@ -154,6 +200,7 @@ public final class AudioPlayerEngine {
         isCrossfading = false
         crossfadeElapsedSeconds = 0.0
         crossfadeTotalDuration = 0.0
+        crossfadeWaitSeconds = 0.0
         currentFadeGain = 1.0
         outgoingFadeGain = 0.0
         applyEffectiveVolumes()
@@ -176,6 +223,10 @@ public final class AudioPlayerEngine {
     // MARK: - Queue & Playback Control
 
     public func setQueue(_ newQueue: [YMTrack], startingAt index: Int = 0, keepShuffle: Bool = false) {
+        if newQueue.isEmpty {
+            stopAndClear()
+            return
+        }
         guard checkSubscriptionEligibility() else { return }
         resetQueueContinuation()
         if !keepShuffle {
@@ -184,9 +235,7 @@ public final class AudioPlayerEngine {
         }
         self.queue = newQueue
         self.currentIndex = max(0, min(index, newQueue.count - 1))
-        if !newQueue.isEmpty {
-            playTrack(at: self.currentIndex)
-        }
+        playTrack(at: self.currentIndex)
     }
 
     /// Attaches an async pagination provider for the active non-wave queue (e.g. Favorites or Search),
@@ -348,6 +397,7 @@ public final class AudioPlayerEngine {
         self.currentStreamRetryCount = 0
         self.accumulatedPlayedSeconds = 0
         self.lastObservedPlaybackTime = 0
+        self.lastPublishedProgressTime = 0
         self.trackStartTimestamp = Date()
         self.progressTracker.reset()
 
@@ -383,7 +433,7 @@ public final class AudioPlayerEngine {
             outgoingPlayer?.play()
         }
         isPlaying = true
-        NowPlayingController.shared.updatePlaybackState(isPlaying: true, currentTime: progressTracker.currentTime)
+        NowPlayingController.shared.updatePlaybackState(isPlaying: true, currentTime: actualPlaybackTime)
     }
 
     public func pause() {
@@ -393,13 +443,17 @@ public final class AudioPlayerEngine {
             outgoingPlayer?.pause()
         }
         isPlaying = false
-        NowPlayingController.shared.updatePlaybackState(isPlaying: false, currentTime: progressTracker.currentTime)
+        NowPlayingController.shared.updatePlaybackState(isPlaying: false, currentTime: actualPlaybackTime)
     }
 
     public func stopAndClear() {
         cancelCrossfade(stopOutgoing: true)
         loadTask?.cancel()
+        loadTask = nil
         prefetchTask?.cancel()
+        prefetchTask = nil
+        eqMixTask?.cancel()
+        eqMixTask = nil
         detachItemObservers()
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -439,16 +493,18 @@ public final class AudioPlayerEngine {
 
     public func previous() {
         // If track played for > 3 seconds, restart current track
-        if progressTracker.currentTime > 3.0 {
+        if actualPlaybackTime > 3.0 {
             seek(to: 0)
         } else if currentIndex > 0 {
             playTrack(at: currentIndex - 1)
+        } else if currentIndex == 0 && currentTrack != nil {
+            seek(to: 0)
         }
     }
 
     /// Relative seek in seconds (+5 or -5 seconds).
     public func seekRelative(by seconds: Double) {
-        let current = progressTracker.currentTime
+        let current = actualPlaybackTime
         let dur = progressTracker.duration
         let target = min(max(current + seconds, 0.0), dur > 0 ? dur : max(0.0, current + seconds))
         seek(to: target)
@@ -460,6 +516,7 @@ public final class AudioPlayerEngine {
         progressTracker.currentTime = seconds
         progressTracker.seekLockUntil = Date().addingTimeInterval(0.4)
         lastObservedPlaybackTime = seconds
+        lastPublishedProgressTime = seconds
         let cmTime = CMTime(seconds: seconds, preferredTimescale: 600)
         player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
             Task { @MainActor [weak self] in
@@ -467,6 +524,7 @@ public final class AudioPlayerEngine {
                 self.progressTracker.currentTime = seconds
                 self.progressTracker.seekLockUntil = .distantPast
                 self.lastObservedPlaybackTime = seconds
+                self.lastPublishedProgressTime = seconds
                 NowPlayingController.shared.updatePlaybackPosition(seconds: seconds, isPlaying: self.isPlaying)
             }
         }
@@ -570,7 +628,7 @@ public final class AudioPlayerEngine {
             }
         case .lessLikeThis:
             let isCurrent = (track.id == currentTrack?.id)
-            let played = isCurrent ? progressTracker.currentTime : 0
+            let played = isCurrent ? actualPlaybackTime : 0
             if isCurrent {
                 self.suppressNextSkipTelemetry = true
                 self.trimUpcomingWaveQueue(keepNextCount: 2)
@@ -606,7 +664,7 @@ public final class AudioPlayerEngine {
             var resolvedStream: YMNetworkClient.YMResolvedAudioStream?
 
             // Check if stream was already pre-fetched
-            if !forceRefresh, let preloaded = self.nextPreloadedStream, preloaded.trackId == track.id {
+            if !forceRefresh, let preloaded = self.nextPreloadedStream, preloaded.trackId == track.id, Date().timeIntervalSince(preloaded.fetchedAt) < 120 {
                 resolvedStream = preloaded.stream
                 self.nextPreloadedStream = nil
             } else {
@@ -626,6 +684,9 @@ public final class AudioPlayerEngine {
 
             guard let stream = resolvedStream else {
                 self.isLoading = false
+                self.isPlaying = false
+                self.cancelCrossfade(stopOutgoing: true)
+                NowPlayingController.shared.updatePlaybackState(isPlaying: false, currentTime: self.actualPlaybackTime)
                 return
             }
 
@@ -639,6 +700,8 @@ public final class AudioPlayerEngine {
     private func attachPlayerItem(with url: URL, for track: YMTrack, seekTo seekSeconds: Double?, autoPlay: Bool = true, isInitialTrackStart: Bool = true) {
         detachItemObservers()
         self.currentAudioFormatDetails = nil
+        self.currentStreamFetchedAt = Date()
+        self.failedItemsHandled.removeAll()
 
         var assetOptions: [String: Any] = [:]
         if let codec = currentStreamInfo?.codec.lowercased() {
@@ -654,7 +717,7 @@ public final class AudioPlayerEngine {
 
         self.updateAudioFormatDetails(for: item)
 
-        // Observe end and failure notifications
+        // Observe end, failure, error-log and playback-stalled notifications
         self.itemEndObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
@@ -669,28 +732,59 @@ public final class AudioPlayerEngine {
             forName: .AVPlayerItemFailedToPlayToEndTime,
             object: item,
             queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleStreamFailure()
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                self?.handleStreamFailure(for: item)
             }
         }
 
-        self.itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
-            Task { @MainActor [weak self] in
+        self.itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self, weak item] observedItem, _ in
+            MainActor.assumeIsolated {
                 if observedItem.status == .failed {
                     print("[AudioEngine] AVPlayerItem status failed: \(String(describing: observedItem.error))")
-                    self?.handleStreamFailure()
+                    self?.handleStreamFailure(for: item)
+                }
+            }
+        }
+
+        self.itemErrorLogObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemNewErrorLogEntry,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                guard let self, let item else { return }
+                if let code = item.errorLog()?.events.last?.errorStatusCode {
+                    let criticalCodes: Set<Int> = [401, 403, 404, 410, -1001, -1005, -1100]
+                    if criticalCodes.contains(code) && (self.player.timeControlStatus != .playing || Date().timeIntervalSince(self.currentStreamFetchedAt) > 60) {
+                        self.handleStreamFailure(for: item)
+                    }
+                }
+            }
+        }
+
+        self.itemStalledObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            MainActor.assumeIsolated {
+                guard let self, let item else { return }
+                if Date().timeIntervalSince(self.currentStreamFetchedAt) > 120 {
+                    self.handleStreamFailure(for: item)
                 }
             }
         }
 
         player.replaceCurrentItem(with: item)
 
+        eqMixTask?.cancel()
+        eqMixTask = nil
         if EqualizerSettings.shared.isEnabled {
-            Task { [weak self, weak item] in
+            eqMixTask = Task { [weak self, weak item] in
                 guard let self = self, let item = item else { return }
                 if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
-                    guard self.player.currentItem === item else { return }
+                    guard !Task.isCancelled, EqualizerSettings.shared.isEnabled, self.player.currentItem === item else { return }
                     item.audioMix = mix
                 }
             }
@@ -698,9 +792,9 @@ public final class AudioPlayerEngine {
 
         if let seekSeconds = seekSeconds, seekSeconds > 0 {
             let cmTime = CMTime(seconds: seekSeconds, preferredTimescale: 600)
-            player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self = self else { return }
+            player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
+                MainActor.assumeIsolated {
+                    guard let self = self, let item = item, self.player.currentItem === item else { return }
                     if autoPlay {
                         self.player.play()
                         self.isPlaying = true
@@ -718,6 +812,7 @@ public final class AudioPlayerEngine {
                             queueCount: self.queue.count,
                             collectionIdentifier: self.currentCollectionIdentifier
                         )
+                        RemoteCommandManager.shared.updateLikeState(isLiked: LikesService.shared.isLiked(trackId: track.id))
                         self.onTrackStarted?(track)
                     } else {
                         NowPlayingController.shared.updatePlaybackPosition(currentTime: seekSeconds, isPlaying: autoPlay)
@@ -741,6 +836,7 @@ public final class AudioPlayerEngine {
                     queueCount: queue.count,
                     collectionIdentifier: currentCollectionIdentifier
                 )
+                RemoteCommandManager.shared.updateLikeState(isLiked: LikesService.shared.isLiked(trackId: track.id))
                 onTrackStarted?(track)
             } else {
                 NowPlayingController.shared.updatePlaybackPosition(currentTime: 0, isPlaying: autoPlay)
@@ -798,7 +894,13 @@ public final class AudioPlayerEngine {
         next()
     }
 
-    private func handleStreamFailure() {
+    private func handleStreamFailure(for failedItem: AVPlayerItem? = nil) {
+        if let failedItem {
+            guard self.player.currentItem === failedItem else { return }
+            let id = ObjectIdentifier(failedItem)
+            if failedItemsHandled.contains(id) { return }
+            failedItemsHandled.insert(id)
+        }
         guard let track = currentTrack, currentStreamRetryCount < maxStreamRetries else {
             print("[AudioEngine] Max stream retry count reached or no current track.")
             isLoading = false
@@ -806,8 +908,9 @@ public final class AudioPlayerEngine {
             return
         }
 
+        cancelCrossfade(stopOutgoing: true)
         currentStreamRetryCount += 1
-        let interruptedPosition = progressTracker.currentTime
+        let interruptedPosition = actualPlaybackTime
         print("[AudioEngine] Stream failed at \(interruptedPosition)s. Retrying sign & seek (attempt \(currentStreamRetryCount))...")
 
         let isFlacMp4 = currentStreamInfo?.codec.lowercased().contains("flac-mp4") == true
@@ -828,18 +931,13 @@ public final class AudioPlayerEngine {
                     forceRefresh: true
                 )
                 guard !Task.isCancelled, self.currentTrack?.id == track.id else { return }
-                await MainActor.run { [weak self] in
-                    guard let self = self else { return }
-                    self.currentStreamInfo = resolved.downloadInfo
-                    self.availableStreamInfos = resolved.allAvailableInfos
-                    self.attachPlayerItem(with: resolved.url, for: track, seekTo: interruptedPosition, autoPlay: true, isInitialTrackStart: false)
-                }
+                self.currentStreamInfo = resolved.downloadInfo
+                self.availableStreamInfos = resolved.allAvailableInfos
+                self.attachPlayerItem(with: resolved.url, for: track, seekTo: interruptedPosition, autoPlay: true, isInitialTrackStart: false)
             } catch {
                 print("[AudioEngine] Error during stream recovery: \(error)")
-                await MainActor.run { [weak self] in
-                    self?.isLoading = false
-                    self?.isPlaying = false
-                }
+                self.isLoading = false
+                self.isPlaying = false
             }
         }
     }
@@ -867,6 +965,16 @@ public final class AudioPlayerEngine {
                 let validDuration = (!duration.isNaN && !duration.isInfinite && duration > 0) ? duration : (Double(self.currentTrack?.durationMs ?? 0) / 1000.0)
 
                 self.lastObservedPlaybackTime = currentTime
+
+                if self.currentStreamRetryCount > 0 && currentTime > 5.0 && self.player.timeControlStatus == .playing {
+                    self.currentStreamRetryCount = 0
+                }
+
+                if let trackId = self.currentTrack?.id, (self.lastSyncedDurationTrackId != trackId || abs(self.lastSyncedDuration - validDuration) >= 0.5) {
+                    self.lastSyncedDurationTrackId = trackId
+                    self.lastSyncedDuration = validDuration
+                    NowPlayingController.shared.updateDuration(validDuration)
+                }
 
                 // UI Progress Tracker: publish only when the host window is visible and active
                 if self.isHostWindowVisible {
@@ -932,6 +1040,8 @@ public final class AudioPlayerEngine {
         outgoingFadeGain = 1.0
         crossfadeElapsedSeconds = 0.0
         crossfadeTotalDuration = duration
+        crossfadeWaitSeconds = 0.0
+        lastPublishedProgressTime = 0
         applyEffectiveVolumes()
         setupTimeObserver()
 
@@ -956,16 +1066,24 @@ public final class AudioPlayerEngine {
             maybePrefetchQueueContinuation()
         }
 
-        if isWaveMode && queue.count - currentIndex <= 2 {
-            onQueueNeedsMoreTracks?()
-        }
-
-        // Start 20 Hz equal-power crossfade timer (0.05s step)
+        // Start 20 Hz equal-power crossfade timer (0.05s step) in .common RunLoop mode
         crossfadeTimer?.invalidate()
-        crossfadeTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self = self, self.isCrossfading else { return }
                 guard self.isPlaying else { return }
+
+                let incomingReady = !self.isLoading && self.player.timeControlStatus == .playing
+                if !incomingReady && self.crossfadeWaitSeconds < 3.0 {
+                    self.crossfadeWaitSeconds += 0.05
+                    self.outgoingFadeGain = 1.0
+                    self.currentFadeGain = 0.0
+                    self.applyEffectiveVolumes()
+                    if let outgoing = self.outgoingPlayer, outgoing.timeControlStatus != .playing && outgoing.currentItem?.status != .readyToPlay {
+                        self.cancelCrossfade(stopOutgoing: true)
+                    }
+                    return
+                }
 
                 self.crossfadeElapsedSeconds += 0.05
                 let progress = min(1.0, self.crossfadeElapsedSeconds / max(0.05, self.crossfadeTotalDuration))
@@ -979,6 +1097,8 @@ public final class AudioPlayerEngine {
                 }
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        crossfadeTimer = timer
     }
 
     private func triggerNextTrackPrefetch() {
@@ -1007,7 +1127,7 @@ public final class AudioPlayerEngine {
                 )
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.nextPreloadedStream = (trackId: nextTrack.id, stream: resolved)
+                    self?.nextPreloadedStream = (trackId: nextTrack.id, stream: resolved, fetchedAt: Date())
                 }
             } catch {
                 print("[AudioEngine] Background prefetch failed for next track \(nextTrack.id): \(error)")
@@ -1033,7 +1153,7 @@ public final class AudioPlayerEngine {
         guard let track = currentTrack else { return }
         cancelCrossfade(stopOutgoing: true)
         self.nextPreloadedStream = nil
-        let interruptedPosition = progressTracker.currentTime
+        let interruptedPosition = actualPlaybackTime
         let wasPlaying = self.isPlaying
         self.isLoading = true
         loadTask?.cancel()
@@ -1057,13 +1177,13 @@ public final class AudioPlayerEngine {
         }
     }
 
-    public func reloadCurrentTrackStream() {
+    public func reloadCurrentTrackStream(forceRefresh: Bool = false, forceAutoPlay: Bool? = nil) {
         guard let track = currentTrack else { return }
         cancelCrossfade(stopOutgoing: true)
         self.nextPreloadedStream = nil
-        let currentPos = progressTracker.currentTime
-        let wasPlaying = self.isPlaying
-        loadAndPlay(track: track, seekTo: currentPos, autoPlay: wasPlaying, forceRefresh: false, isInitialTrackStart: false)
+        let currentPos = actualPlaybackTime
+        let wasPlaying = forceAutoPlay ?? self.isPlaying
+        loadAndPlay(track: track, seekTo: currentPos, autoPlay: wasPlaying, forceRefresh: forceRefresh, isInitialTrackStart: false)
     }
 
     private func recordPlaybackSession() {
@@ -1084,6 +1204,7 @@ public final class AudioPlayerEngine {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                self.sleepTimestamp = Date()
                 self.wasPlayingBeforeSleep = self.isPlaying
                 if self.isPlaying {
                     self.pause()
@@ -1099,7 +1220,12 @@ public final class AudioPlayerEngine {
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 if self.wasPlayingBeforeSleep {
-                    self.play()
+                    let sleepDuration = self.sleepTimestamp.map { Date().timeIntervalSince($0) } ?? 0
+                    if sleepDuration > 120 && self.currentTrack != nil {
+                        self.reloadCurrentTrackStream(forceRefresh: true, forceAutoPlay: true)
+                    } else {
+                        self.play()
+                    }
                 }
             }
         }
@@ -1156,13 +1282,15 @@ public final class AudioPlayerEngine {
 
     private func handleEqualizerEnabledChange() {
         guard let currentItem = player.currentItem else { return }
+        eqMixTask?.cancel()
+        eqMixTask = nil
         if EqualizerSettings.shared.isEnabled {
             if currentItem.audioMix == nil {
                 let asset = currentItem.asset
-                Task { [weak self, weak currentItem] in
+                eqMixTask = Task { [weak self, weak currentItem] in
                     guard let self = self, let currentItem = currentItem else { return }
                     if let mix = await AudioEqualizerTapBuilder.makeAudioMix(for: asset) {
-                        guard self.player.currentItem === currentItem else { return }
+                        guard !Task.isCancelled, EqualizerSettings.shared.isEnabled, self.player.currentItem === currentItem else { return }
                         currentItem.audioMix = mix
                     }
                 }
@@ -1186,6 +1314,14 @@ public final class AudioPlayerEngine {
         if let failObs = itemFailedObserver {
             NotificationCenter.default.removeObserver(failObs)
             itemFailedObserver = nil
+        }
+        if let errObs = itemErrorLogObserver {
+            NotificationCenter.default.removeObserver(errObs)
+            itemErrorLogObserver = nil
+        }
+        if let stallObs = itemStalledObserver {
+            NotificationCenter.default.removeObserver(stallObs)
+            itemStalledObserver = nil
         }
     }
 

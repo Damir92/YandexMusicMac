@@ -15,6 +15,7 @@ public final class PlaylistsService {
     public var pendingInitialTrack: YMTrack? = nil
     public var toastMessage: String? = nil
 
+    @ObservationIgnored private var loadGeneration: UInt64 = 0
     private var toastDismissTask: Task<Void, Never>? = nil
     private let networkClient: YMNetworkClient
     private let keychain: KeychainManager
@@ -31,6 +32,35 @@ public final class PlaylistsService {
         AuthService.shared.currentUser?.userId ?? (try? keychain.getString(for: .userId))
     }
 
+    private func resolvedOwnerUid(for playlist: YMPlaylist) throws -> String {
+        if !playlist.uid.isEmpty && playlist.uid != "0" {
+            return playlist.uid
+        }
+        if let uid = currentUserId(), !uid.isEmpty {
+            return uid
+        }
+        throw YMAPIError.unauthorized
+    }
+
+    private func isRevisionConflict(_ error: Error) -> Bool {
+        if let apiError = error as? YMAPIError {
+            switch apiError {
+            case .httpError(let statusCode, _):
+                return statusCode == 409 || statusCode == 412
+            case .serverError(let name, let message):
+                let lower = (name + " " + message).lowercased()
+                return lower.contains("revision") || lower.contains("wrong-revision")
+            default:
+                return false
+            }
+        }
+        return false
+    }
+
+    private func extractCleanId(from trackId: String) -> String {
+        trackId.split(separator: ":", maxSplits: 1).first.map(String.init) ?? trackId
+    }
+
     public func ensureLoaded() async {
         if playlists.isEmpty && !isLoading {
             await loadPlaylists(force: false)
@@ -44,6 +74,8 @@ public final class PlaylistsService {
             return
         }
 
+        loadGeneration &+= 1
+        let generation = loadGeneration
         isLoading = true
         errorMessage = nil
         do {
@@ -51,9 +83,11 @@ public final class PlaylistsService {
                 uid: uid,
                 cachePolicy: force ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
             )
+            guard self.loadGeneration == generation else { return }
             self.playlists = fetched
             self.isLoading = false
         } catch {
+            guard self.loadGeneration == generation else { return }
             self.errorMessage = error.localizedDescription
             self.isLoading = false
         }
@@ -84,16 +118,41 @@ public final class PlaylistsService {
         )
 
         if !initialTracks.isEmpty {
-            let rev = created.revision ?? 1
-            if let withTracks = try? await networkClient.addTracksToPlaylist(
-                uid: uid,
-                kind: created.kind,
-                revision: rev,
-                tracks: initialTracks,
-                at: 0
-            ) {
-                created = withTracks
+            var addError: Error?
+            do {
+                var rev = created.revision ?? 1
+                do {
+                    created = try await networkClient.addTracksToPlaylist(
+                        uid: uid,
+                        kind: created.kind,
+                        revision: rev,
+                        tracks: initialTracks,
+                        at: 0
+                    )
+                } catch {
+                    if isRevisionConflict(error) {
+                        let details = try await networkClient.fetchPlaylistDetails(uid: uid, kind: created.kind)
+                        rev = details.revision ?? created.revision ?? 1
+                        created = try await networkClient.addTracksToPlaylist(
+                            uid: uid,
+                            kind: created.kind,
+                            revision: rev,
+                            tracks: initialTracks,
+                            at: 0
+                        )
+                    } else {
+                        throw error
+                    }
+                }
+            } catch {
+                addError = error
             }
+
+            upsertPlaylist(created, insertAtTop: true)
+            if let addError {
+                throw addError
+            }
+            return created
         }
 
         upsertPlaylist(created, insertAtTop: true)
@@ -107,7 +166,7 @@ public final class PlaylistsService {
         description: String,
         isPrivate: Bool
     ) async throws -> YMPlaylist {
-        let uid = playlist.uid
+        let uid = try resolvedOwnerUid(for: playlist)
         var latest = playlist
 
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -117,8 +176,11 @@ public final class PlaylistsService {
 
         let cleanDesc = description.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanDesc != (playlist.description ?? "") {
-            if let updated = try? await networkClient.updatePlaylistDescription(uid: uid, kind: playlist.kind, description: cleanDesc) {
-                latest = updated
+            do {
+                latest = try await networkClient.updatePlaylistDescription(uid: uid, kind: playlist.kind, description: cleanDesc)
+            } catch {
+                upsertPlaylist(latest, insertAtTop: false)
+                throw error
             }
         }
 
@@ -132,39 +194,118 @@ public final class PlaylistsService {
     }
 
     public func deletePlaylist(_ playlist: YMPlaylist) async throws {
-        try await networkClient.deletePlaylist(uid: playlist.uid, kind: playlist.kind)
+        let uid = try resolvedOwnerUid(for: playlist)
+        try await networkClient.deletePlaylist(uid: uid, kind: playlist.kind)
         playlists.removeAll { $0.id == playlist.id }
     }
 
     @discardableResult
     public func addTracks(_ tracks: [YMTrack], to playlist: YMPlaylist) async throws -> YMPlaylist {
         guard !tracks.isEmpty else { return playlist }
-        // Always fetch fresh revision before mutating to avoid wrong-revision conflicts
-        let details = try await networkClient.fetchPlaylistDetails(uid: playlist.uid, kind: playlist.kind)
-        let revision = details.revision ?? playlist.revision ?? 1
-        let updated = try await networkClient.addTracksToPlaylist(
-            uid: playlist.uid,
-            kind: playlist.kind,
-            revision: revision,
-            tracks: tracks,
-            at: 0
-        )
-        upsertPlaylist(updated, insertAtTop: false)
-        return updated
+        let uid = try resolvedOwnerUid(for: playlist)
+
+        var attempts = 0
+        while true {
+            attempts += 1
+            let details = try await networkClient.fetchPlaylistDetails(uid: uid, kind: playlist.kind)
+            let revision = details.revision ?? playlist.revision ?? 1
+            do {
+                let updated = try await networkClient.addTracksToPlaylist(
+                    uid: uid,
+                    kind: playlist.kind,
+                    revision: revision,
+                    tracks: tracks,
+                    at: 0
+                )
+                upsertPlaylist(updated, insertAtTop: false)
+                return updated
+            } catch {
+                if attempts < 2 && isRevisionConflict(error) {
+                    continue
+                }
+                throw error
+            }
+        }
     }
 
     @discardableResult
     public func removeTrack(at index: Int, from playlist: YMPlaylist) async throws -> YMPlaylist {
-        let details = try await networkClient.fetchPlaylistDetails(uid: playlist.uid, kind: playlist.kind)
-        let revision = details.revision ?? playlist.revision ?? 1
-        let updated = try await networkClient.removeTrackFromPlaylist(
-            uid: playlist.uid,
-            kind: playlist.kind,
-            revision: revision,
-            at: index
-        )
-        upsertPlaylist(updated, insertAtTop: false)
-        return updated
+        let uid = try resolvedOwnerUid(for: playlist)
+
+        var attempts = 0
+        while true {
+            attempts += 1
+            let details = try await networkClient.fetchPlaylistDetails(uid: uid, kind: playlist.kind)
+            if let serverTracks = details.tracks {
+                guard index >= 0 && index < serverTracks.count else {
+                    throw YMAPIError.serverError(name: "index-out-of-bounds", message: "Трек уже удалён или список изменился")
+                }
+            } else {
+                guard index >= 0 else {
+                    throw YMAPIError.serverError(name: "invalid-index", message: "Invalid track index")
+                }
+            }
+            let revision = details.revision ?? playlist.revision ?? 1
+            do {
+                let updated = try await networkClient.removeTrackFromPlaylist(
+                    uid: uid,
+                    kind: playlist.kind,
+                    revision: revision,
+                    at: index
+                )
+                upsertPlaylist(updated, insertAtTop: false)
+                return updated
+            } catch {
+                if attempts < 2 && isRevisionConflict(error) {
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    @discardableResult
+    public func removeTrack(_ track: YMTrack, at index: Int, from playlist: YMPlaylist) async throws -> YMPlaylist {
+        let uid = try resolvedOwnerUid(for: playlist)
+        let targetCleanId = extractCleanId(from: track.id)
+
+        var attempts = 0
+        while true {
+            attempts += 1
+            let details = try await networkClient.fetchPlaylistDetails(uid: uid, kind: playlist.kind)
+            let resolvedIndex: Int
+            if let serverTracks = details.tracks {
+                if index >= 0 && index < serverTracks.count && extractCleanId(from: serverTracks[index].id) == targetCleanId {
+                    resolvedIndex = index
+                } else if let foundIndex = serverTracks.firstIndex(where: { extractCleanId(from: $0.id) == targetCleanId }) {
+                    resolvedIndex = foundIndex
+                } else {
+                    throw YMAPIError.serverError(name: "track-not-found", message: "Трек не найден в плейлисте")
+                }
+            } else {
+                guard index >= 0 else {
+                    throw YMAPIError.serverError(name: "invalid-index", message: "Invalid track index")
+                }
+                resolvedIndex = index
+            }
+
+            let revision = details.revision ?? playlist.revision ?? 1
+            do {
+                let updated = try await networkClient.removeTrackFromPlaylist(
+                    uid: uid,
+                    kind: playlist.kind,
+                    revision: revision,
+                    at: resolvedIndex
+                )
+                upsertPlaylist(updated, insertAtTop: false)
+                return updated
+            } catch {
+                if attempts < 2 && isRevisionConflict(error) {
+                    continue
+                }
+                throw error
+            }
+        }
     }
 
     public func upsertPlaylist(_ playlist: YMPlaylist, insertAtTop: Bool) {
@@ -193,6 +334,7 @@ public final class PlaylistsService {
     }
 
     public func resetAll() {
+        loadGeneration &+= 1
         playlists = []
         isLoading = false
         errorMessage = nil

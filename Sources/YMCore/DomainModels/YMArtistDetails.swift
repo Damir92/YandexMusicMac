@@ -45,10 +45,10 @@ public struct YMArtistBriefInfo: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.artist = try container.decode(YMArtist.self, forKey: .artist)
-        self.albums = (try? container.decodeIfPresent([YMAlbum].self, forKey: .albums)) ?? []
-        self.alsoAlbums = (try? container.decodeIfPresent([YMAlbum].self, forKey: .alsoAlbums)) ?? []
-        self.popularTracks = (try? container.decodeIfPresent([YMTrack].self, forKey: .popularTracks)) ?? []
-        self.similarArtists = (try? container.decodeIfPresent([YMArtist].self, forKey: .similarArtists)) ?? []
+        self.albums = FlexibleArrayDecoder.decodeLossy(YMAlbum.self, from: container, forKey: .albums)
+        self.alsoAlbums = FlexibleArrayDecoder.decodeLossy(YMAlbum.self, from: container, forKey: .alsoAlbums)
+        self.popularTracks = FlexibleArrayDecoder.decodeLossy(YMTrack.self, from: container, forKey: .popularTracks)
+        self.similarArtists = FlexibleArrayDecoder.decodeLossy(YMArtist.self, from: container, forKey: .similarArtists)
         self.stats = try? container.decodeIfPresent(YMArtistStats.self, forKey: .stats)
         self.counts = try? container.decodeIfPresent(YMArtistCounts.self, forKey: .counts)
         self.description = try? container.decodeIfPresent(YMArtistDescription.self, forKey: .description)
@@ -69,16 +69,24 @@ public struct YMArtistStats: Codable, Sendable {
         self.lastMonthListenersDelta = lastMonthListenersDelta
     }
 
-    private static let listenersFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.groupingSeparator = " "
-        return formatter
-    }()
+    private static func formatWithSpaces(_ value: Int) -> String {
+        let digits = String(value)
+        guard digits.count > 3 else { return digits }
+        var result = ""
+        result.reserveCapacity(digits.count + digits.count / 3)
+        for (idx, ch) in digits.enumerated() {
+            let remaining = digits.count - idx
+            if idx > 0 && remaining % 3 == 0 {
+                result.append(" ")
+            }
+            result.append(ch)
+        }
+        return result
+    }
 
     public var formattedListeners: String {
         guard let count = lastMonthListeners, count > 0 else { return "" }
-        let formattedNumber = Self.listenersFormatter.string(from: NSNumber(value: count)) ?? "\(count)"
+        let formattedNumber = Self.formatWithSpaces(count)
         return "\(formattedNumber) слушателей за месяц"
     }
 }
@@ -113,5 +121,14 @@ public struct YMArtistDescription: Codable, Sendable {
 
     public init(text: String? = nil) {
         self.text = text
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let str = try? decoder.singleValueContainer().decode(String.self) {
+            self.text = str
+            return
+        }
+        let container = try? decoder.container(keyedBy: CodingKeys.self)
+        self.text = try? container?.decodeIfPresent(String.self, forKey: .text)
     }
 }

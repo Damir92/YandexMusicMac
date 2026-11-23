@@ -9,26 +9,68 @@ public struct FavoritesListView: View {
     @UIState private var coordinator = NavigationCoordinator.shared
 
     @UIState private var filterQuery = ""
+    @UIState private var filterTask: Task<Void, Never>? = nil
     @UIState private var isScrolled = false
+
+    @UIState private var cachedDisplayedTracks: [YMTrack] = []
+    @UIState private var cachedTotalDuration: String = ""
 
     public init() {}
 
+    private var isFiltered: Bool {
+        !filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var displayedTracks: [YMTrack] {
-        let q = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return likesService.likedTracks }
-        return likesService.searchInLikes(query: q)
+        if isFiltered {
+            return cachedDisplayedTracks
+        } else {
+            return likesService.likedTracks
+        }
     }
 
     private var totalDurationFormatted: String {
-        let totalMs = displayedTracks.compactMap(\.durationMs).reduce(0, +)
-        guard totalMs > 0 else { return "" }
-        let totalSeconds = totalMs / 1000
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
-        if hours > 0 {
-            return "\(hours) ч \(minutes) мин"
+        cachedTotalDuration
+    }
+
+    private func formatTrackCount(_ count: Int) -> String {
+        let mod10 = count % 10
+        let mod100 = count % 100
+        if mod100 >= 11 && mod100 <= 19 {
+            return "\(count) треков"
         }
-        return "\(minutes) мин"
+        switch mod10 {
+        case 1:
+            return "\(count) трек"
+        case 2, 3, 4:
+            return "\(count) трека"
+        default:
+            return "\(count) треков"
+        }
+    }
+
+    private func recalculateDisplayedTracks() {
+        let q = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if q.isEmpty {
+            cachedDisplayedTracks = []
+        } else {
+            cachedDisplayedTracks = likesService.searchInLikes(query: q)
+        }
+
+        let tracks = displayedTracks
+        let totalMs = tracks.compactMap(\.durationMs).reduce(0, +)
+        if totalMs > 0 {
+            let totalSeconds = totalMs / 1000
+            let hours = totalSeconds / 3600
+            let minutes = (totalSeconds % 3600) / 60
+            if hours > 0 {
+                cachedTotalDuration = "\(hours) ч \(minutes) мин"
+            } else {
+                cachedTotalDuration = "\(minutes) мин"
+            }
+        } else {
+            cachedTotalDuration = ""
+        }
     }
 
     public var body: some View {
@@ -92,7 +134,7 @@ public struct FavoritesListView: View {
                             .lineLimit(1)
 
                         HStack(spacing: 6) {
-                            Text("\(likesService.likedTrackIds.count) треков")
+                            Text(formatTrackCount(likesService.likedTrackIds.count))
                             if !totalDurationFormatted.isEmpty {
                                 Text("• \(totalDurationFormatted)")
                             }
@@ -207,6 +249,7 @@ public struct FavoritesListView: View {
                             .foregroundStyle(YMTheme.fg60)
                         Button("Очистить поиск") {
                             filterQuery = ""
+                            likesService.pruneSearchCatalogIfNeeded()
                         }
                         .buttonStyle(YMGlassPillButtonStyle(primary: false))
                         .padding(.top, 4)
@@ -240,6 +283,11 @@ public struct FavoritesListView: View {
                                 }
                             }
                         },
+                        onTrackAppear: { track in
+                            if track.isPlaceholder {
+                                likesService.loadBatchIfNeeded(forTrackId: track.id)
+                            }
+                        },
                         onLoadMore: {
                             Task {
                                 await likesService.loadMoreLikedTracks()
@@ -261,20 +309,53 @@ public struct FavoritesListView: View {
             }
             .padding(.bottom, 80)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "favorites_scroll",
-                    threshold: 88,
-                    isScrolled: $isScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "favorites_scroll",
+                        threshold: 88,
+                        isScrolled: $isScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 88, isScrolled: $isScrolled)
         .coordinateSpace(name: "favorites_scroll")
         .overlay(alignment: .top) {
             YMStickyTopBar(title: "Мне нравится", isVisible: isScrolled)
         }
         .ymScreenBackground()
+        .onAppear {
+            recalculateDisplayedTracks()
+        }
+        .onDisappear {
+            filterTask?.cancel()
+            filterTask = nil
+        }
+        .onChange(of: filterQuery) { _, newQuery in
+            filterTask?.cancel()
+            let trimmed = newQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                recalculateDisplayedTracks()
+            } else {
+                filterTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard !Task.isCancelled else { return }
+                    recalculateDisplayedTracks()
+                }
+            }
+        }
+        .onChange(of: likesService.likedTracks.count) { _, _ in
+            recalculateDisplayedTracks()
+        }
+        .onChange(of: likesService.likedTrackIds.count) { _, _ in
+            recalculateDisplayedTracks()
+        }
+        .onChange(of: likesService.isIndexingCatalog) { _, _ in
+            recalculateDisplayedTracks()
+        }
         .task {
             await likesService.ensureInitialLikesLoaded()
+            recalculateDisplayedTracks()
         }
         .task(id: filterQuery) {
             let trimmed = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -282,6 +363,7 @@ public struct FavoritesListView: View {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
             await likesService.ensureAllLikedTracksLoadedForSearch()
+            recalculateDisplayedTracks()
         }
     }
 
@@ -302,6 +384,7 @@ public struct FavoritesListView: View {
                 .fixedSize(horizontal: true, vertical: false)
         }
         .buttonStyle(YMGlassPillButtonStyle(primary: true, height: height))
+        .disabled(displayedTracks.isEmpty)
     }
 
     @ViewBuilder
@@ -321,6 +404,7 @@ public struct FavoritesListView: View {
                 .fixedSize(horizontal: true, vertical: false)
         }
         .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .disabled(likesService.likedTrackIds.isEmpty && displayedTracks.isEmpty)
     }
 
     private func attachSequentialLikesContinuation() {
@@ -347,5 +431,6 @@ public struct FavoritesListView: View {
                 .fixedSize(horizontal: true, vertical: false)
         }
         .buttonStyle(YMGlassPillButtonStyle(primary: false, height: height))
+        .disabled(displayedTracks.isEmpty)
     }
 }

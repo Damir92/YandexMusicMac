@@ -180,6 +180,9 @@ public struct YMRotorStationTracksResult: Codable, Sendable {
     public let radioSessionId: String?
     public let batchId: String?
     public let sequence: [YMRotorSequenceItem]
+    public let terminated: Bool?
+    public let unknownSession: Bool?
+    public let pumpkin: Bool?
 
     enum CodingKeys: String, CodingKey {
         case radioSessionId
@@ -187,12 +190,26 @@ public struct YMRotorStationTracksResult: Codable, Sendable {
         case batchId
         case batchIdKebab = "batch-id"
         case sequence
+        case terminated
+        case unknownSession
+        case unknownSessionKebab = "unknown-session"
+        case pumpkin
     }
 
-    public init(radioSessionId: String? = nil, batchId: String?, sequence: [YMRotorSequenceItem] = []) {
+    public init(
+        radioSessionId: String? = nil,
+        batchId: String?,
+        sequence: [YMRotorSequenceItem] = [],
+        terminated: Bool? = nil,
+        unknownSession: Bool? = nil,
+        pumpkin: Bool? = nil
+    ) {
         self.radioSessionId = radioSessionId
         self.batchId = batchId
         self.sequence = sequence
+        self.terminated = terminated
+        self.unknownSession = unknownSession
+        self.pumpkin = pumpkin
     }
 
     public init(from decoder: Decoder) throws {
@@ -213,6 +230,15 @@ public struct YMRotorStationTracksResult: Codable, Sendable {
         }
 
         self.sequence = (try? container.decodeIfPresent([YMRotorSequenceItem].self, forKey: .sequence)) ?? []
+        self.terminated = try? container.decodeIfPresent(Bool.self, forKey: .terminated)
+
+        if let unk = try? container.decodeIfPresent(Bool.self, forKey: .unknownSession) {
+            self.unknownSession = unk
+        } else {
+            self.unknownSession = try? container.decodeIfPresent(Bool.self, forKey: .unknownSessionKebab)
+        }
+
+        self.pumpkin = try? container.decodeIfPresent(Bool.self, forKey: .pumpkin)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -220,6 +246,9 @@ public struct YMRotorStationTracksResult: Codable, Sendable {
         try container.encodeIfPresent(radioSessionId, forKey: .radioSessionId)
         try container.encodeIfPresent(batchId, forKey: .batchId)
         try container.encode(sequence, forKey: .sequence)
+        try container.encodeIfPresent(terminated, forKey: .terminated)
+        try container.encodeIfPresent(unknownSession, forKey: .unknownSession)
+        try container.encodeIfPresent(pumpkin, forKey: .pumpkin)
     }
 }
 
@@ -273,6 +302,7 @@ public struct YMPersonalWaveStation: Identifiable, Hashable, Sendable {
     public let iconUrl: String?
     public let accentHex: String?
     public let combineWithMyWave: Bool
+    public let idForFrom: String?
 
     public init(
         type: String,
@@ -281,7 +311,8 @@ public struct YMPersonalWaveStation: Identifiable, Hashable, Sendable {
         subtitle: String? = nil,
         iconUrl: String? = nil,
         accentHex: String? = nil,
-        combineWithMyWave: Bool? = nil
+        combineWithMyWave: Bool? = nil,
+        idForFrom: String? = nil
     ) {
         self.type = type
         self.tag = tag
@@ -290,6 +321,7 @@ public struct YMPersonalWaveStation: Identifiable, Hashable, Sendable {
         self.subtitle = subtitle
         self.iconUrl = iconUrl
         self.accentHex = accentHex
+        self.idForFrom = idForFrom
         if let explicit = combineWithMyWave {
             self.combineWithMyWave = explicit
         } else {
@@ -298,14 +330,12 @@ public struct YMPersonalWaveStation: Identifiable, Hashable, Sendable {
     }
 
     public func toWaveContext() -> YMWaveContext {
-        let seeds: [String] = combineWithMyWave
-            ? ["user:onyourwave", id]
-            : [id]
-        return YMWaveContext(
+        YMWaveContext(
             title: title,
             subtitle: subtitle ?? "Персональная волна «\(title)»",
-            seeds: seeds,
-            fallbackStationId: id
+            seeds: [id],
+            fallbackStationId: id,
+            idForFrom: idForFrom
         )
     }
 
@@ -376,21 +406,29 @@ public struct YMRotorStationInfo: Codable, Sendable {
         self.idForFrom = try? container.decodeIfPresent(String.self, forKey: .idForFrom)
     }
 
-    public func toPersonalWaveStation(subtitle: String? = nil, overrideTitle: String? = nil) -> YMPersonalWaveStation? {
+    public func toPersonalWaveStation(
+        subtitle: String? = nil,
+        overrideTitle: String? = nil,
+        customName: String? = nil
+    ) -> YMPersonalWaveStation? {
         guard let stationId = id, !stationId.type.isEmpty, !stationId.tag.isEmpty else {
             return nil
         }
 
-        // Prefer `station.name` (actual genre/mood/activity/artist name).
-        // Yandex API often sets `rupTitle` to generic "Моя волна" for personalized genre cards — never let that overwrite `station.name`.
+        // Priority: customName -> station.name -> rupTitle, discarding empty strings and generic "Моя волна"
+        let cleanCustom = customName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanOverride = overrideTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let resolvedTitle: String
-        if let cleanName, !cleanName.isEmpty, cleanName.caseInsensitiveCompare("Моя волна") != .orderedSame {
+        if let cleanCustom, !cleanCustom.isEmpty, cleanCustom.caseInsensitiveCompare("Моя волна") != .orderedSame {
+            resolvedTitle = cleanCustom
+        } else if let cleanName, !cleanName.isEmpty, cleanName.caseInsensitiveCompare("Моя волна") != .orderedSame {
             resolvedTitle = cleanName
         } else if let cleanOverride, !cleanOverride.isEmpty, cleanOverride.caseInsensitiveCompare("Моя волна") != .orderedSame {
             resolvedTitle = cleanOverride
+        } else if let cleanCustom, !cleanCustom.isEmpty {
+            resolvedTitle = cleanCustom
         } else if let cleanName, !cleanName.isEmpty {
             resolvedTitle = cleanName
         } else {
@@ -406,7 +444,8 @@ public struct YMRotorStationInfo: Codable, Sendable {
             title: resolvedTitle,
             subtitle: subtitle,
             iconUrl: icon?.imageUrl ?? fullImageUrl,
-            accentHex: icon?.backgroundColor
+            accentHex: icon?.backgroundColor,
+            idForFrom: idForFrom
         )
     }
 }
@@ -416,12 +455,14 @@ public struct YMRotorDashboardStationItem: Codable, Sendable {
     public let rupTitle: String?
     public let rupDescription: String?
     public let explanation: String?
+    public let customName: String?
 
     enum CodingKeys: String, CodingKey {
         case station
         case rupTitle
         case rupDescription
         case explanation
+        case customName
     }
 
     public init(from decoder: Decoder) throws {
@@ -435,12 +476,17 @@ public struct YMRotorDashboardStationItem: Codable, Sendable {
         self.rupTitle = try? container.decodeIfPresent(String.self, forKey: .rupTitle)
         self.rupDescription = try? container.decodeIfPresent(String.self, forKey: .rupDescription)
         self.explanation = try? container.decodeIfPresent(String.self, forKey: .explanation)
+        self.customName = try? container.decodeIfPresent(String.self, forKey: .customName)
     }
 
     public func toPersonalWaveStation() -> YMPersonalWaveStation? {
         let subtitle = (rupDescription?.isEmpty == false ? rupDescription : nil)
             ?? (explanation?.isEmpty == false ? explanation : nil)
-        return station?.toPersonalWaveStation(subtitle: subtitle, overrideTitle: rupTitle)
+        return station?.toPersonalWaveStation(
+            subtitle: subtitle,
+            overrideTitle: rupTitle,
+            customName: customName
+        )
     }
 }
 
@@ -472,17 +518,20 @@ public struct YMRotorSessionNewRequest: Codable, Sendable {
     public let includeTracksInResponse: Bool
     public let includeWaveModel: Bool
     public let interactive: Bool
+    public let queue: [String]?
 
     public init(
         seeds: [String] = ["user:onyourwave"],
         includeTracksInResponse: Bool = true,
         includeWaveModel: Bool = true,
-        interactive: Bool = true
+        interactive: Bool = true,
+        queue: [String]? = nil
     ) {
         self.seeds = seeds
         self.includeTracksInResponse = includeTracksInResponse
         self.includeWaveModel = includeWaveModel
         self.interactive = interactive
+        self.queue = queue
     }
 }
 
@@ -494,19 +543,96 @@ public struct YMRotorSessionNextTracksRequest: Codable, Sendable {
         self.queue = queue
         self.batchId = batchId
     }
-}
 
-public struct YMRotorSessionFeedbackRequest: Codable, Sendable {
-    public let event: YMRotorFeedbackEvent
-    public let batchId: String?
+    enum CodingKeys: String, CodingKey {
+        case queue
+        case batchId
+    }
 
-    public init(event: YMRotorFeedbackEvent, batchId: String?) {
-        self.event = event
-        self.batchId = batchId
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(queue, forKey: .queue)
+        try container.encodeIfPresent(batchId, forKey: .batchId)
     }
 }
 
-// MARK: - Rotor Feedback Telemetry Models
+public struct YMRotorSessionEvent: Codable, Sendable {
+    public let type: YMRotorEventType
+    public let timestamp: String
+    public let trackId: String?
+    public let totalPlayedSeconds: Double?
+
+    public init(
+        type: YMRotorEventType,
+        timestamp: String,
+        trackId: String? = nil,
+        totalPlayedSeconds: Double? = nil
+    ) {
+        self.type = type
+        self.timestamp = timestamp
+        self.trackId = trackId
+        self.totalPlayedSeconds = totalPlayedSeconds
+    }
+}
+
+public struct YMRotorSessionFeedbackRequest: Codable, Sendable {
+    public let event: YMRotorSessionEvent
+    public let batchId: String?
+    public let from: String?
+
+    public init(event: YMRotorSessionEvent, batchId: String? = nil, from: String? = nil) {
+        self.event = event
+        self.batchId = batchId
+        self.from = from
+    }
+}
+
+public struct YMRotorStationFeedbackRequest: Codable, Sendable {
+    public let type: YMRotorEventType
+    public let timestamp: String
+    public let trackId: String?
+    public let totalPlayedSeconds: Double?
+    public let from: String?
+
+    public init(
+        type: YMRotorEventType,
+        timestamp: String,
+        trackId: String? = nil,
+        totalPlayedSeconds: Double? = nil,
+        from: String? = nil
+    ) {
+        self.type = type
+        self.timestamp = timestamp
+        self.trackId = trackId
+        if let played = totalPlayedSeconds, played > 0 {
+            self.totalPlayedSeconds = played
+        } else {
+            self.totalPlayedSeconds = nil
+        }
+        self.from = from
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case timestamp
+        case trackId
+        case totalPlayedSeconds
+        case from
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encodeIfPresent(trackId, forKey: .trackId)
+        if let totalPlayed = totalPlayedSeconds, totalPlayed > 0 {
+            try container.encode(totalPlayed, forKey: .totalPlayedSeconds)
+        }
+        try container.encodeIfPresent(from, forKey: .from)
+    }
+}
+
+// MARK: - Rotor Feedback Telemetry Models (Compatibility)
 
 public enum YMRotorEventType: String, Codable, Sendable {
     case radioStarted
@@ -602,17 +728,46 @@ public enum YMWaveVibePreset: String, CaseIterable, Identifiable, Sendable {
     public var seedParameter: String? {
         switch self {
         case .defaultWave: return nil
-        case .energetic: return "mood:energize"
+        case .energetic: return "settingMoodEnergy:active"
         case .unfamiliar: return "settingDiversity:discover"
         case .familiar: return "settingDiversity:favorite"
         case .popular: return "settingDiversity:popular"
-        case .calm: return "mood:calm"
-        case .joyful: return "mood:fun"
-        case .sad: return "mood:sad"
-        case .russian: return "language:russian"
-        case .foreign: return "language:not-russian"
+        case .calm: return "settingMoodEnergy:calm"
+        case .joyful: return "settingMoodEnergy:fun"
+        case .sad: return "settingMoodEnergy:sad"
+        case .russian: return "settingLanguage:russian"
+        case .foreign: return "settingLanguage:not-russian"
         case .focus: return "activity:work"
         case .workout: return "activity:sport"
+        }
+    }
+
+    public var v1SettingsPayload: (moodEnergy: String, diversity: String, language: String)? {
+        switch self {
+        case .defaultWave:
+            return nil
+        case .energetic:
+            return ("active", "default", "any")
+        case .calm:
+            return ("calm", "default", "any")
+        case .joyful:
+            return ("fun", "default", "any")
+        case .sad:
+            return ("sad", "default", "any")
+        case .unfamiliar:
+            return ("all", "discover", "any")
+        case .familiar:
+            return ("all", "favorite", "any")
+        case .popular:
+            return ("all", "popular", "any")
+        case .russian:
+            return ("all", "default", "russian")
+        case .foreign:
+            return ("all", "default", "not-russian")
+        case .focus:
+            return ("calm", "default", "any")
+        case .workout:
+            return ("active", "default", "any")
         }
     }
 
@@ -658,17 +813,23 @@ public struct YMWaveContext: Equatable, Sendable {
     public let subtitle: String
     public let seeds: [String]
     public let fallbackStationId: String
+    public let idForFrom: String?
+    public let fallbackTrackSeeds: [String]
 
     public init(
         title: String,
         subtitle: String,
         seeds: [String],
-        fallbackStationId: String = "user:onyourwave"
+        fallbackStationId: String = "user:onyourwave",
+        idForFrom: String? = nil,
+        fallbackTrackSeeds: [String] = []
     ) {
         self.title = title
         self.subtitle = subtitle
         self.seeds = seeds
         self.fallbackStationId = fallbackStationId
+        self.idForFrom = idForFrom
+        self.fallbackTrackSeeds = fallbackTrackSeeds
     }
 
     public static let myWaveDefault = YMWaveContext(
@@ -679,23 +840,27 @@ public struct YMWaveContext: Equatable, Sendable {
     )
 
     public static func forTrack(_ track: YMTrack) -> YMWaveContext {
-        YMWaveContext(
+        let cleanId = track.id.components(separatedBy: ":").first ?? track.id
+        return YMWaveContext(
             title: "Волна по треку: \(track.title)",
             subtitle: "Похожее на \(track.artistsString) — \(track.displayTitle)",
-            seeds: ["track:\(track.id)"],
-            fallbackStationId: "track:\(track.id)"
+            seeds: ["track:\(cleanId)"],
+            fallbackStationId: "track:\(cleanId)"
         )
     }
 
     public static func forPlaylist(_ playlist: YMPlaylist, sampleTrackIds: [String] = []) -> YMWaveContext {
         let primarySeed = "playlist:\(playlist.uid)_\(playlist.kind)"
-        let fallbackSeeds = sampleTrackIds.prefix(5).map { "track:\($0)" }
-        let effectiveSeeds = [primarySeed] + fallbackSeeds
+        let cleanFallbackSeeds = sampleTrackIds.prefix(5).map {
+            let cleanId = $0.components(separatedBy: ":").first ?? $0
+            return "track:\(cleanId)"
+        }
         return YMWaveContext(
             title: "Волна по плейлисту: \(playlist.title)",
             subtitle: "Треки в стиле плейлиста «\(playlist.title)»",
-            seeds: effectiveSeeds,
-            fallbackStationId: "user:onyourwave"
+            seeds: [primarySeed],
+            fallbackStationId: primarySeed,
+            fallbackTrackSeeds: cleanFallbackSeeds
         )
     }
 

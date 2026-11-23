@@ -10,13 +10,24 @@ public final class WindowState {
 
     public var isFullScreen: Bool = false
     public var isSidebarVisible: Bool = true
-    public var windowSize: CGSize = CGSize(width: 900, height: 620)
+    public var windowSize: CGSize = CGSize(width: 900, height: 620) {
+        didSet {
+            let nextCompact = windowSize.width < 720
+            if isCompactWidth != nextCompact {
+                isCompactWidth = nextCompact
+            }
+            let nextMini = windowSize.width < 560
+            if isMiniWidth != nextMini {
+                isMiniWidth = nextMini
+            }
+        }
+    }
 
     /// Узкий режим окна (< 720 pt)
-    public var isCompactWidth: Bool { windowSize.width < 720 }
+    public private(set) var isCompactWidth: Bool = false
 
     /// Сверхкомпактный режим (< 560 pt)
-    public var isMiniWidth: Bool { windowSize.width < 560 }
+    public private(set) var isMiniWidth: Bool = false
 
     /// True when the detail content starts beneath the macOS window traffic lights.
     public var needsTopChromeClearance: Bool { !isFullScreen && !isSidebarVisible }
@@ -25,7 +36,12 @@ public final class WindowState {
     public var topChromeContentPadding: CGFloat { needsTopChromeClearance ? 48 : 20 }
 
     /// Leading inset for top bars ("Назад", "Сейчас играет") to sit cleanly beside traffic lights and `sidebar.left`.
-    public var topToolbarLeadingInset: CGFloat { isSidebarVisible ? 24 : (isFullScreen ? 56 : 124) }
+    public var topToolbarLeadingInset: CGFloat {
+        if !isSidebarVisible {
+            return isFullScreen ? 56 : 124
+        }
+        return isCompactWidth ? 56 : 24
+    }
 
     @ObservationIgnored
     private var observers: [any NSObjectProtocol] = []
@@ -44,9 +60,11 @@ public final class WindowState {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let window = notification.object as? NSWindow
-            Task { @MainActor in
-                guard let self = self, let window = window, self.isValidAppWindow(window) else { return }
+            nonisolated(unsafe) let notif = notification
+            MainActor.assumeIsolated {
+                guard let self,
+                      let window = notif.object as? NSWindow,
+                      self.isValidAppWindow(window) else { return }
                 self.isFullScreen = true
             }
         }
@@ -56,9 +74,11 @@ public final class WindowState {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let window = notification.object as? NSWindow
-            Task { @MainActor in
-                guard let self = self, let window = window, self.isValidAppWindow(window) else { return }
+            nonisolated(unsafe) let notif = notification
+            MainActor.assumeIsolated {
+                guard let self,
+                      let window = notif.object as? NSWindow,
+                      self.isValidAppWindow(window) else { return }
                 self.isFullScreen = false
             }
         }
@@ -68,9 +88,11 @@ public final class WindowState {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let window = notification.object as? NSWindow
-            Task { @MainActor in
-                self?.update(from: window)
+            nonisolated(unsafe) let notif = notification
+            MainActor.assumeIsolated {
+                guard let self,
+                      let window = notif.object as? NSWindow else { return }
+                self.update(from: window)
             }
         }
 
@@ -78,7 +100,7 @@ public final class WindowState {
     }
 
     /// Verifies that the window is the primary application window, not an accessory popup, menu, or tooltip.
-    private func isValidAppWindow(_ window: NSWindow) -> Bool {
+    public func isValidAppWindow(_ window: NSWindow) -> Bool {
         guard !(window is NSPanel) else { return false }
         guard window.sheetParent == nil else { return false }
         guard window.level == .normal else { return false }
@@ -113,6 +135,16 @@ public final class WindowState {
         let frameSize = window.contentView?.bounds.size ?? window.frame.size
         if abs(self.windowSize.width - frameSize.width) > 1 || abs(self.windowSize.height - frameSize.height) > 1 {
             self.windowSize = frameSize
+        }
+
+        let nextCompact = frameSize.width < 720
+        if self.isCompactWidth != nextCompact {
+            self.isCompactWidth = nextCompact
+        }
+
+        let nextMini = frameSize.width < 560
+        if self.isMiniWidth != nextMini {
+            self.isMiniWidth = nextMini
         }
     }
 }

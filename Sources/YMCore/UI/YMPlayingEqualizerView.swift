@@ -100,6 +100,8 @@ private final class CoreAnimationEqualizerNSView: NSView {
 
     private let barLayers: [CALayer] = (0..<4).map { _ in CALayer() }
     private var currentColor: Color = .yellow
+    private var lastAppliedAppearanceName: NSAppearance.Name? = nil
+    private var hasAppliedColor: Bool = false
     private var barWidth: CGFloat = 2.5
     private var barSpacing: CGFloat = 2
     private var maxHeight: CGFloat = 14
@@ -144,6 +146,10 @@ private final class CoreAnimationEqualizerNSView: NSView {
             || self.maxHeight != maxHeight
             || self.minHeight != minHeight
 
+        let colorChanged = !hasAppliedColor
+            || self.currentColor != color
+            || self.lastAppliedAppearanceName != effectiveAppearance.name
+
         self.currentColor = color
         self.barWidth = barWidth
         self.barSpacing = barSpacing
@@ -154,7 +160,9 @@ private final class CoreAnimationEqualizerNSView: NSView {
         if geometryChanged {
             layoutBars()
         }
-        applyBarColors()
+        if colorChanged {
+            applyBarColors()
+        }
         updateAnimationState()
     }
 
@@ -169,12 +177,15 @@ private final class CoreAnimationEqualizerNSView: NSView {
         if let window {
             installObservers(for: window)
         }
-        applyBarColors()
+        if !hasAppliedColor || lastAppliedAppearanceName != effectiveAppearance.name {
+            applyBarColors()
+        }
         updateAnimationState()
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        hasAppliedColor = false
         applyBarColors()
     }
 
@@ -197,6 +208,8 @@ private final class CoreAnimationEqualizerNSView: NSView {
     }
 
     private func applyBarColors() {
+        lastAppliedAppearanceName = effectiveAppearance.name
+        hasAppliedColor = true
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let nsColor = NSColor(self.currentColor)
             let cgColor = nsColor.usingColorSpace(.sRGB)?.cgColor ?? nsColor.cgColor

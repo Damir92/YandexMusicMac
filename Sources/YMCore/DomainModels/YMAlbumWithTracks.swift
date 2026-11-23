@@ -19,6 +19,7 @@ public struct YMAlbumWithTracks: Codable, Sendable, Identifiable {
         case year
         case releaseDate
         case coverUri
+        case ogImage
         case genre
         case trackCount
         case likesCount
@@ -60,12 +61,53 @@ public struct YMAlbumWithTracks: Codable, Sendable, Identifiable {
         self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "Unknown Album"
         self.year = try? container.decodeIfPresent(Int.self, forKey: .year)
         self.releaseDate = try? container.decodeIfPresent(String.self, forKey: .releaseDate)
-        self.coverUri = try? container.decodeIfPresent(String.self, forKey: .coverUri)
+        self.coverUri = (try? container.decodeIfPresent(String.self, forKey: .coverUri))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .ogImage))
         self.genre = try? container.decodeIfPresent(String.self, forKey: .genre)
         self.trackCount = try? container.decodeIfPresent(Int.self, forKey: .trackCount)
         self.likesCount = try? container.decodeIfPresent(Int.self, forKey: .likesCount)
-        self.artists = (try? container.decodeIfPresent([YMArtist].self, forKey: .artists)) ?? []
-        self.volumes = (try? container.decodeIfPresent([[YMTrack]].self, forKey: .volumes)) ?? []
+        self.artists = FlexibleArrayDecoder.decodeLossy(YMArtist.self, from: container, forKey: .artists)
+
+        // Lossy decoding for nested volumes [[YMTrack]]
+        if let direct = try? container.decodeIfPresent([[YMTrack]].self, forKey: .volumes) {
+            self.volumes = direct
+        } else if var volumesContainer = try? container.nestedUnkeyedContainer(forKey: .volumes) {
+            var decodedVolumes: [[YMTrack]] = []
+            while !volumesContainer.isAtEnd {
+                if let directVol = try? volumesContainer.decode([YMTrack].self) {
+                    decodedVolumes.append(directVol)
+                } else if var trackContainer = try? volumesContainer.nestedUnkeyedContainer() {
+                    var volTracks: [YMTrack] = []
+                    while !trackContainer.isAtEnd {
+                        if let track = try? trackContainer.decode(YMTrack.self) {
+                            volTracks.append(track)
+                        } else {
+                            _ = try? trackContainer.decode(LossySkipElement.self)
+                        }
+                    }
+                    decodedVolumes.append(volTracks)
+                } else {
+                    _ = try? volumesContainer.decode(LossySkipElement.self)
+                }
+            }
+            self.volumes = decodedVolumes
+        } else {
+            self.volumes = []
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(year, forKey: .year)
+        try container.encodeIfPresent(releaseDate, forKey: .releaseDate)
+        try container.encodeIfPresent(coverUri, forKey: .coverUri)
+        try container.encodeIfPresent(genre, forKey: .genre)
+        try container.encodeIfPresent(trackCount, forKey: .trackCount)
+        try container.encodeIfPresent(likesCount, forKey: .likesCount)
+        try container.encode(artists, forKey: .artists)
+        try container.encode(volumes, forKey: .volumes)
     }
 
     /// Flattened list of tracks from all volumes/discs

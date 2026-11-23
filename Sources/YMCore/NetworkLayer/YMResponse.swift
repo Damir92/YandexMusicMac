@@ -6,11 +6,40 @@ public struct YMResponse<T: Decodable & Sendable>: Decodable, Sendable {
     public let invocationInfo: YMInvocationInfo?
     public let result: T?
     public let error: YMAPIErrorPayload?
+    public let errorDescription: String?
 
-    public init(invocationInfo: YMInvocationInfo? = nil, result: T? = nil, error: YMAPIErrorPayload? = nil) {
+    enum CodingKeys: String, CodingKey {
+        case invocationInfo
+        case result
+        case error
+        case errorDescription
+        case errorDescriptionKebab = "error-description"
+    }
+
+    public init(
+        invocationInfo: YMInvocationInfo? = nil,
+        result: T? = nil,
+        error: YMAPIErrorPayload? = nil,
+        errorDescription: String? = nil
+    ) {
         self.invocationInfo = invocationInfo
         self.result = result
         self.error = error
+        self.errorDescription = errorDescription
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.invocationInfo = try? container.decodeIfPresent(YMInvocationInfo.self, forKey: .invocationInfo)
+        self.result = try? container.decodeIfPresent(T.self, forKey: .result)
+        self.error = try? container.decodeIfPresent(YMAPIErrorPayload.self, forKey: .error)
+        if let desc = try? container.decodeIfPresent(String.self, forKey: .errorDescription) {
+            self.errorDescription = desc
+        } else if let desc = try? container.decodeIfPresent(String.self, forKey: .errorDescriptionKebab) {
+            self.errorDescription = desc
+        } else {
+            self.errorDescription = nil
+        }
     }
 
     /// Automatically unwraps the result or throws a typed `YMAPIError`.
@@ -18,7 +47,13 @@ public struct YMResponse<T: Decodable & Sendable>: Decodable, Sendable {
         if let error = error {
             throw YMAPIError.serverError(
                 name: error.name ?? "unknown_error",
-                message: error.message ?? "No error message provided."
+                message: error.message ?? errorDescription ?? "No error message provided."
+            )
+        }
+        if let errorDescription = errorDescription {
+            throw YMAPIError.serverError(
+                name: "unknown_error",
+                message: errorDescription
             )
         }
         guard let result = result else {

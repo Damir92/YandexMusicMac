@@ -14,6 +14,15 @@ public final class NowPlayingController {
 
     public init() {}
 
+    private nonisolated static func stablePersistentID(for id: String) -> UInt64 {
+        var hash: UInt64 = 14695981039346656037
+        for byte in id.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return hash
+    }
+
     /// Updates Now Playing metadata on track change or initial playback, including queue position and collection metadata.
     public func updateTrack(
         _ track: YMTrack,
@@ -42,7 +51,7 @@ public final class NowPlayingController {
         info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         info[MPNowPlayingInfoPropertyIsLiveStream] = false
         info[MPNowPlayingInfoPropertyExternalContentIdentifier] = track.id
-        info[MPMediaItemPropertyPersistentID] = NSNumber(value: UInt64(bitPattern: Int64(track.id.hashValue)))
+        info[MPMediaItemPropertyPersistentID] = NSNumber(value: Self.stablePersistentID(for: track.id))
 
         if let count = queueCount, count > 0 {
             info[MPNowPlayingInfoPropertyPlaybackQueueCount] = count
@@ -57,22 +66,29 @@ public final class NowPlayingController {
 
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+
+        currentArtworkTask?.cancel()
+        currentArtworkTask = nil
+        let coverUri = track.effectiveCoverUri
+        if let coverUri = coverUri, !coverUri.isEmpty {
+            if let cached = ImagePipeline.shared.cachedImage(for: coverUri, size: .artwork),
+               let cgImage = cached.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                info[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: cgImage)
+            } else {
+                currentArtworkTask = Task { [weak self] in
+                    guard let image = await ImagePipeline.shared.image(for: coverUri, size: .artwork) else {
+                        return
+                    }
+                    guard !Task.isCancelled, let self = self, self.currentTrackId == track.id else { return }
+                    self.setArtwork(image: image)
+                }
+            }
+        }
 
         let center = MPNowPlayingInfoCenter.default()
         center.nowPlayingInfo = info
         center.playbackState = isPlaying ? .playing : .paused
-
-        // Fetch artwork asynchronously and downsample to 300x300 via shared ImagePipeline
-        currentArtworkTask?.cancel()
-        if let coverUri = track.effectiveCoverUri, !coverUri.isEmpty {
-            currentArtworkTask = Task { [weak self] in
-                guard let image = await ImagePipeline.shared.image(for: coverUri, size: .artwork) else {
-                    return
-                }
-                guard !Task.isCancelled, let self = self, self.currentTrackId == track.id else { return }
-                self.setArtwork(image: image)
-            }
-        }
     }
 
     /// Updates queue indices and optional collection identifier in `nowPlayingInfo` without reloading artwork.
@@ -123,31 +139,34 @@ public final class NowPlayingController {
         updatePlaybackPosition(seconds: seconds, isPlaying: isPlaying)
     }
 
+    /// Updates duration in nowPlayingInfo if significantly changed
+    public func updateDuration(_ duration: Double) {
+        guard duration.isFinite && duration > 0 else { return }
+        let center = MPNowPlayingInfoCenter.default()
+        guard var currentInfo = center.nowPlayingInfo else { return }
+        let existingDuration = currentInfo[MPMediaItemPropertyPlaybackDuration] as? Double ?? 0
+        if abs(existingDuration - duration) >= 0.5 {
+            currentInfo[MPMediaItemPropertyPlaybackDuration] = duration
+            center.nowPlayingInfo = currentInfo
+        }
+    }
+
     /// Sets downsampled artwork into the active nowPlayingInfo dictionary
     private func setArtwork(image: NSImage) {
         guard var currentInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo else { return }
-        // Snapshot to immutable `Data` so the artwork closure never captures actor state
-        if let imageData = image.tiffRepresentation {
-            currentInfo[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: imageData)
+        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            currentInfo[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: cgImage)
         } else {
             currentInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = currentInfo
     }
 
-    /// Builds `MPMediaItemArtwork` outside of the main actor.
-    ///
-    /// MediaPlayer calls the artwork request handler on its own serial queue
-    /// (`*/accessQueue`) while converting `nowPlayingInfo` into a MediaRemote dictionary.
-    /// A handler created inside a `@MainActor` method inherits main-actor isolation, so the
-    /// call trips Swift's executor check (`dispatch_assert_queue_fail` / EXC_BREAKPOINT)
-    /// and the app crashes right after playback starts. Keeping the factory `nonisolated`
-    /// and passing only `Sendable` `Data` makes the handler safe from any queue.
-    private nonisolated static func makeArtwork(from imageData: Data) -> MPMediaItemArtwork {
+    /// Builds `MPMediaItemArtwork` outside of the main actor directly from Sendable `CGImage`.
+    private nonisolated static func makeArtwork(from cgImage: CGImage) -> MPMediaItemArtwork {
         let bounds = CGSize(width: 300, height: 300)
         return MPMediaItemArtwork(boundsSize: bounds) { @Sendable _ in
-            // Decode lazily on whichever queue MediaPlayer asks for the image
-            NSImage(data: imageData) ?? NSImage(size: bounds)
+            NSImage(cgImage: cgImage, size: bounds)
         }
     }
 

@@ -4,6 +4,7 @@ import SwiftUI
 /// artist carousels, and high-performance tracklist tables.
 public struct SearchView: View {
     @UIState private var searchText = ""
+    @UIState private var activeSearchQuery = ""
     @UIState private var searchResults: [YMTrack] = []
     @UIState private var searchArtists: [YMArtist] = []
     @UIState private var searchAlbums: [YMAlbum] = []
@@ -14,6 +15,8 @@ public struct SearchView: View {
     @UIState private var canLoadMore = true
     @UIState private var isLoadingMore = false
     @UIState private var searchTask: Task<Void, Never>? = nil
+    @UIState private var loadMoreTask: Task<Void, Never>? = nil
+    @FocusState private var isSearchFieldFocused: Bool
 
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var coordinator = NavigationCoordinator.shared
@@ -27,6 +30,8 @@ public struct SearchView: View {
     public init() {}
 
     public var body: some View {
+        let hasAnyResults = !searchResults.isEmpty || !searchArtists.isEmpty || !searchAlbums.isEmpty
+
         VStack(spacing: 0) {
             // Search Input Header
             HStack(spacing: 12) {
@@ -37,12 +42,20 @@ public struct SearchView: View {
                 TextField("Треки, артисты, альбомы...", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
+                    .focused($isSearchFieldFocused)
                     .onSubmit {
                         performSearch()
                     }
 
                 if !searchText.isEmpty {
                     Button {
+                        searchTask?.cancel()
+                        searchTask = nil
+                        loadMoreTask?.cancel()
+                        loadMoreTask = nil
+                        isSearching = false
+                        isLoadingMore = false
+                        activeSearchQuery = ""
                         searchText = ""
                         searchResults = []
                         searchArtists = []
@@ -87,7 +100,7 @@ public struct SearchView: View {
             }
 
             // Content Area
-            if isSearching && searchResults.isEmpty {
+            if isSearching && !hasAnyResults {
                 VStack(spacing: 14) {
                     ProgressView()
                         .scaleEffect(1.2)
@@ -96,7 +109,7 @@ public struct SearchView: View {
                         .foregroundStyle(YMTheme.fg40)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if searchResults.isEmpty {
+            } else if !hasAnyResults {
                 // Empty state or Quick Genres explore
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 20) {
@@ -165,7 +178,7 @@ public struct SearchView: View {
                                     .padding(.horizontal, 24)
 
                                 ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 16) {
+                                    LazyHStack(spacing: 16) {
                                         ForEach(searchArtists) { artist in
                                             YMArtistCard(artist: artist) {
                                                 coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
@@ -188,7 +201,7 @@ public struct SearchView: View {
                                     .padding(.horizontal, 24)
 
                                 ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 16) {
+                                    LazyHStack(spacing: 16) {
                                         ForEach(searchAlbums) { album in
                                             YMAlbumCard(
                                                 album: album,
@@ -221,58 +234,70 @@ public struct SearchView: View {
                         }
 
                         // Tracks Section
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Треки")
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundStyle(YMTheme.fg)
-                                .padding(.horizontal, 24)
+                        if !searchResults.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Треки")
+                                    .font(.system(size: 16, weight: .bold))
+                                    .foregroundStyle(YMTheme.fg)
+                                    .padding(.horizontal, 24)
 
-                            TrackTableView(
-                                tracks: searchResults,
-                                onPlayTrack: { track in
-                                    audioEngine.isWaveMode = false
-                                    if let idx = searchResults.firstIndex(where: { $0.id == track.id }) {
-                                        audioEngine.setQueue(searchResults, startingAt: idx)
-                                        let capturedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        if !capturedQuery.isEmpty && canLoadMore {
-                                            var nextPage = currentPage + 1
-                                            let client = networkClient
-                                            audioEngine.attachQueueContinuation { existingIds in
-                                                guard let pageTracks = try? await client.searchTracks(query: capturedQuery, page: nextPage),
-                                                      !pageTracks.isEmpty else {
-                                                    return []
+                                TrackTableView(
+                                    tracks: searchResults,
+                                    onPlayTrack: { track in
+                                        audioEngine.isWaveMode = false
+                                        if let idx = searchResults.firstIndex(where: { $0.id == track.id }) {
+                                            audioEngine.setQueue(searchResults, startingAt: idx)
+                                            let capturedQuery = activeSearchQuery
+                                            if !capturedQuery.isEmpty && canLoadMore {
+                                                var nextPage = currentPage + 1
+                                                let client = networkClient
+                                                audioEngine.attachQueueContinuation { existingIds in
+                                                    guard let pageTracks = try? await client.searchTracks(query: capturedQuery, page: nextPage),
+                                                          !pageTracks.isEmpty else {
+                                                        return []
+                                                    }
+                                                    nextPage += 1
+                                                    return pageTracks.filter { !existingIds.contains($0.id) }
                                                 }
-                                                nextPage += 1
-                                                return pageTracks.filter { !existingIds.contains($0.id) }
                                             }
                                         }
+                                    },
+                                    onLoadMore: {
+                                        Task {
+                                            await loadMoreSearchResults()
+                                        }
                                     }
-                                },
-                                onLoadMore: {
-                                    Task {
-                                        await loadMoreSearchResults()
-                                    }
-                                }
-                            )
-                            .padding(.horizontal, 16)
+                                )
+                                .padding(.horizontal, 16)
 
-                            if isLoadingMore {
-                                HStack {
-                                    Spacer()
-                                    ProgressView()
-                                        .scaleEffect(0.8)
-                                    Spacer()
+                                if isLoadingMore {
+                                    HStack {
+                                        Spacer()
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                        Spacer()
+                                    }
+                                    .padding(.vertical, 8)
                                 }
-                                .padding(.vertical, 8)
                             }
                         }
                     }
                     .padding(.top, 14)
                     .padding(.bottom, 60)
                 }
+                .ymTrackHoverScroll()
             }
         }
         .ymScreenBackground()
+        .onAppear {
+            isSearchFieldFocused = true
+        }
+        .onDisappear {
+            searchTask?.cancel()
+            searchTask = nil
+            loadMoreTask?.cancel()
+            loadMoreTask = nil
+        }
     }
 
     private func performSearch() {
@@ -280,16 +305,19 @@ public struct SearchView: View {
         guard !trimmed.isEmpty else { return }
 
         searchTask?.cancel()
+        loadMoreTask?.cancel()
+        isLoadingMore = false
         isSearching = true
         hasSearched = true
         errorMessage = nil
         currentPage = 0
         canLoadMore = true
+        activeSearchQuery = trimmed
 
         searchTask = Task {
             do {
                 let fullResult = try await networkClient.searchAll(query: trimmed, page: 0)
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.activeSearchQuery == trimmed else { return }
                 await MainActor.run {
                     self.searchResults = fullResult.tracks
                     self.searchArtists = fullResult.artists
@@ -300,7 +328,7 @@ public struct SearchView: View {
                     }
                 }
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.activeSearchQuery == trimmed else { return }
                 await MainActor.run {
                     self.errorMessage = error.localizedDescription
                     self.isSearching = false
@@ -311,32 +339,37 @@ public struct SearchView: View {
 
     private func loadMoreSearchResults() async {
         guard canLoadMore, !isLoadingMore, !isSearching else { return }
-        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        let query = activeSearchQuery
+        guard !query.isEmpty else { return }
 
         isLoadingMore = true
         let nextPage = currentPage + 1
 
-        do {
-            let nextBatch = try await networkClient.searchTracks(query: trimmed, page: nextPage)
-            await MainActor.run {
-                if nextBatch.isEmpty {
-                    self.canLoadMore = false
-                } else {
-                    let existingIds = Set(self.searchResults.map(\.id))
-                    let uniqueNew = nextBatch.filter { !existingIds.contains($0.id) }
-                    self.searchResults.append(contentsOf: uniqueNew)
-                    self.currentPage = nextPage
-                    if nextBatch.count < 20 {
+        loadMoreTask = Task {
+            do {
+                let nextBatch = try await networkClient.searchTracks(query: query, page: nextPage)
+                guard !Task.isCancelled, self.activeSearchQuery == query else { return }
+                await MainActor.run {
+                    if nextBatch.isEmpty {
                         self.canLoadMore = false
+                    } else {
+                        let existingIds = Set(self.searchResults.map(\.id))
+                        let uniqueNew = nextBatch.filter { !existingIds.contains($0.id) }
+                        self.searchResults.append(contentsOf: uniqueNew)
+                        self.currentPage = nextPage
+                        if nextBatch.count < 20 {
+                            self.canLoadMore = false
+                        }
                     }
+                    self.isLoadingMore = false
                 }
-                self.isLoadingMore = false
-            }
-        } catch {
-            await MainActor.run {
-                self.isLoadingMore = false
+            } catch {
+                guard !Task.isCancelled, self.activeSearchQuery == query else { return }
+                await MainActor.run {
+                    self.isLoadingMore = false
+                }
             }
         }
+        await loadMoreTask?.value
     }
 }

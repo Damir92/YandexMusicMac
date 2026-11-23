@@ -22,17 +22,22 @@ public struct YMTrackShort: Codable, Sendable, Identifiable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedTrack = try? container.decodeIfPresent(YMTrack.self, forKey: .track)
         if let idString = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .id) {
             self.id = idString
-        } else if let nestedTrack = try? container.decodeIfPresent(YMTrack.self, forKey: .track) {
+        } else if let nestedTrack = decodedTrack {
             self.id = nestedTrack.id
         } else {
             self.id = UUID().uuidString
         }
 
-        self.albumId = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .albumId)
+        if let explicitAlbumId = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .albumId) {
+            self.albumId = explicitAlbumId
+        } else {
+            self.albumId = decodedTrack?.primaryAlbumId
+        }
         self.timestamp = try? container.decodeIfPresent(String.self, forKey: .timestamp)
-        self.track = try? container.decodeIfPresent(YMTrack.self, forKey: .track)
+        self.track = decodedTrack
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -127,7 +132,13 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
             self.uid = "0"
         }
 
-        self.kind = (try? container.decodeIfPresent(Int.self, forKey: .kind)) ?? 0
+        if let intKind = try? container.decodeIfPresent(Int.self, forKey: .kind) {
+            self.kind = intKind
+        } else if let strKind = try? container.decodeIfPresent(String.self, forKey: .kind), let parsed = Int(strKind) {
+            self.kind = parsed
+        } else {
+            self.kind = 0
+        }
         self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "Плейлист"
 
         if let descStr = try? container.decodeIfPresent(String.self, forKey: .description), !descStr.isEmpty {
@@ -146,21 +157,31 @@ public struct YMPlaylist: Codable, Sendable, Identifiable {
         self.trackCount = try? container.decodeIfPresent(Int.self, forKey: .trackCount)
         self.ogImage = try? container.decodeIfPresent(String.self, forKey: .ogImage)
 
-        // Cover resolution with fallback to itemsUri.first and ogImage
-        var resolvedCover: String? = nil
+        // Cover resolution with fallback to itemsUri.first, coverUri, ogImage, and dir last
+        var coverUriFromContainer: String? = nil
+        var coverItemsUriFirst: String? = nil
+        var coverDir: String? = nil
+
         if let coverContainer = try? container.nestedContainer(keyedBy: CoverKeys.self, forKey: .cover) {
-            resolvedCover = (try? coverContainer.decodeIfPresent(String.self, forKey: .uri))
-                ?? (try? coverContainer.decodeIfPresent(String.self, forKey: .dir))
-                ?? (try? coverContainer.decodeIfPresent([String].self, forKey: .itemsUri))?.first
+            coverUriFromContainer = try? coverContainer.decodeIfPresent(String.self, forKey: .uri)
+            coverItemsUriFirst = (try? coverContainer.decodeIfPresent([String].self, forKey: .itemsUri))?.first
+            coverDir = try? coverContainer.decodeIfPresent(String.self, forKey: .dir)
         }
 
-        if resolvedCover == nil {
-            resolvedCover = (try? container.decodeIfPresent(String.self, forKey: .coverUri))
-                ?? (try? container.decodeIfPresent(String.self, forKey: .ogImage))
+        let fallbackCoverUri = try? container.decodeIfPresent(String.self, forKey: .coverUri)
+        let ogImageVal = try? container.decodeIfPresent(String.self, forKey: .ogImage)
+
+        var resolvedCover: String? = coverUriFromContainer ?? coverItemsUriFirst ?? fallbackCoverUri ?? ogImageVal
+        if resolvedCover == nil, let dir = coverDir, YMCoverURLBuilder.buildURL(from: dir) != nil {
+            resolvedCover = dir
         }
 
         self.coverUri = resolvedCover
-        self.tracks = try? container.decodeIfPresent([YMTrackShort].self, forKey: .tracks)
+        if container.contains(.tracks) && (try? container.decodeNil(forKey: .tracks)) == false {
+            self.tracks = FlexibleArrayDecoder.decodeLossy(YMTrackShort.self, from: container, forKey: .tracks)
+        } else {
+            self.tracks = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {

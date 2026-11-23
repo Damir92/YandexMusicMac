@@ -47,8 +47,41 @@ public enum YMEqualizerPreset: String, CaseIterable, Identifiable, Codable, Send
 }
 
 /// Потокобезопасный мост для чтения параметров эквалайзера из real-time потока CoreAudio без блокировки MainActor.
-public final class EqualizerParameterBridge: @unchecked Sendable {
+public final class EqualizerParameterBridge: Sendable {
     public static let shared = EqualizerParameterBridge()
+
+    public struct RealtimeSnapshot: Sendable {
+        public var isEnabled: Bool = false
+        public var isFlatAndNeutral: Bool = true
+        public var preampDb: Float = 0.0
+        public var b0: Float = 0.0
+        public var b1: Float = 0.0
+        public var b2: Float = 0.0
+        public var b3: Float = 0.0
+        public var b4: Float = 0.0
+        public var b5: Float = 0.0
+        public var b6: Float = 0.0
+        public var b7: Float = 0.0
+        public var b8: Float = 0.0
+        public var b9: Float = 0.0
+        public var generation: UInt64 = 1
+
+        public func bandGain(at index: Int) -> Float {
+            switch index {
+            case 0: return b0
+            case 1: return b1
+            case 2: return b2
+            case 3: return b3
+            case 4: return b4
+            case 5: return b5
+            case 6: return b6
+            case 7: return b7
+            case 8: return b8
+            case 9: return b9
+            default: return 0.0
+            }
+        }
+    }
 
     public struct Snapshot: Sendable {
         public let isEnabled: Bool
@@ -57,55 +90,55 @@ public final class EqualizerParameterBridge: @unchecked Sendable {
         public let generation: UInt64
     }
 
-    private var lock = os_unfair_lock_s()
-    private var isEnabled: Bool = false
-    private var preampDb: Float = 0.0
-    private var bandGains: [Float] = Array(repeating: 0.0, count: 10)
-    private var generation: UInt64 = 1
+    private let stateLock = OSAllocatedUnfairLock(initialState: RealtimeSnapshot())
 
     public init() {}
 
     public func update(isEnabled: Bool, preampDb: Float, bandGains: [Float]) {
-        os_unfair_lock_lock(&lock)
-        self.isEnabled = isEnabled
-        self.preampDb = preampDb
-        self.bandGains = bandGains
-        self.generation &+= 1
-        os_unfair_lock_unlock(&lock)
+        let g: (Int) -> Float = { idx in idx < bandGains.count ? bandGains[idx] : 0.0 }
+        let b0 = g(0), b1 = g(1), b2 = g(2), b3 = g(3), b4 = g(4)
+        let b5 = g(5), b6 = g(6), b7 = g(7), b8 = g(8), b9 = g(9)
+        let flat = abs(preampDb) < 0.001
+            && abs(b0) < 0.001 && abs(b1) < 0.001 && abs(b2) < 0.001 && abs(b3) < 0.001 && abs(b4) < 0.001
+            && abs(b5) < 0.001 && abs(b6) < 0.001 && abs(b7) < 0.001 && abs(b8) < 0.001 && abs(b9) < 0.001
+
+        stateLock.withLock { state in
+            state.isEnabled = isEnabled
+            state.isFlatAndNeutral = flat
+            state.preampDb = preampDb
+            state.b0 = b0; state.b1 = b1; state.b2 = b2; state.b3 = b3; state.b4 = b4
+            state.b5 = b5; state.b6 = b6; state.b7 = b7; state.b8 = b8; state.b9 = b9
+            state.generation &+= 1
+        }
+    }
+
+    /// Non-blocking read for CoreAudio real-time thread (zero heap allocations, zero ARC).
+    /// Returns nil only if main thread is mid-write; caller keeps using cached snapshot for this buffer.
+    @inline(__always)
+    public func tryReadRealtimeSnapshot() -> RealtimeSnapshot? {
+        stateLock.withLockIfAvailable { $0 }
     }
 
     public func currentGeneration() -> UInt64 {
-        os_unfair_lock_lock(&lock)
-        let gen = self.generation
-        os_unfair_lock_unlock(&lock)
-        return gen
+        stateLock.withLock { $0.generation }
     }
 
     public func currentIsEnabled() -> Bool {
-        os_unfair_lock_lock(&lock)
-        let enabled = self.isEnabled
-        os_unfair_lock_unlock(&lock)
-        return enabled
+        stateLock.withLock { $0.isEnabled }
     }
 
     public func isFlatAndNeutral() -> Bool {
-        os_unfair_lock_lock(&lock)
-        let isZeroPreamp = abs(self.preampDb) < 0.001
-        let isZeroBands = self.bandGains.allSatisfy { abs($0) < 0.001 }
-        os_unfair_lock_unlock(&lock)
-        return isZeroPreamp && isZeroBands
+        stateLock.withLock { $0.isFlatAndNeutral }
     }
 
     public func readSnapshot() -> Snapshot {
-        os_unfair_lock_lock(&lock)
-        let snap = Snapshot(
-            isEnabled: self.isEnabled,
-            preampDb: self.preampDb,
-            bandGains: self.bandGains,
-            generation: self.generation
+        let rt = stateLock.withLock { $0 }
+        return Snapshot(
+            isEnabled: rt.isEnabled,
+            preampDb: rt.preampDb,
+            bandGains: [rt.b0, rt.b1, rt.b2, rt.b3, rt.b4, rt.b5, rt.b6, rt.b7, rt.b8, rt.b9],
+            generation: rt.generation
         )
-        os_unfair_lock_unlock(&lock)
-        return snap
     }
 }
 
@@ -125,6 +158,9 @@ public final class EqualizerSettings {
     private let gainsKey = "ym_eq_band_gains"
     private let preampKey = "ym_eq_preamp_db"
 
+    @ObservationIgnored
+    private var persistTask: Task<Void, Never>?
+
     public var isEnabled: Bool {
         didSet {
             UserDefaults.standard.set(isEnabled, forKey: enabledKey)
@@ -141,15 +177,25 @@ public final class EqualizerSettings {
 
     public var bandGains: [Float] {
         didSet {
-            UserDefaults.standard.set(bandGains, forKey: gainsKey)
             syncBridge()
+            schedulePersistence()
         }
     }
 
     public var preampDb: Float {
         didSet {
-            UserDefaults.standard.set(preampDb, forKey: preampKey)
             syncBridge()
+            schedulePersistence()
+        }
+    }
+
+    private func schedulePersistence() {
+        persistTask?.cancel()
+        persistTask = Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            UserDefaults.standard.set(self.bandGains, forKey: self.gainsKey)
+            UserDefaults.standard.set(self.preampDb, forKey: self.preampKey)
         }
     }
 

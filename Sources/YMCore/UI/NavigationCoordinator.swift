@@ -28,8 +28,9 @@ public enum YMLyricsPosition: String, CaseIterable, Identifiable, Sendable {
 }
 
 /// Centralized app navigation coordinator managing deep links, detail views, lyrics and sub-flows.
+@MainActor
 @Observable
-public final class NavigationCoordinator: @unchecked Sendable {
+public final class NavigationCoordinator {
     public static let shared = NavigationCoordinator()
 
     public var path: [AppRoute] = []

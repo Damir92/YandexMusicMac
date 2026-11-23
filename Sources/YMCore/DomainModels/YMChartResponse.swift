@@ -38,7 +38,7 @@ public struct YMChartBlock: Codable, Sendable {
         self.id = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .id)
         self.title = try? container.decodeIfPresent(String.self, forKey: .title)
         self.description = try? container.decodeIfPresent(String.self, forKey: .description)
-        self.tracks = (try? container.decodeIfPresent([YMChartItem].self, forKey: .tracks)) ?? []
+        self.tracks = FlexibleArrayDecoder.decodeLossy(YMChartItem.self, from: container, forKey: .tracks)
     }
 }
 
@@ -63,7 +63,12 @@ public struct YMChartItem: Codable, Sendable, Identifiable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let decodedId = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .id)
         let decodedTrack = try? container.decodeIfPresent(YMTrack.self, forKey: .track)
-        self.id = decodedId ?? decodedTrack?.id ?? UUID().uuidString
+        guard let resolvedId = decodedId ?? decodedTrack?.id else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "YMChartItem requires id or track")
+            )
+        }
+        self.id = resolvedId
         self.track = decodedTrack
         self.chart = try? container.decodeIfPresent(YMChartPosition.self, forKey: .chart)
     }
@@ -87,6 +92,20 @@ public struct YMChartPosition: Codable, Sendable {
         self.progress = progress
         self.shift = shift
         self.listeners = listeners
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let intVal = try? container.decodeIfPresent(Int.self, forKey: .position) {
+            self.position = intVal
+        } else if let strVal = try? container.decodeIfPresent(String.self, forKey: .position), let parsed = Int(strVal) {
+            self.position = parsed
+        } else {
+            self.position = 0
+        }
+        self.progress = try? container.decodeIfPresent(String.self, forKey: .progress)
+        self.shift = try? container.decodeIfPresent(Int.self, forKey: .shift)
+        self.listeners = try? container.decodeIfPresent(Int.self, forKey: .listeners)
     }
 
     public var progressSymbol: String {

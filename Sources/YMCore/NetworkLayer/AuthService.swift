@@ -16,6 +16,10 @@ public final class AuthService {
     private let keychain: KeychainManager
     private let networkClient: YMNetworkClient
 
+    @ObservationIgnored private var sessionGeneration: UInt64 = 0
+    @ObservationIgnored private var validationTask: Task<Void, Never>?
+    @ObservationIgnored private var signOutTask: Task<Void, Never>?
+
     /// Official Yandex Music OAuth Client ID
     public static let oauthClientID = "23cabbbdc6cd418abb4b39c32c41195d"
 
@@ -27,8 +31,9 @@ public final class AuthService {
         self.networkClient = networkClient
         if let savedToken = keychain.getToken(), !savedToken.isEmpty {
             self.isAuthenticated = true
-            Task {
-                await self.validateSavedSession()
+            let gen = self.sessionGeneration
+            self.validationTask = Task { [weak self] in
+                await self?.validateSavedSession(expectedGeneration: gen)
             }
         }
     }
@@ -36,8 +41,13 @@ public final class AuthService {
     // MARK: - Token Parsing, Sanitization & Extraction Utility
 
     /// Robustly extracts and sanitizes access_token from raw token string, full redirect URL, or fragment.
-    public static func extractToken(from rawInput: String) -> String {
-        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+    public nonisolated static func extractToken(from rawInput: String) -> String {
+        var trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("oauth ") {
+            trimmed = String(trimmed.dropFirst("oauth ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if trimmed.lowercased().hasPrefix("bearer ") {
+            trimmed = String(trimmed.dropFirst("bearer ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         guard !trimmed.isEmpty else { return "" }
 
         var candidate = ""
@@ -106,16 +116,28 @@ public final class AuthService {
     // MARK: - Token Validation & Keychain Persistence
 
     public func validateAndSaveToken(_ token: String) async {
+        validationTask?.cancel()
+        validationTask = nil
+        signOutTask?.cancel()
+        signOutTask = nil
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
+
         self.isAuthenticating = true
         self.errorMessage = nil
 
         // 1. Set token in network client temporarily to validate BEFORE saving to Keychain
         await networkClient.setToken(token)
 
+        guard !Task.isCancelled, self.sessionGeneration == generation else { return }
+
         // 2. Validate token via GET https://api.music.yandex.net/account/status
         do {
             let status = try await networkClient.getAccountStatus()
-            guard status.userId != nil || status.account?.login != nil else {
+            guard !Task.isCancelled, self.sessionGeneration == generation else { return }
+
+            guard status.account?.registered != false,
+                  (status.userId != nil || status.account?.login != nil) else {
                 throw YMAPIError.unauthorized
             }
 
@@ -131,47 +153,85 @@ public final class AuthService {
                 try? await LikesService.shared.syncLikes(uid: uid)
             }
 
+            guard !Task.isCancelled, self.sessionGeneration == generation else { return }
+
             self.currentUser = status
             self.isAuthenticated = true
             self.isAuthenticating = false
+            AudioPlayerEngine.shared.checkSubscriptionEligibility()
         } catch {
+            guard !Task.isCancelled, self.sessionGeneration == generation else { return }
+
             // Rollback token in network client if validation failed
             let previousValidToken = keychain.getToken()
-            await networkClient.setToken(previousValidToken)
+            if self.sessionGeneration == generation {
+                await networkClient.setToken(previousValidToken)
+            }
             self.isAuthenticating = false
             self.errorMessage = "Ошибка проверки токена: \(error.localizedDescription)"
         }
     }
 
     public func validateSavedSession() async {
+        validationTask?.cancel()
+        sessionGeneration &+= 1
+        let gen = sessionGeneration
+        await validateSavedSession(expectedGeneration: gen)
+    }
+
+    private func validateSavedSession(expectedGeneration: UInt64) async {
         guard let token = keychain.getToken(), !token.isEmpty else {
+            guard !Task.isCancelled, self.sessionGeneration == expectedGeneration else { return }
             self.isAuthenticated = false
             return
         }
 
         await networkClient.setToken(token)
 
+        guard !Task.isCancelled, self.sessionGeneration == expectedGeneration else { return }
+
         do {
             let status = try await networkClient.getAccountStatus()
+            guard !Task.isCancelled, self.sessionGeneration == expectedGeneration else { return }
+
+            guard status.account?.registered != false,
+                  (status.userId != nil || status.account?.login != nil) else {
+                self.signOut()
+                return
+            }
+
             self.currentUser = status
             self.isAuthenticated = true
+            AudioPlayerEngine.shared.checkSubscriptionEligibility()
+
             if let uid = status.userId {
                 try? keychain.saveUserId(uid)
                 try? await LikesService.shared.syncLikes(uid: uid)
             }
         } catch let apiError as YMAPIError {
+            guard !Task.isCancelled, self.sessionGeneration == expectedGeneration else { return }
             if case .unauthorized = apiError {
                 print("[AuthService] Saved token is unauthorized (401). Signing out.")
-                self.signOut()
+                if self.sessionGeneration == expectedGeneration {
+                    self.signOut()
+                }
             } else {
                 print("[AuthService] Saved session network warning (offline?): \(apiError)")
             }
         } catch {
+            guard !Task.isCancelled, self.sessionGeneration == expectedGeneration else { return }
             print("[AuthService] Saved session validation error: \(error)")
         }
     }
 
     public func signOut() {
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
+
+        validationTask?.cancel()
+        validationTask = nil
+        signOutTask?.cancel()
+
         // Останавливаем воспроизведение и очищаем системный плеер
         AudioPlayerEngine.shared.stopAndClear()
         NowPlayingController.shared.clearNowPlaying()
@@ -179,11 +239,19 @@ public final class AuthService {
         PlaylistsService.shared.resetAll()
 
         try? keychain.clearAll()
-        Task {
+
+        signOutTask = Task { [weak self, networkClient] in
             await RotorService.shared.resetSession()
-            await networkClient.setToken(nil)
-            await networkClient.clearCache()
+            guard let self = self else { return }
+            let stillMatches = await MainActor.run {
+                self.sessionGeneration == generation
+            }
+            if stillMatches {
+                await networkClient.setToken(nil)
+                await networkClient.clearCache()
+            }
         }
+
         self.currentUser = nil
         self.errorMessage = nil
         self.isAuthenticated = false

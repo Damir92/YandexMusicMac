@@ -35,7 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// Вызывается macOS при клике на иконку приложения в Dock
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
+        if !flag || mainWindow?.isVisible == false {
             showMainWindow()
         }
         return true
@@ -83,27 +83,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func configureMainWindowIfNeeded() {
         for window in NSApp.windows where !(window is NSPanel) {
             window.tabbingMode = .disallowed
-            // Игнорируем вспомогательное окно Settings (Cmd + ,)
-            if window.identifier?.rawValue.contains("Settings") == true || window.title.contains("Settings") || window.title.contains("Настройки") {
-                continue
-            }
+            guard WindowState.shared.isValidAppWindow(window) else { continue }
             if mainWindow == nil {
                 mainWindow = window
             }
             guard window === mainWindow else { continue }
-
             if window.delegate !== self {
                 window.delegate = self
             }
+            window.styleMask.insert([.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView])
             window.title = ""
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
             window.minSize = NSSize(width: 440, height: 320)
             window.toolbar = nil
-            // Не перетаскиваем окно за произвольную точку: AppKit перехватывает mouseDown раньше SwiftUI,
-            // из-за чего ломались кастомные ползунки (громкость, прогресс, crossfade) и поля ввода.
-            // Окно перетаскивается через явные зоны YMWindowDragHandle в верхней панели и нижнем баре.
             window.isMovableByWindowBackground = false
+            for buttonType: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                window.standardWindowButton(buttonType)?.isHidden = false
+            }
             YMThemeManager.shared.updateWindowAppearance()
             WindowState.shared.update(from: window)
         }
@@ -215,6 +212,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 }
 
+private struct PlaybackCommands: Commands {
+    @UIState private var audioEngine = AudioPlayerEngine.shared
+    @UIState private var eqSettings = EqualizerSettings.shared
+
+    var body: some Commands {
+        CommandMenu("Воспроизведение") {
+            Button(audioEngine.isPlaying ? "Пауза" : "Воспроизведение") {
+                audioEngine.togglePlayPause()
+            }
+            .keyboardShortcut(.space, modifiers: [])
+
+            Button("Следующий трек") {
+                audioEngine.next()
+            }
+            .keyboardShortcut(.rightArrow, modifiers: [.command])
+
+            Button("Предыдущий трек") {
+                audioEngine.previous()
+            }
+            .keyboardShortcut(.leftArrow, modifiers: [.command])
+
+            Button("Вперед на 5 секунд") {
+                audioEngine.seekRelative(by: 5.0)
+            }
+            .keyboardShortcut(.rightArrow, modifiers: [])
+
+            Button("Назад на 5 секунд") {
+                audioEngine.seekRelative(by: -5.0)
+            }
+            .keyboardShortcut(.leftArrow, modifiers: [])
+
+            Divider()
+
+            Button("Увеличить громкость") {
+                audioEngine.volume = min(1.0, audioEngine.volume + 0.1)
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command])
+
+            Button("Уменьшить громкость") {
+                audioEngine.volume = max(0.0, audioEngine.volume - 0.1)
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command])
+
+            Button("Мне нравится / Удалить из избранного") {
+                if let track = audioEngine.currentTrack {
+                    Task { await LikesService.shared.toggleLike(track: track) }
+                }
+            }
+            .keyboardShortcut("l", modifiers: [.command])
+
+            Divider()
+
+            Button("Перемешать очередь") {
+                audioEngine.toggleShuffle()
+            }
+            .keyboardShortcut("s", modifiers: [.command])
+
+            Button("Волна по текущему треку") {
+                if let track = audioEngine.currentTrack {
+                    audioEngine.startWave(forTrack: track)
+                }
+            }
+            .keyboardShortcut("w", modifiers: [.command, .shift])
+
+            Button(eqSettings.isEnabled ? "Выключить эквалайзер" : "Включить эквалайзер") {
+                eqSettings.isEnabled.toggle()
+            }
+            .keyboardShortcut("e", modifiers: [.command])
+
+            Divider()
+
+            Menu("Качество звука") {
+                ForEach(YMAudioQualityPreset.allCases) { preset in
+                    Button(preset.title) {
+                        audioEngine.setAudioQualityPreset(preset)
+                    }
+                }
+            }
+
+            Menu("Предпочитаемый кодек") {
+                ForEach(YMAudioCodecPreference.allCases) { codec in
+                    Button(codec.title) {
+                        audioEngine.setCodecPreference(codec)
+                    }
+                }
+            }
+        }
+    }
+}
+
 @main
 struct YandexMusicMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -239,6 +326,9 @@ struct YandexMusicMacApp: App {
             .frame(minWidth: 440, minHeight: 320)
             .onAppear {
                 appDelegate.configureMainWindowIfNeeded()
+                DispatchQueue.main.async {
+                    appDelegate.configureMainWindowIfNeeded()
+                }
                 appDelegate.localizeSystemMenusToRussian()
             }
         }
@@ -248,88 +338,7 @@ struct YandexMusicMacApp: App {
             // Disable creating extra windows / tabs via ⌘N
             CommandGroup(replacing: .newItem) {}
 
-            CommandMenu("Воспроизведение") {
-                Button(AudioPlayerEngine.shared.isPlaying ? "Пауза" : "Воспроизведение") {
-                    AudioPlayerEngine.shared.togglePlayPause()
-                }
-                .keyboardShortcut(.space, modifiers: [])
-
-                Button("Следующий трек") {
-                    AudioPlayerEngine.shared.next()
-                }
-                .keyboardShortcut(.rightArrow, modifiers: [.command])
-
-                Button("Предыдущий трек") {
-                    AudioPlayerEngine.shared.previous()
-                }
-                .keyboardShortcut(.leftArrow, modifiers: [.command])
-
-                Button("Вперед на 5 секунд") {
-                    AudioPlayerEngine.shared.seekRelative(by: 5.0)
-                }
-                .keyboardShortcut(.rightArrow, modifiers: [])
-
-                Button("Назад на 5 секунд") {
-                    AudioPlayerEngine.shared.seekRelative(by: -5.0)
-                }
-                .keyboardShortcut(.leftArrow, modifiers: [])
-
-                Divider()
-
-                Button("Увеличить громкость") {
-                    AudioPlayerEngine.shared.volume = min(1.0, AudioPlayerEngine.shared.volume + 0.1)
-                }
-                .keyboardShortcut(.upArrow, modifiers: [.command])
-
-                Button("Уменьшить громкость") {
-                    AudioPlayerEngine.shared.volume = max(0.0, AudioPlayerEngine.shared.volume - 0.1)
-                }
-                .keyboardShortcut(.downArrow, modifiers: [.command])
-
-                Button("Мне нравится / Удалить из избранного") {
-                    if let track = AudioPlayerEngine.shared.currentTrack {
-                        Task { await LikesService.shared.toggleLike(track: track) }
-                    }
-                }
-                .keyboardShortcut("l", modifiers: [.command])
-
-                Divider()
-
-                Button("Перемешать очередь") {
-                    AudioPlayerEngine.shared.toggleShuffle()
-                }
-                .keyboardShortcut("s", modifiers: [.command])
-
-                Button("Волна по текущему треку") {
-                    if let track = AudioPlayerEngine.shared.currentTrack {
-                        AudioPlayerEngine.shared.startWave(forTrack: track)
-                    }
-                }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
-
-                Button(EqualizerSettings.shared.isEnabled ? "Выключить эквалайзер" : "Включить эквалайзер") {
-                    EqualizerSettings.shared.isEnabled.toggle()
-                }
-                .keyboardShortcut("e", modifiers: [.command])
-
-                Divider()
-
-                Menu("Качество звука") {
-                    ForEach(YMAudioQualityPreset.allCases) { preset in
-                        Button(preset.title) {
-                            AudioPlayerEngine.shared.setAudioQualityPreset(preset)
-                        }
-                    }
-                }
-
-                Menu("Предпочитаемый кодек") {
-                    ForEach(YMAudioCodecPreference.allCases) { codec in
-                        Button(codec.title) {
-                            AudioPlayerEngine.shared.setCodecPreference(codec)
-                        }
-                    }
-                }
-            }
+            PlaybackCommands()
 
             CommandMenu("Навигация") {
                 Button("Поиск") {

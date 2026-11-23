@@ -1,14 +1,32 @@
 import SwiftUI
 
+fileprivate func formatTrackCount(_ count: Int) -> String {
+    let mod10 = count % 10
+    let mod100 = count % 100
+    if mod100 >= 11 && mod100 <= 19 {
+        return "\(count) треков"
+    }
+    switch mod10 {
+    case 1:
+        return "\(count) трек"
+    case 2, 3, 4:
+        return "\(count) трека"
+    default:
+        return "\(count) треков"
+    }
+}
+
 /// Modern Playlists view supporting responsive grid of playlist cards and deep-dive playlist detail view.
 public struct PlaylistsView: View {
     @UIState private var playlistsService = PlaylistsService.shared
     @UIState private var selectedPlaylist: YMPlaylist? = nil
     @UIState private var playlistTracks: [YMTrack] = []
+    @UIState private var cachedDisplayedPlaylistTracks: [YMTrack] = []
     @UIState private var isLoadingTracks = false
     @UIState private var detailErrorMessage: String? = nil
     @UIState private var playlistFilterQuery: String = ""
     @UIState private var playlistDetailTask: Task<Void, Never>? = nil
+    @UIState private var quickPlayTask: Task<Void, Never>? = nil
     @UIState private var isGridScrolled = false
     @UIState private var isDetailScrolled = false
 
@@ -30,12 +48,20 @@ public struct PlaylistsView: View {
     }
 
     private var displayedPlaylistTracks: [YMTrack] {
-        let q = playlistFilterQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return playlistTracks }
-        return playlistTracks.filter { track in
-            track.displayTitle.lowercased().contains(q) ||
-            track.artistsString.lowercased().contains(q) ||
-            (track.primaryAlbumTitle?.lowercased().contains(q) ?? false)
+        cachedDisplayedPlaylistTracks
+    }
+
+    private func updateCachedDisplayedTracks() {
+        let q = playlistFilterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            cachedDisplayedPlaylistTracks = playlistTracks
+            return
+        }
+        cachedDisplayedPlaylistTracks = playlistTracks.filter { track in
+            track.displayTitle.localizedCaseInsensitiveContains(q) ||
+            track.artists.contains { $0.name.localizedCaseInsensitiveContains(q) } ||
+            (track.artists.isEmpty && track.artistsString.localizedCaseInsensitiveContains(q)) ||
+            (track.primaryAlbumTitle?.localizedCaseInsensitiveContains(q) ?? false)
         }
     }
 
@@ -97,6 +123,18 @@ public struct PlaylistsView: View {
         }
         .task {
             await playlistsService.ensureLoaded()
+        }
+        .onDisappear {
+            playlistDetailTask?.cancel()
+            playlistDetailTask = nil
+            quickPlayTask?.cancel()
+            quickPlayTask = nil
+        }
+        .onChange(of: playlistFilterQuery) { _, _ in
+            updateCachedDisplayedTracks()
+        }
+        .onChange(of: playlistTracks) { _, _ in
+            updateCachedDisplayedTracks()
         }
     }
 
@@ -208,13 +246,16 @@ public struct PlaylistsView: View {
             }
             .padding(.bottom, 60)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "playlists_grid_scroll",
-                    threshold: 52,
-                    isScrolled: $isGridScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "playlists_grid_scroll",
+                        threshold: 52,
+                        isScrolled: $isGridScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 52, isScrolled: $isGridScrolled)
         .coordinateSpace(name: "playlists_grid_scroll")
         .overlay(alignment: .top) {
             YMStickyTopBar(title: "Плейлисты", isVisible: isGridScrolled)
@@ -317,7 +358,7 @@ public struct PlaylistsView: View {
                         }
 
                         let effectiveCount = playlistTracks.isEmpty ? (playlist.trackCount ?? 0) : playlistTracks.count
-                        Text("\(effectiveCount) треков")
+                        Text(formatTrackCount(effectiveCount))
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(YMTheme.fg60)
                             .lineLimit(1)
@@ -443,8 +484,8 @@ public struct PlaylistsView: View {
                                 audioEngine.setQueue(displayedPlaylistTracks, startingAt: idx)
                             }
                         },
-                        onRemoveFromPlaylist: { track, _ in
-                            removeTrackFromSelectedPlaylist(track: track, playlist: playlist)
+                        onRemoveFromPlaylist: { track, displayedIdx in
+                            removeTrackFromSelectedPlaylist(track: track, displayedIdx: displayedIdx, playlist: playlist)
                         }
                     )
                     .padding(.horizontal, 14)
@@ -452,13 +493,16 @@ public struct PlaylistsView: View {
             }
             .padding(.bottom, 80)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "playlist_detail_scroll",
-                    threshold: 84,
-                    isScrolled: $isDetailScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "playlist_detail_scroll",
+                        threshold: 84,
+                        isScrolled: $isDetailScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 84, isScrolled: $isDetailScrolled)
         .coordinateSpace(name: "playlist_detail_scroll")
         .overlay(alignment: .top) {
             YMStickyDetailTopBar(
@@ -567,12 +611,21 @@ public struct PlaylistsView: View {
         }
     }
 
-    private func removeTrackFromSelectedPlaylist(track: YMTrack, playlist: YMPlaylist) {
-        guard let originalIdx = playlistTracks.firstIndex(where: { $0.id == track.id }) else { return }
+    private func removeTrackFromSelectedPlaylist(track: YMTrack, displayedIdx: Int, playlist: YMPlaylist) {
+        let isFilterEmpty = playlistFilterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let originalIdx: Int
+        if isFilterEmpty && displayedIdx < playlistTracks.count && playlistTracks[displayedIdx].id == track.id {
+            originalIdx = displayedIdx
+        } else if let foundIdx = playlistTracks.firstIndex(where: { $0.id == track.id }) {
+            originalIdx = foundIdx
+        } else {
+            return
+        }
         let removedTrack = playlistTracks.remove(at: originalIdx)
+        updateCachedDisplayedTracks()
         Task {
             do {
-                let updated = try await playlistsService.removeTrack(at: originalIdx, from: playlist)
+                let updated = try await playlistsService.removeTrack(track, at: originalIdx, from: playlist)
                 if selectedPlaylist?.id == updated.id {
                     selectedPlaylist = updated
                 }
@@ -581,6 +634,7 @@ public struct PlaylistsView: View {
                 // Rollback optimistic removal on failure
                 let insertIdx = min(originalIdx, playlistTracks.count)
                 playlistTracks.insert(removedTrack, at: insertIdx)
+                updateCachedDisplayedTracks()
                 detailErrorMessage = "Не удалось удалить трек: \(error.localizedDescription)"
             }
         }
@@ -591,6 +645,7 @@ public struct PlaylistsView: View {
         isDetailScrolled = false
         selectedPlaylist = playlist
         playlistTracks = []
+        cachedDisplayedPlaylistTracks = []
         isLoadingTracks = true
         detailErrorMessage = nil
         let targetPlaylistId = playlist.id
@@ -606,6 +661,7 @@ public struct PlaylistsView: View {
                     self.selectedPlaylist = details
                     self.playlistsService.upsertPlaylist(details, insertAtTop: false)
                     self.playlistTracks = resolvedTracks
+                    self.updateCachedDisplayedTracks()
                     self.isLoadingTracks = false
                 }
             } catch {
@@ -641,12 +697,13 @@ public struct PlaylistsView: View {
     }
 
     private func playPlaylistImmediately(_ playlist: YMPlaylist, shuffle: Bool, startWave: Bool) {
-        Task {
+        quickPlayTask?.cancel()
+        quickPlayTask = Task {
             do {
                 let details = try await networkClient.fetchPlaylistDetails(uid: playlist.uid, kind: playlist.kind)
                 let resolvedTracks = try await resolveAllTracks(from: details.tracks ?? [])
 
-                guard !resolvedTracks.isEmpty else { return }
+                guard !Task.isCancelled, !resolvedTracks.isEmpty else { return }
 
                 await MainActor.run {
                     if startWave {
@@ -659,7 +716,9 @@ public struct PlaylistsView: View {
                     }
                 }
             } catch {
-                print("[PlaylistsView] Failed to play: \(error)")
+                if !Task.isCancelled {
+                    print("[PlaylistsView] Failed to play: \(error)")
+                }
             }
         }
     }
@@ -680,69 +739,100 @@ private struct PlaylistCardItem: View {
     @UIState private var isHovered = false
 
     var body: some View {
-        Button {
-            onSelect()
-        } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                ZStack(alignment: .bottomTrailing) {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .bottomTrailing) {
+                ZStack {
                     CachedCoverImage(
                         coverUri: playlist.coverUri,
                         size: .medium,
                         displaySize: cardSize,
                         cornerRadius: YMTheme.cornerRadiusMedium
                     )
-                    .frame(width: cardSize, height: cardSize)
-                    .ymCardHover(cornerRadius: YMTheme.cornerRadiusMedium, scale: 1.04)
-
-                    if playlist.isPrivate {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(6)
-                            .background(Circle().fill(Color.black.opacity(0.55)))
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                            .padding(6)
-                    }
+                    .scaleEffect(isHovered ? 1.05 : 1.0)
 
                     if isHovered {
-                        Button {
-                            onPlay()
-                        } label: {
-                            Image(systemName: "play.fill")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.black)
-                                .frame(width: 38, height: 38)
-                                .background(Circle().fill(YMTheme.accent))
-                                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(8)
-                        .transition(.scale.combined(with: .opacity))
+                        LinearGradient(
+                            colors: [Color.clear, Color.black.opacity(0.42)],
+                            startPoint: .center,
+                            endPoint: .bottom
+                        )
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
                     }
                 }
-                .onHover { isHovered = $0 }
+                .frame(width: cardSize, height: cardSize)
+                .clipShape(RoundedRectangle(cornerRadius: YMTheme.cornerRadiusMedium, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: YMTheme.cornerRadiusMedium, style: .continuous)
+                        .strokeBorder(isHovered ? YMTheme.borderHover : YMTheme.border, lineWidth: 1)
+                        .allowsHitTesting(false)
+                )
+                .shadow(
+                    color: YMTheme.shadowColor,
+                    radius: isHovered ? 12 : 3,
+                    y: isHovered ? 6 : 1
+                )
+                .animation(.spring(response: 0.28, dampingFraction: 0.72), value: isHovered)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(playlist.title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(isHovered ? YMTheme.accent : YMTheme.fg)
-                        .lineLimit(1)
-
-                    if let desc = playlist.description, !desc.isEmpty {
-                        Text(desc)
-                            .font(.system(size: 11))
-                            .foregroundStyle(YMTheme.fg60)
-                            .lineLimit(1)
-                    } else if let count = playlist.trackCount {
-                        Text("\(count) треков")
-                            .font(.caption)
-                            .foregroundStyle(YMTheme.fg40)
-                    }
+                if playlist.isPrivate {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(6)
+                        .background(Circle().fill(Color.black.opacity(0.55)))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .padding(6)
+                        .allowsHitTesting(false)
                 }
-                .frame(width: cardSize, alignment: .leading)
+
+                if isHovered {
+                    Button {
+                        onPlay()
+                    } label: {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 38, height: 38)
+                            .background(Circle().fill(YMTheme.accent))
+                            .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .transition(.scale.combined(with: .opacity))
+                }
             }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(playlist.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isHovered ? YMTheme.accent : YMTheme.fg)
+                    .lineLimit(1)
+
+                if let desc = playlist.description, !desc.isEmpty {
+                    Text(desc)
+                        .font(.system(size: 11))
+                        .foregroundStyle(YMTheme.fg60)
+                        .lineLimit(1)
+                } else if let count = playlist.trackCount {
+                    Text(formatTrackCount(count))
+                        .font(.caption)
+                        .foregroundStyle(YMTheme.fg40)
+                }
+            }
+            .frame(width: cardSize, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onSelect()
+        }
+        .onHover { inside in
+            if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+            if isHovered != inside { isHovered = inside }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false }
+        }
+        .accessibilityAddTraits(.isButton)
         .contextMenu {
             Button("Слушать плейлист", action: onPlay)
             Button("Перемешать", action: onShuffle)

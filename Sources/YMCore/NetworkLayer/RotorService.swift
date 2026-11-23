@@ -12,6 +12,9 @@ public actor RotorService {
     private let networkClient: YMNetworkClient
     private var currentSessionId: String?
     private var currentBatchId: String?
+    private var sessionGeneration: UInt64 = 0
+    private var activeV1StationId: String? = nil
+    private var isUsingV1Protocol: Bool = false
     private var seenTrackIds: Set<String> = []
     private var seenTrackIdList: [String] = []
     private var recentQueueIdentifiers: [String] = []
@@ -93,8 +96,11 @@ public actor RotorService {
     }
 
     public func resetSession() {
+        self.sessionGeneration &+= 1
         self.currentSessionId = nil
         self.currentBatchId = nil
+        self.activeV1StationId = nil
+        self.isUsingV1Protocol = false
         self.seenTrackIds.removeAll()
         self.seenTrackIdList.removeAll()
         self.recentQueueIdentifiers.removeAll()
@@ -143,6 +149,7 @@ public actor RotorService {
             do {
                 let listItems: [YMRotorDashboardStationItem] = try await networkClient.request(
                     endpoint: "/rotor/stations/list",
+                    queryItems: [URLQueryItem(name: "language", value: "ru")],
                     cachePolicy: .useProtocolCachePolicy
                 )
                 for item in listItems {
@@ -181,6 +188,7 @@ public actor RotorService {
         do {
             let listItems: [YMRotorDashboardStationItem] = try await networkClient.request(
                 endpoint: "/rotor/stations/list",
+                queryItems: [URLQueryItem(name: "language", value: "ru")],
                 cachePolicy: .useProtocolCachePolicy
             )
             for item in listItems {
@@ -210,6 +218,7 @@ public actor RotorService {
         vibe: YMWaveVibePreset? = nil
     ) async throws -> [YMTrack] {
         resetSession()
+        let gen = sessionGeneration
         self.activeContext = context
         self.activeVibe = vibe ?? .defaultWave
 
@@ -235,12 +244,16 @@ public actor RotorService {
                     cachePolicy: .reloadIgnoringLocalCacheData
                 )
 
+                guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
+
                 recordTrackInsights(from: result.sequence)
                 let rawTracks = result.sequence.compactMap(\.track)
                 let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
                 if !uniqueTracks.isEmpty {
                     self.currentSessionId = result.radioSessionId
                     self.currentBatchId = result.batchId
+                    self.isUsingV1Protocol = false
+                    self.activeV1StationId = nil
                     updateDiagnostics(
                         activeProtocol: "Rotor Session v2 (POST /rotor/session/new)",
                         isFallbackActive: false,
@@ -256,11 +269,15 @@ public actor RotorService {
                 } else {
                     lastFallbackReason = "Session v2 вернул пустой список треков"
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
                 lastFallbackReason = "Session v2 ошибка: \(error.localizedDescription)"
                 print("[RotorService] Level 1 Session v2 start error: \(error)")
             }
+
+            guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
 
             // Level 2: Rotor Session v2 with Simplified Seeds
             let simplifiedSeeds = buildSimplifiedSeeds(for: context, vibe: activeVibe)
@@ -277,12 +294,16 @@ public actor RotorService {
                         cachePolicy: .reloadIgnoringLocalCacheData
                     )
 
+                    guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
+
                     recordTrackInsights(from: result.sequence)
                     let rawTracks = result.sequence.compactMap(\.track)
                     let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
                     if !uniqueTracks.isEmpty {
                         self.currentSessionId = result.radioSessionId
                         self.currentBatchId = result.batchId
+                        self.isUsingV1Protocol = false
+                        self.activeV1StationId = nil
                         updateDiagnostics(
                             activeProtocol: "Rotor Session v2 (Simplified Seeds)",
                             isFallbackActive: true,
@@ -296,12 +317,16 @@ public actor RotorService {
                         try? await sendFeedback(type: .radioStarted, trackId: nil)
                         return uniqueTracks
                     }
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     lastError = error
                     lastFallbackReason = "Session v2 Simplified ошибка: \(error.localizedDescription)"
                     print("[RotorService] Level 2 Session v2 simplified retry failed: \(error)")
                 }
             }
+
+            guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
 
             // If user strictly locked mode to v2Only, do not fall back to v1
             if preferredAPIMode == .v2Only {
@@ -320,37 +345,57 @@ public actor RotorService {
             lastFallbackReason = "Выбран ручной режим Rotor Radio v1"
         }
 
-        // Level 3: Rotor Station v1 (GET /rotor/station/{stationId}/tracks?settings2=true + activeVibe params)
-        var v1QueryItems = [URLQueryItem(name: "settings2", value: "true")]
-        v1QueryItems.append(contentsOf: activeVibe.v1QueryItems)
+        // Level 3: Rotor Station v1 (GET /rotor/station/{targetStation}/tracks?settings2=true)
+        let targetStation = context.fallbackStationId
+        if let v1Settings = activeVibe.v1SettingsPayload {
+            try? await applyV1Settings(stationId: targetStation, settings: v1Settings)
+        }
+
+        guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
+
+        let v1QueryItems = [URLQueryItem(name: "settings2", value: "true")]
 
         var response: YMRotorStationTracksResult?
         var usedBaseWaveFallback = false
 
         do {
             response = try await networkClient.request(
-                endpoint: "/rotor/station/\(YMNetworkClient.escapePath(context.fallbackStationId))/tracks",
+                endpoint: "/rotor/station/\(YMNetworkClient.escapePath(targetStation))/tracks",
                 queryItems: v1QueryItems,
                 cachePolicy: .reloadIgnoringLocalCacheData
             )
+            guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
+            self.isUsingV1Protocol = true
+            self.activeV1StationId = targetStation
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
-            print("[RotorService] Level 3 Rotor v1 station \(context.fallbackStationId) failed: \(error). Falling back to user:onyourwave...")
-            lastFallbackReason = "Station v1 (\(context.fallbackStationId)): \(error.localizedDescription)"
+            print("[RotorService] Level 3 Rotor v1 station \(targetStation) failed: \(error). Falling back to user:onyourwave...")
+            lastFallbackReason = "Station v1 (\(targetStation)): \(error.localizedDescription)"
+
+            guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
 
             // Level 4: Base Wave Fallback (GET /rotor/station/user:onyourwave/tracks?settings2=true)
-            if context.fallbackStationId != "user:onyourwave" {
+            if targetStation != "user:onyourwave" {
                 usedBaseWaveFallback = true
+                if let v1Settings = activeVibe.v1SettingsPayload {
+                    try? await applyV1Settings(stationId: "user:onyourwave", settings: v1Settings)
+                }
+                guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
                 response = try await networkClient.request(
                     endpoint: "/rotor/station/user:onyourwave/tracks",
                     queryItems: v1QueryItems,
                     cachePolicy: .reloadIgnoringLocalCacheData
                 )
+                guard gen == sessionGeneration, !Task.isCancelled else { throw CancellationError() }
+                self.isUsingV1Protocol = true
+                self.activeV1StationId = "user:onyourwave"
             } else {
                 updateDiagnostics(
                     activeProtocol: "Ошибка Rotor Station v1",
                     isFallbackActive: true,
                     activeLevel: 0,
-                    activeSeeds: [context.fallbackStationId],
+                    activeSeeds: [targetStation],
                     fetchedDelta: 0,
                     duplicatesDelta: 0,
                     lastFallbackReason: lastFallbackReason
@@ -371,13 +416,13 @@ public actor RotorService {
 
         let protocolLabel = usedBaseWaveFallback
             ? "Base Wave Fallback (GET /rotor/station/user:onyourwave/tracks)"
-            : "Rotor Station v1 (GET /rotor/station/\(context.fallbackStationId)/tracks)"
+            : "Rotor Station v1 (GET /rotor/station/\(targetStation)/tracks)"
 
         updateDiagnostics(
             activeProtocol: protocolLabel,
             isFallbackActive: true,
             activeLevel: usedBaseWaveFallback ? 4 : 3,
-            activeSeeds: usedBaseWaveFallback ? ["user:onyourwave"] : [context.fallbackStationId],
+            activeSeeds: usedBaseWaveFallback ? ["user:onyourwave"] : [targetStation],
             fetchedDelta: uniqueTracks.count,
             duplicatesDelta: duplicatesFiltered,
             lastFallbackReason: lastFallbackReason
@@ -388,9 +433,10 @@ public actor RotorService {
         return uniqueTracks
     }
 
-    /// Fetches next batch of tracks using v2 if radioSessionId is present, otherwise v1.
-    /// Passes up to 25 recent track identifiers and current `batchId` to the API, filtering duplicates and updating diagnostics.
+    /// Fetches next batch of tracks using v2 if radioSessionId is present and v2 is active, otherwise v1.
+    /// Passes queue identifiers and handles transparent session recreation upon unknown-session or terminated.
     public func fetchNextBatch(lastTrackId: String, queueHistory: [String] = []) async throws -> [YMTrack] {
+        let gen = sessionGeneration
         var queueList: [String] = []
         if !queueHistory.isEmpty {
             queueList = Array(queueHistory.suffix(25))
@@ -402,10 +448,10 @@ public actor RotorService {
 
         var fallbackReason: String? = diagnostics.lastFallbackReason
 
-        // Try Rotor Session v2 if sessionId is active and mode permits v2
-        if let sessionId = currentSessionId, preferredAPIMode != .v1Fallback {
+        // Try Rotor Session v2 if sessionId is active, we're not currently on v1, and mode permits v2
+        if !isUsingV1Protocol, preferredAPIMode != .v1Fallback, let sessionId = currentSessionId {
             do {
-                let payload = YMRotorSessionNextTracksRequest(queue: queueList, batchId: currentBatchId)
+                let payload = YMRotorSessionNextTracksRequest(queue: queueList)
                 let body = try encoder.encode(payload)
 
                 let result: YMRotorStationTracksResult = try await networkClient.request(
@@ -416,26 +462,70 @@ public actor RotorService {
                     cachePolicy: .reloadIgnoringLocalCacheData
                 )
 
-                if let newBatchId = result.batchId {
-                    self.currentBatchId = newBatchId
-                }
-                recordTrackInsights(from: result.sequence)
-                let rawTracks = result.sequence.compactMap(\.track)
-                let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
-                if !uniqueTracks.isEmpty {
-                    updateDiagnostics(
-                        activeProtocol: diagnostics.activeLevel == 2
-                            ? "Rotor Session v2 (Simplified Seeds)"
-                            : "Rotor Session v2 (POST /rotor/session/new)",
-                        isFallbackActive: diagnostics.activeLevel == 2,
-                        activeLevel: diagnostics.activeLevel == 2 ? 2 : 1,
-                        activeSeeds: diagnostics.activeSeeds,
-                        fetchedDelta: uniqueTracks.count,
-                        duplicatesDelta: duplicatesFiltered,
-                        lastFallbackReason: diagnostics.lastFallbackReason
+                guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+
+                // Check if session is expired or terminated -> transparently recreate v2 session
+                if result.unknownSession == true || result.terminated == true {
+                    print("[RotorService] Session unknown/terminated, transparently recreating v2 session...")
+                    let seedsToUse = diagnostics.activeSeeds.isEmpty ? activeContext.seeds : diagnostics.activeSeeds
+                    let newReq = YMRotorSessionNewRequest(seeds: seedsToUse, queue: queueList)
+                    let newBody = try encoder.encode(newReq)
+
+                    let recreatedResult: YMRotorStationTracksResult = try await networkClient.request(
+                        endpoint: "/rotor/session/new",
+                        method: "POST",
+                        body: newBody,
+                        headers: ["Content-Type": "application/json"],
+                        cachePolicy: .reloadIgnoringLocalCacheData
                     )
-                    return uniqueTracks
+
+                    guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+
+                    if let newSessionId = recreatedResult.radioSessionId {
+                        self.currentSessionId = newSessionId
+                    }
+                    if let newBatchId = recreatedResult.batchId {
+                        self.currentBatchId = newBatchId
+                    }
+                    recordTrackInsights(from: recreatedResult.sequence)
+                    let rawTracks = recreatedResult.sequence.compactMap(\.track)
+                    let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
+                    if !uniqueTracks.isEmpty {
+                        updateDiagnostics(
+                            activeProtocol: diagnostics.activeProtocol,
+                            isFallbackActive: diagnostics.isFallbackActive,
+                            activeLevel: diagnostics.activeLevel,
+                            activeSeeds: diagnostics.activeSeeds,
+                            fetchedDelta: uniqueTracks.count,
+                            duplicatesDelta: duplicatesFiltered,
+                            lastFallbackReason: diagnostics.lastFallbackReason
+                        )
+                        return uniqueTracks
+                    }
+                } else {
+                    if let newBatchId = result.batchId {
+                        self.currentBatchId = newBatchId
+                    }
+                    recordTrackInsights(from: result.sequence)
+                    let rawTracks = result.sequence.compactMap(\.track)
+                    let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
+                    if !uniqueTracks.isEmpty {
+                        updateDiagnostics(
+                            activeProtocol: diagnostics.activeLevel == 2
+                                ? "Rotor Session v2 (Simplified Seeds)"
+                                : "Rotor Session v2 (POST /rotor/session/new)",
+                            isFallbackActive: diagnostics.activeLevel == 2,
+                            activeLevel: diagnostics.activeLevel == 2 ? 2 : 1,
+                            activeSeeds: diagnostics.activeSeeds,
+                            fetchedDelta: uniqueTracks.count,
+                            duplicatesDelta: duplicatesFiltered,
+                            lastFallbackReason: diagnostics.lastFallbackReason
+                        )
+                        return uniqueTracks
+                    }
                 }
+            } catch is CancellationError {
+                return []
             } catch {
                 fallbackReason = "Session v2 next batch ошибка: \(error.localizedDescription)"
                 print("[RotorService] Session v2 next batch error: \(error). Falling back to v1...")
@@ -445,31 +535,42 @@ public actor RotorService {
             }
         }
 
-        // Fallback to Rotor v1: GET /rotor/station/\(activeContext.fallbackStationId)/tracks
-        let queueParam = queueList.joined(separator: ",")
-        var queryItems = [
+        guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+
+        // Fallback to Rotor v1: GET /rotor/station/\(stationId)/tracks
+        let stationId = activeV1StationId ?? activeContext.fallbackStationId
+        let lastId = queueList.last ?? lastTrackId
+        let queryItems = [
             URLQueryItem(name: "settings2", value: "true"),
-            URLQueryItem(name: "queue", value: queueParam)
+            URLQueryItem(name: "queue", value: lastId)
         ]
-        queryItems.append(contentsOf: activeVibe.v1QueryItems)
 
         var response: YMRotorStationTracksResult?
         var usedBaseWaveFallback = false
         do {
             response = try await networkClient.request(
-                endpoint: "/rotor/station/\(YMNetworkClient.escapePath(activeContext.fallbackStationId))/tracks",
+                endpoint: "/rotor/station/\(YMNetworkClient.escapePath(stationId))/tracks",
                 queryItems: queryItems,
                 cachePolicy: .reloadIgnoringLocalCacheData
             )
+            guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+            self.isUsingV1Protocol = true
+            self.activeV1StationId = stationId
+        } catch is CancellationError {
+            return []
         } catch {
-            fallbackReason = "Station v1 (\(activeContext.fallbackStationId)): \(error.localizedDescription)"
-            if activeContext.fallbackStationId != "user:onyourwave" {
+            fallbackReason = "Station v1 (\(stationId)): \(error.localizedDescription)"
+            guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+            if stationId != "user:onyourwave" {
                 usedBaseWaveFallback = true
                 response = try await networkClient.request(
                     endpoint: "/rotor/station/user:onyourwave/tracks",
                     queryItems: queryItems,
                     cachePolicy: .reloadIgnoringLocalCacheData
                 )
+                guard gen == sessionGeneration, !Task.isCancelled else { return [] }
+                self.isUsingV1Protocol = true
+                self.activeV1StationId = "user:onyourwave"
             } else {
                 throw error
             }
@@ -484,13 +585,14 @@ public actor RotorService {
         let rawTracks = sequence.compactMap(\.track)
         let (uniqueTracks, duplicatesFiltered) = filterUniqueTracksWithStats(rawTracks)
 
+        let finalStationId = activeV1StationId ?? (usedBaseWaveFallback ? "user:onyourwave" : stationId)
         updateDiagnostics(
             activeProtocol: usedBaseWaveFallback
                 ? "Base Wave Fallback (GET /rotor/station/user:onyourwave/tracks)"
-                : "Rotor Station v1 (GET /rotor/station/\(activeContext.fallbackStationId)/tracks)",
+                : "Rotor Station v1 (GET /rotor/station/\(finalStationId)/tracks)",
             isFallbackActive: true,
             activeLevel: usedBaseWaveFallback ? 4 : 3,
-            activeSeeds: usedBaseWaveFallback ? ["user:onyourwave"] : [activeContext.fallbackStationId],
+            activeSeeds: [finalStationId],
             fetchedDelta: uniqueTracks.count,
             duplicatesDelta: duplicatesFiltered,
             lastFallbackReason: fallbackReason
@@ -501,20 +603,54 @@ public actor RotorService {
 
     // MARK: - Helpers
 
+    private struct YMRotorV1SettingsRequest: Codable {
+        let moodEnergy: String
+        let diversity: String
+        let language: String
+        let type: String
+    }
+
+    private func applyV1Settings(
+        stationId: String,
+        settings: (moodEnergy: String, diversity: String, language: String)
+    ) async throws {
+        let req = YMRotorV1SettingsRequest(
+            moodEnergy: settings.moodEnergy,
+            diversity: settings.diversity,
+            language: settings.language,
+            type: "rotor"
+        )
+        let body = try encoder.encode(req)
+        let _: (Data, HTTPURLResponse) = try await networkClient.performRawRequest(
+            endpoint: "/rotor/station/\(YMNetworkClient.escapePath(stationId))/settings3",
+            method: "POST",
+            body: body,
+            headers: ["Content-Type": "application/json"]
+        )
+    }
+
     private func buildSimplifiedSeeds(for context: YMWaveContext, vibe: YMWaveVibePreset) -> [String] {
-        var trackSeeds = context.seeds.filter { $0.hasPrefix("track:") }
-        if !trackSeeds.isEmpty && context.seeds.count > 1 {
-            if let vibeSeed = vibe.seedParameter {
-                trackSeeds.append(vibeSeed)
+        let vibeSeed = vibe.seedParameter
+
+        // 1. If playlist has fallback track seeds
+        if !context.fallbackTrackSeeds.isEmpty {
+            var seeds = context.fallbackTrackSeeds
+            if let vibeSeed {
+                seeds.append(vibeSeed)
             }
-            return trackSeeds
+            return seeds
         }
 
-        var baseSeeds = ["user:onyourwave"]
-        if let vibeSeed = vibe.seedParameter {
-            baseSeeds.append(vibeSeed)
+        // 2. If station/artist has vibe seed (count > 1), try context.seeds without vibe
+        if vibeSeed != nil, !context.seeds.isEmpty {
+            if context != .myWaveDefault {
+                return context.seeds
+            } else {
+                return ["user:onyourwave"]
+            }
         }
-        return baseSeeds
+
+        return []
     }
 
     private func filterUniqueTracksWithStats(_ tracks: [YMTrack]) -> (unique: [YMTrack], duplicatesFiltered: Int) {
@@ -617,12 +753,10 @@ public actor RotorService {
         try await sendFeedback(type: .skip, trackId: track.rotorTrackIdentifier, totalPlayedSeconds: playedSeconds)
     }
 
-    /// Сигнал "Больше похожих треков": отправляет алгоритму радио события like + trackFinished (100% прослушивание),
-    /// не добавляя трек в библиотеку "Мне нравится" пользователя.
+    /// Сигнал "Больше похожих треков": отправляет алгоритму радио событие like,
+    /// не отправляя ложный trackFinished до завершения трека.
     public func sendAlgorithmicMoreLikeThis(track: YMTrack) async throws {
-        let fullDuration = Double(track.durationMs ?? 180_000) / 1000.0
-        try? await sendFeedback(type: .like, trackId: track.rotorTrackIdentifier)
-        try await sendFeedback(type: .trackFinished, trackId: track.rotorTrackIdentifier, totalPlayedSeconds: max(120.0, fullDuration))
+        try await sendFeedback(type: .like, trackId: track.rotorTrackIdentifier)
     }
 
     /// Сигнал "Меньше таких треков": отправляет алгоритму радио события dislike + skip с минимальным временем.
@@ -636,18 +770,24 @@ public actor RotorService {
         trackId: String? = nil,
         totalPlayedSeconds: Double? = nil
     ) async throws {
-        let fromValue = "mobile-home-rup_main-\(activeContext.seeds.first?.replacingOccurrences(of: ":", with: "-") ?? "user-onyourwave")-default"
-        let event = YMRotorFeedbackEvent(
-            type: type,
-            timestamp: isoFormatter.string(from: Date()),
-            trackId: trackId,
-            totalPlayedSeconds: totalPlayedSeconds,
-            from: fromValue
-        )
+        let fromValue = activeContext.idForFrom
+            ?? "mobile-home-rup_main-\(activeContext.seeds.first?.replacingOccurrences(of: ":", with: "-") ?? "user-onyourwave")-default"
+        let validSeconds: Double? = (totalPlayedSeconds != nil && totalPlayedSeconds! > 0) ? totalPlayedSeconds : nil
+        let timestamp = isoFormatter.string(from: Date())
 
-        if let sessionId = currentSessionId {
+        if !isUsingV1Protocol, preferredAPIMode != .v1Fallback, let sessionId = currentSessionId {
             // Rotor Session v2 feedback: POST /rotor/session/{radioSessionId}/feedback
-            let v2Payload = YMRotorSessionFeedbackRequest(event: event, batchId: currentBatchId)
+            let event = YMRotorSessionEvent(
+                type: type,
+                timestamp: timestamp,
+                trackId: trackId,
+                totalPlayedSeconds: validSeconds
+            )
+            let v2Payload = YMRotorSessionFeedbackRequest(
+                event: event,
+                batchId: currentBatchId,
+                from: type == .radioStarted ? fromValue : nil
+            )
             let body = try encoder.encode(v2Payload)
             let _: (Data, HTTPURLResponse) = try await networkClient.performRawRequest(
                 endpoint: "/rotor/session/\(YMNetworkClient.escapePath(sessionId))/feedback",
@@ -658,20 +798,27 @@ public actor RotorService {
             return
         }
 
-        // Rotor v1 feedback: POST /rotor/station/\(activeContext.fallbackStationId)/feedback?batch-id={batchId}
+        // Rotor v1 flat feedback: POST /rotor/station/\(stationId)/feedback?batch-id={batchId}
+        let stationId = activeV1StationId ?? activeContext.fallbackStationId
         guard let batchId = currentBatchId else {
             print("[RotorService] Skipping v1 feedback \(type): batchId is nil")
             return
         }
 
-        let payload = YMRotorFeedbackPayload(event: event)
+        let payload = YMRotorStationFeedbackRequest(
+            type: type,
+            timestamp: timestamp,
+            trackId: trackId,
+            totalPlayedSeconds: validSeconds,
+            from: type == .radioStarted ? fromValue : nil
+        )
         let body = try encoder.encode(payload)
         let queryItems = [
             URLQueryItem(name: "batch-id", value: batchId)
         ]
 
         let _: (Data, HTTPURLResponse) = try await networkClient.performRawRequest(
-            endpoint: "/rotor/station/\(YMNetworkClient.escapePath(activeContext.fallbackStationId))/feedback",
+            endpoint: "/rotor/station/\(YMNetworkClient.escapePath(stationId))/feedback",
             method: "POST",
             queryItems: queryItems,
             body: body,

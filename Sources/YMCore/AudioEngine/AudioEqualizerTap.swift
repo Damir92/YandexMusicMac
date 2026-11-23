@@ -8,7 +8,13 @@ final class EqualizerTapContext {
     var audioUnit: AudioUnit?
     var sampleRate: Double = 44100.0
     var sampleCursor: Float64 = 0
+    var cachedSnapshot = EqualizerParameterBridge.RealtimeSnapshot()
     var lastAppliedGeneration: UInt64 = 0
+    var wasBypassed: Bool = true
+    var maxFramesPerSlice: UInt32 = 0
+    var bytesPerFrame: UInt32 = 4
+    var didPullSourceAudio: Bool = false
+    var lastSourceFrames: CMItemCount = 0
 
     // Указатели, валидные только на время одного вызова `eqTapProcess`
     var activeTap: MTAudioProcessingTap?
@@ -16,6 +22,9 @@ final class EqualizerTapContext {
 
     func setupAudioUnit(format: AudioStreamBasicDescription, maxFrames: CMItemCount) {
         disposeAudioUnit()
+
+        self.maxFramesPerSlice = UInt32(maxFrames)
+        self.bytesPerFrame = format.mBytesPerFrame > 0 ? format.mBytesPerFrame : 4
 
         var desc = AudioComponentDescription(
             componentType: kAudioUnitType_Effect,
@@ -115,24 +124,20 @@ final class EqualizerTapContext {
         self.sampleRate = format.mSampleRate > 0 ? format.mSampleRate : 44100.0
         self.sampleCursor = 0
         self.lastAppliedGeneration = 0
+        self.wasBypassed = true
         self.audioUnit = au
     }
 
-    func applyParametersIfNeeded() {
-        guard let au = audioUnit else { return }
-        let bridge = EqualizerParameterBridge.shared
-        let gen = bridge.currentGeneration()
-        guard gen != lastAppliedGeneration else { return }
-
-        let snapshot = bridge.readSnapshot()
+    func applyParametersIfNeeded(from snapshot: EqualizerParameterBridge.RealtimeSnapshot) {
+        guard let au = audioUnit, snapshot.generation != lastAppliedGeneration else { return }
         AudioUnitSetParameter(au, kAUNBandEQParam_GlobalGain, kAudioUnitScope_Global, 0, snapshot.preampDb, 0)
-        for index in 0..<min(snapshot.bandGains.count, 10) {
+        for index in 0..<10 {
             AudioUnitSetParameter(
                 au,
                 kAUNBandEQParam_Gain + UInt32(index),
                 kAudioUnitScope_Global,
                 0,
-                snapshot.bandGains[index],
+                snapshot.bandGain(at: index),
                 0
             )
         }
@@ -166,7 +171,7 @@ private let eqAudioUnitInputCallback: AURenderCallback = { (
         return noErr
     }
     var sourceFrames: CMItemCount = 0
-    return MTAudioProcessingTapGetSourceAudio(
+    let status = MTAudioProcessingTapGetSourceAudio(
         tap,
         CMItemCount(inNumberFrames),
         ioData,
@@ -174,6 +179,22 @@ private let eqAudioUnitInputCallback: AURenderCallback = { (
         nil,
         &sourceFrames
     )
+    context.didPullSourceAudio = true
+    context.lastSourceFrames = sourceFrames
+    let requested = Int(inNumberFrames)
+    let received = max(0, min(requested, Int(sourceFrames)))
+    if status == noErr && received < requested {
+        let validBytes = received * Int(context.bytesPerFrame)
+        let bufferList = UnsafeMutableAudioBufferListPointer(ioData)
+        for buffer in bufferList {
+            guard let data = buffer.mData else { continue }
+            let totalBytes = Int(buffer.mDataByteSize)
+            if validBytes < totalBytes {
+                memset(data.advanced(by: validBytes), 0, totalBytes - validBytes)
+            }
+        }
+    }
+    return status
 }
 
 private let eqTapInit: MTAudioProcessingTapInitCallback = { (tap, clientInfo, tapStorageOut) in
@@ -201,7 +222,7 @@ private let eqTapUnprepare: MTAudioProcessingTapUnprepareCallback = { (tap) in
 private let eqTapProcess: MTAudioProcessingTapProcessCallback = { (
     tap,
     numberFrames,
-    _,
+    flags,
     bufferListInOut,
     numberFramesOut,
     flagsOut
@@ -209,18 +230,31 @@ private let eqTapProcess: MTAudioProcessingTapProcessCallback = { (
     let storage = MTAudioProcessingTapGetStorage(tap)
     let context = Unmanaged<EqualizerTapContext>.fromOpaque(storage).takeUnretainedValue()
 
+    if let latest = EqualizerParameterBridge.shared.tryReadRealtimeSnapshot() {
+        context.cachedSnapshot = latest
+    }
+    let snapshot = context.cachedSnapshot
+
     // Если эквалайзер выключен, все полосы нейтральны или AudioUnit не инициализирован — прозрачный bypass без вызова AudioUnitRender
-    guard EqualizerParameterBridge.shared.currentIsEnabled(),
-          !EqualizerParameterBridge.shared.isFlatAndNeutral(),
-          let au = context.audioUnit else {
+    if !snapshot.isEnabled || snapshot.isFlatAndNeutral || context.audioUnit == nil || UInt32(numberFrames) > context.maxFramesPerSlice {
+        context.wasBypassed = true
         MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, nil, numberFramesOut)
-        context.sampleCursor += Float64(numberFrames)
+        context.sampleCursor += Float64(numberFramesOut.pointee)
         return
     }
 
-    context.applyParametersIfNeeded()
+    guard let au = context.audioUnit else { return }
+
+    if (flags & MTAudioProcessingTapFlags(kMTAudioProcessingTapFlag_StartOfStream)) != 0 || context.wasBypassed {
+        AudioUnitReset(au, kAudioUnitScope_Global, 0)
+        context.wasBypassed = false
+    }
+
+    context.applyParametersIfNeeded(from: snapshot)
     context.activeTap = tap
     context.activeFlagsOut = flagsOut
+    context.didPullSourceAudio = false
+    context.lastSourceFrames = 0
 
     var actionFlags = AudioUnitRenderActionFlags(rawValue: 0)
     var timeStamp = AudioTimeStamp()
@@ -240,13 +274,16 @@ private let eqTapProcess: MTAudioProcessingTapProcessCallback = { (
     context.activeFlagsOut = nil
 
     if status == noErr {
-        numberFramesOut.pointee = numberFrames
+        numberFramesOut.pointee = context.didPullSourceAudio ? min(numberFrames, context.lastSourceFrames) : numberFrames
     } else {
-        // Аварийный пропуск чистого аудио при сбое рендера AudioUnit
-        MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, nil, numberFramesOut)
+        if !context.didPullSourceAudio {
+            MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut, flagsOut, nil, numberFramesOut)
+        } else {
+            numberFramesOut.pointee = 0
+        }
     }
 
-    context.sampleCursor += Float64(numberFrames)
+    context.sampleCursor += Float64(numberFramesOut.pointee)
 }
 
 // MARK: - SDK-Agnostic MTAudioProcessingTapCreate Bridge

@@ -13,6 +13,8 @@ public struct SettingsView: View {
     @UIState private var isMemoryCompressed = false
     @UIState private var isCacheCleared = false
     @UIState private var isScrolled = false
+    @UIState private var compressFeedbackTask: Task<Void, Never>? = nil
+    @UIState private var clearCacheFeedbackTask: Task<Void, Never>? = nil
 
     public init() {}
 
@@ -312,9 +314,9 @@ public struct SettingsView: View {
                                 Spacer()
 
                                 let duration = audioEngine.qualitySettings.crossfadeDuration
-                                Text(duration < 0.25 ? "Выключен" : String(format: "%.1f сек", duration))
+                                Text(duration < 0.5 ? "Выключен" : String(format: "%.1f сек", duration))
                                     .font(.system(size: 12, weight: .semibold).monospacedDigit())
-                                    .foregroundStyle(duration < 0.25 ? YMTheme.fg40 : YMTheme.accent)
+                                    .foregroundStyle(duration < 0.5 ? YMTheme.fg40 : YMTheme.accent)
                             }
 
                             YMSlider(
@@ -444,16 +446,25 @@ public struct SettingsView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 60)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "settings_scroll",
-                    threshold: 48,
-                    isScrolled: $isScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "settings_scroll",
+                        threshold: 48,
+                        isScrolled: $isScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 48, isScrolled: $isScrolled)
         .coordinateSpace(name: "settings_scroll")
         .overlay(alignment: .top) {
             YMStickyTopBar(title: "Настройки", isVisible: isScrolled)
+        }
+        .onDisappear {
+            compressFeedbackTask?.cancel()
+            compressFeedbackTask = nil
+            clearCacheFeedbackTask?.cancel()
+            clearCacheFeedbackTask = nil
         }
         .ymScreenBackground()
     }
@@ -712,6 +723,12 @@ public struct SettingsView: View {
         Button {
             audioEngine.qualitySettings.purgeUnusedMemory()
             isMemoryCompressed = true
+            compressFeedbackTask?.cancel()
+            compressFeedbackTask = Task {
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                guard !Task.isCancelled else { return }
+                isMemoryCompressed = false
+            }
         } label: {
             Text("Выгрузить неиспользуемую память")
                 .fixedSize(horizontal: true, vertical: false)
@@ -722,10 +739,15 @@ public struct SettingsView: View {
     @ViewBuilder
     private var clearDiskCacheButton: some View {
         Button {
-            Task {
+            clearCacheFeedbackTask?.cancel()
+            clearCacheFeedbackTask = Task {
                 await networkClient.clearCache()
                 ImagePipeline.shared.clearCache()
+                YMBackdropBlurProcessor.shared.clearCache()
                 isCacheCleared = true
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                guard !Task.isCancelled else { return }
+                isCacheCleared = false
             }
         } label: {
             Text("Очистить дисковый кэш")

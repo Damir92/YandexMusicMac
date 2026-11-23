@@ -15,11 +15,12 @@ public actor YMNetworkClient {
         let infos: [YMDownloadInfo]
     }
     private var streamInfosCache: [String: CachedStreamInfos] = [:]
-    private let streamCacheTTL: TimeInterval = 600 // 10 минут
-    /// Tiny bounded in-memory LRC cache (max 2 tracks) so switching lyrics display modes is instant
+    private let streamCacheTTL: TimeInterval = 120 // 2 минуты
+    /// Bounded in-memory LRC cache (max 12 tracks) so switching lyrics display modes is instant
     private var lyricsLRCCache: [String: YMSyncedLyrics] = [:]
     private var lyricsLRCCacheOrder: [String] = []
 
+    public static let userAgent = "Yandex-Music-API"
     public static let clientHeader = "YandexMusicAndroid/24023621"
     public static let acceptLanguage = "ru"
 
@@ -126,14 +127,12 @@ public actor YMNetworkClient {
             var existingItems = components.queryItems ?? []
             existingItems.append(contentsOf: queryItems)
 
-            // Percent-encode query item values properly, especially ensuring '+' is encoded as '%2B',
-            // '/' as '%2F', and ',' as '%2C' (RFC 3986 unreserved: alphanumerics and "-._~").
+            // Percent-encode query item names and values strictly using RFC 3986 unreserved: alphanumerics and "-._~".
+            let rfc3986Unreserved = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
             var queryParts: [String] = []
             for item in existingItems {
-                let name = item.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? item.name
-                let value = item.value?.addingPercentEncoding(
-                    withAllowedCharacters: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
-                ) ?? ""
+                let name = item.name.addingPercentEncoding(withAllowedCharacters: rfc3986Unreserved) ?? item.name
+                let value = item.value?.addingPercentEncoding(withAllowedCharacters: rfc3986Unreserved) ?? ""
                 queryParts.append("\(name)=\(value)")
             }
             components.percentEncodedQuery = queryParts.joined(separator: "&")
@@ -156,6 +155,7 @@ public actor YMNetworkClient {
                                finalURL.host?.lowercased() == baseURL.host?.lowercased()
 
         if isTrustedAPIHost {
+            request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
             request.setValue(Self.clientHeader, forHTTPHeaderField: "X-Yandex-Music-Client")
             if let token = self.token, !token.isEmpty {
                 request.setValue("OAuth \(token)", forHTTPHeaderField: "Authorization")
@@ -200,9 +200,13 @@ public actor YMNetworkClient {
     /// Step 2: GET {downloadInfoUrl}&format=json -> Parse host, path, ts, s
     public func fetchStreamData(from downloadInfoURL: URL) async throws -> YMStreamData {
         var components = URLComponents(url: downloadInfoURL, resolvingAgainstBaseURL: false)
-        var queryItems = components?.queryItems ?? []
-        queryItems.append(URLQueryItem(name: "format", value: "json"))
-        components?.queryItems = queryItems
+        if components?.queryItems?.contains(where: { $0.name == "format" }) != true {
+            if let existing = components?.percentEncodedQuery, !existing.isEmpty {
+                components?.percentEncodedQuery = existing + "&format=json"
+            } else {
+                components?.percentEncodedQuery = "format=json"
+            }
+        }
 
         guard let targetURL = components?.url else {
             throw YMAPIError.invalidURL(downloadInfoURL.absoluteString)
@@ -219,8 +223,25 @@ public actor YMNetworkClient {
            let result = envelope.result {
             return result
         }
+        if let xmlData = parseStorageXML(data: data) {
+            return xmlData
+        }
 
         throw YMAPIError.decodingError("Unable to decode YMStreamData from storage endpoint")
+    }
+
+    private func parseStorageXML(data: Data) -> YMStreamData? {
+        let parser = XMLParser(data: data)
+        let delegate = YMStorageXMLParserDelegate()
+        parser.delegate = delegate
+        guard parser.parse(),
+              let host = delegate.host, !host.isEmpty,
+              let path = delegate.path, !path.isEmpty,
+              let ts = delegate.ts, !ts.isEmpty,
+              let s = delegate.s, !s.isEmpty else {
+            return nil
+        }
+        return YMStreamData(host: host, path: path, ts: ts, s: s, region: delegate.region.flatMap(Int.init))
     }
 
     // MARK: - Direct Audio Stream Resolution Models
@@ -311,15 +332,15 @@ public actor YMNetworkClient {
             self.codec = try? container.decodeIfPresent(String.self, forKey: .codec)
             self.quality = try? container.decodeIfPresent(String.self, forKey: .quality)
 
-            if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitrate) {
+            if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitrate), bInt > 0 {
                 self.bitrate = bInt > 5000 ? bInt / 1000 : bInt
-            } else if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitrateInKbps) {
+            } else if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitrateInKbps), bInt > 0 {
                 self.bitrate = bInt > 5000 ? bInt / 1000 : bInt
-            } else if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitRate) {
+            } else if let bInt = try? container.decodeIfPresent(Int.self, forKey: .bitRate), bInt > 0 {
                 self.bitrate = bInt > 5000 ? bInt / 1000 : bInt
-            } else if let bStr = try? container.decodeIfPresent(String.self, forKey: .bitrate), let parsed = Int(bStr) {
+            } else if let bStr = try? container.decodeIfPresent(String.self, forKey: .bitrate), let parsed = Int(bStr), parsed > 0 {
                 self.bitrate = parsed > 5000 ? parsed / 1000 : parsed
-            } else if let bStr = try? container.decodeIfPresent(String.self, forKey: .bitrateInKbps), let parsed = Int(bStr) {
+            } else if let bStr = try? container.decodeIfPresent(String.self, forKey: .bitrateInKbps), let parsed = Int(bStr), parsed > 0 {
                 self.bitrate = parsed > 5000 ? parsed / 1000 : parsed
             } else {
                 self.bitrate = nil
@@ -339,21 +360,24 @@ public actor YMNetworkClient {
         }
     }
 
-    /// Requests direct CDN stream via GET /get-file-info with signature validation
+    /// Internal helper requesting direct CDN stream via GET /get-file-info for either Desktop or Android protocol
     private func fetchFileInfoStream(
         trackId: String,
         quality: String = "lossless",
         codecs: String,
-        expectedBitrateHint: Int? = nil
-    ) async -> YMDownloadInfo? {
+        expectedBitrateHint: Int? = nil,
+        useDesktopClient: Bool
+    ) async -> (info: YMDownloadInfo?, isUnauthorized: Bool) {
         let ts = String(Int(Date().timeIntervalSince1970))
         let cleanTrackId = trackId.components(separatedBy: ":").first ?? trackId
+        let secretKey = useDesktopClient ? YMAudioURLSigner.desktopFileInfoSecretKey : YMAudioURLSigner.fileInfoSecretKey
         let sign = YMAudioURLSigner.computeFileInfoSign(
             ts: ts,
             trackId: cleanTrackId,
             quality: quality,
             codecs: codecs,
-            transports: "raw"
+            transports: "raw",
+            secretKey: secretKey
         )
 
         let queryItems = [
@@ -365,15 +389,18 @@ public actor YMNetworkClient {
             URLQueryItem(name: "sign", value: sign)
         ]
 
+        let customHeaders = useDesktopClient ? ["X-Yandex-Music-Client": YMAudioURLSigner.desktopClientHeader] : nil
+
         do {
             let (data, response) = try await performRawRequest(
                 endpoint: "/get-file-info",
                 queryItems: queryItems,
+                headers: customHeaders,
                 cachePolicy: .reloadIgnoringLocalCacheData
             )
 
             guard (200...299).contains(response.statusCode) else {
-                return nil
+                return (nil, false)
             }
 
             let payload: YMFileInfoPayload?
@@ -384,14 +411,14 @@ public actor YMNetworkClient {
                 payload = try? decoder.decode(YMFileInfoPayload.self, from: data)
             }
 
-            guard let payload = payload else { return nil }
+            guard let payload = payload else { return (nil, false) }
             if payload.downloadInfo?.isEncrypted == true {
-                return nil
+                return (nil, false)
             }
 
             guard let directUrlStr = payload.downloadInfo?.effectiveURLString ?? payload.url ?? payload.urls?.first,
                   let directURL = URL(string: directUrlStr) else {
-                return nil
+                return (nil, false)
             }
 
             let returnedCodec = (payload.downloadInfo?.codec ?? payload.codec ?? "mp3").lowercased()
@@ -419,16 +446,52 @@ public actor YMNetworkClient {
 
             let isLossless = isFlacOrAlac || resolvedBitrate > 500
 
-            return YMDownloadInfo(
+            let info = YMDownloadInfo(
                 codec: returnedCodec,
                 bitrateInKbps: resolvedBitrate,
                 downloadInfoUrl: directURL,
                 direct: true,
                 lossless: isLossless
             )
+            return (info, false)
+        } catch let apiError as YMAPIError {
+            if case .unauthorized = apiError {
+                return (nil, true)
+            }
+            return (nil, false)
         } catch {
+            return (nil, false)
+        }
+    }
+
+    /// Requests direct CDN stream via GET /get-file-info with Desktop protocol, falling back safely to Android protocol
+    private func fetchFileInfoStream(
+        trackId: String,
+        quality: String = "lossless",
+        codecs: String,
+        expectedBitrateHint: Int? = nil
+    ) async -> YMDownloadInfo? {
+        let desktopResult = await fetchFileInfoStream(
+            trackId: trackId,
+            quality: quality,
+            codecs: codecs,
+            expectedBitrateHint: expectedBitrateHint,
+            useDesktopClient: true
+        )
+        if let info = desktopResult.info {
+            return info
+        }
+        if desktopResult.isUnauthorized {
             return nil
         }
+        let fallbackResult = await fetchFileInfoStream(
+            trackId: trackId,
+            quality: quality,
+            codecs: codecs,
+            expectedBitrateHint: expectedBitrateHint,
+            useDesktopClient: false
+        )
+        return fallbackResult.info
     }
 
     /// Resolves direct stream URL taking into account requested quality preset and codec preference.
@@ -447,6 +510,7 @@ public actor YMNetworkClient {
         }
 
         let allOptions: [YMDownloadInfo]
+        var catalogError: Error? = nil
 
         if !forceRefresh,
            let cached = streamInfosCache[cleanTrackId],
@@ -454,14 +518,15 @@ public actor YMNetworkClient {
            !cached.infos.isEmpty {
             allOptions = cached.infos
         } else {
-            async let catalogTask: [YMDownloadInfo] = {
+            async let catalogTask: (infos: [YMDownloadInfo], error: Error?) = {
                 do {
                     let catalog = try await getDownloadInfo(for: cleanTrackId)
                     // Оставляем все поддерживаемые потоки каталога (MP3 320/192/128, AAC 192/64), отсеивая только flac
-                    return catalog.filter { !($0.codec.lowercased().contains("flac")) }
+                    let filtered = catalog.filter { !($0.codec.lowercased().contains("flac")) }
+                    return (filtered, nil)
                 } catch {
                     print("[YMNetworkClient] getDownloadInfo error for \(cleanTrackId): \(error)")
-                    return []
+                    return ([], error)
                 }
             }()
 
@@ -472,13 +537,16 @@ public actor YMNetworkClient {
             async let aacHqTask = fetchFileInfoStream(trackId: cleanTrackId, quality: "lossless", codecs: "aac,aac-mp4", expectedBitrateHint: 256)
             async let heAacTask = fetchFileInfoStream(trackId: cleanTrackId, quality: "lossless", codecs: "he-aac,he-aac-mp4", expectedBitrateHint: 64)
 
-            let (catalogInfos, flacInfo, mp3HqInfo, aacHqInfo, heAacInfo) = await (
+            let (catalogResult, flacInfo, mp3HqInfo, aacHqInfo, heAacInfo) = await (
                 catalogTask,
                 flacTask,
                 mp3HqTask,
                 aacHqTask,
                 heAacTask
             )
+
+            let catalogInfos = catalogResult.infos
+            catalogError = catalogResult.error
 
             var candidates: [YMDownloadInfo] = []
             // 1. Сначала добавляем прямые потоки из /get-file-info (FLAC, MP3 320, AAC, HE-AAC)
@@ -541,12 +609,24 @@ public actor YMNetworkClient {
            let found = allOptions.first(where: { $0.matchesVariant(specific) }) {
             selected = found
         } else if let specific = specificInfo {
+            if specific.isDirectCdnStream && !forceRefresh {
+                return try await resolveAudioStream(
+                    for: trackId,
+                    preset: preset,
+                    codecPreference: codecPreference,
+                    specificInfo: specificInfo,
+                    forceRefresh: true
+                )
+            }
             selected = specific
         } else if let matched = allOptions.selectDownloadInfo(preset: preset, codecPreference: codecPreference) {
             selected = matched
         } else if let fallback = allOptions.selectBestAudioDownloadInfo() {
             selected = fallback
         } else {
+            if let catalogError = catalogError as? YMAPIError, case .unauthorized = catalogError {
+                throw YMAPIError.unauthorized
+            }
             throw YMAPIError.decodingError("No suitable audio download stream found for track \(trackId)")
         }
 
@@ -576,6 +656,8 @@ public actor YMNetworkClient {
         session.configuration.urlCache?.removeAllCachedResponses()
         URLCache.shared.removeAllCachedResponses()
         streamInfosCache.removeAll()
+        lyricsLRCCache.removeAll()
+        lyricsLRCCacheOrder.removeAll()
     }
 
     // MARK: - Account Status Verification
@@ -596,8 +678,7 @@ public actor YMNetworkClient {
         for chunkStart in stride(from: 0, to: trackIds.count, by: chunkSize) {
             let chunkEnd = min(chunkStart + chunkSize, trackIds.count)
             let chunk = Array(trackIds[chunkStart..<chunkEnd])
-            let bodyString = "track-ids=" + chunk.joined(separator: ",")
-            guard let bodyData = bodyString.data(using: .utf8) else { continue }
+            let bodyData = Self.formEncodedBody([("track-ids", chunk.joined(separator: ","))])
 
             do {
                 let chunkTracks: [YMTrack] = try await request(
@@ -741,6 +822,9 @@ public actor YMNetworkClient {
         guard (200...299).contains(response.statusCode) else {
             throw YMAPIError.httpError(statusCode: response.statusCode, data: data)
         }
+        if let env = try? decoder.decode(YMResponse<String>.self, from: data), env.error != nil {
+            _ = try env.unwrap()
+        }
     }
 
     /// POST /users/{uid}/playlists/{kind}/change-relative (insert tracks)
@@ -761,25 +845,41 @@ public actor YMNetworkClient {
             let tracks: [DiffTrack]
         }
 
-        let diffTracks = tracks.map { track in
-            let cleanId = track.id.components(separatedBy: ":").first ?? track.id
-            let albumId = track.albums.first?.id
+        let diffTracks = tracks.map { track -> DiffTrack in
+            let parts = track.id.split(separator: ":", maxSplits: 1).map(String.init)
+            let cleanId = parts.first ?? track.id
+            let albumId = track.albums.first?.id ?? (parts.count > 1 ? parts[1] : nil)
             return DiffTrack(id: cleanId, albumId: albumId)
         }
         let diffPayload = [InsertDiff(op: "insert", at: max(0, index), tracks: diffTracks)]
         let diffData = try encoder.encode(diffPayload)
         let diffJSON = String(data: diffData, encoding: .utf8) ?? "[]"
 
-        return try await request(
-            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
-            method: "POST",
-            body: Self.formEncodedBody([
-                ("diff", diffJSON),
-                ("revision", String(revision))
-            ]),
-            headers: ["Content-Type": "application/x-www-form-urlencoded"],
-            cachePolicy: .reloadIgnoringLocalCacheData
-        )
+        do {
+            return try await request(
+                endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
+                method: "POST",
+                body: Self.formEncodedBody([
+                    ("kind", String(kind)),
+                    ("diff", diffJSON),
+                    ("revision", String(revision))
+                ]),
+                headers: ["Content-Type": "application/x-www-form-urlencoded"],
+                cachePolicy: .reloadIgnoringLocalCacheData
+            )
+        } catch let YMAPIError.httpError(statusCode, _) where statusCode == 404 || statusCode == 405 {
+            return try await request(
+                endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change",
+                method: "POST",
+                body: Self.formEncodedBody([
+                    ("kind", String(kind)),
+                    ("diff", diffJSON),
+                    ("revision", String(revision))
+                ]),
+                headers: ["Content-Type": "application/x-www-form-urlencoded"],
+                cachePolicy: .reloadIgnoringLocalCacheData
+            )
+        }
     }
 
     /// POST /users/{uid}/playlists/{kind}/change-relative (delete track at index)
@@ -789,25 +889,44 @@ public actor YMNetworkClient {
         revision: Int,
         at index: Int
     ) async throws -> YMPlaylist {
+        guard index >= 0 else {
+            throw YMAPIError.serverError(name: "invalid-index", message: "Invalid track index")
+        }
+
         struct DeleteDiff: Encodable {
             let op: String
             let from: Int
             let to: Int
         }
-        let diffPayload = [DeleteDiff(op: "delete", from: max(0, index), to: max(0, index) + 1)]
+        let diffPayload = [DeleteDiff(op: "delete", from: index, to: index + 1)]
         let diffData = try encoder.encode(diffPayload)
         let diffJSON = String(data: diffData, encoding: .utf8) ?? "[]"
 
-        return try await request(
-            endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
-            method: "POST",
-            body: Self.formEncodedBody([
-                ("diff", diffJSON),
-                ("revision", String(revision))
-            ]),
-            headers: ["Content-Type": "application/x-www-form-urlencoded"],
-            cachePolicy: .reloadIgnoringLocalCacheData
-        )
+        do {
+            return try await request(
+                endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change-relative",
+                method: "POST",
+                body: Self.formEncodedBody([
+                    ("kind", String(kind)),
+                    ("diff", diffJSON),
+                    ("revision", String(revision))
+                ]),
+                headers: ["Content-Type": "application/x-www-form-urlencoded"],
+                cachePolicy: .reloadIgnoringLocalCacheData
+            )
+        } catch let YMAPIError.httpError(statusCode, _) where statusCode == 404 || statusCode == 405 {
+            return try await request(
+                endpoint: "/users/\(Self.escapePath(uid))/playlists/\(kind)/change",
+                method: "POST",
+                body: Self.formEncodedBody([
+                    ("kind", String(kind)),
+                    ("diff", diffJSON),
+                    ("revision", String(revision))
+                ]),
+                headers: ["Content-Type": "application/x-www-form-urlencoded"],
+                cachePolicy: .reloadIgnoringLocalCacheData
+            )
+        }
     }
 
     // MARK: - Search & Artist API
@@ -891,7 +1010,8 @@ public actor YMNetworkClient {
         do {
             envelope = try await request(
                 endpoint: "/tracks/\(Self.escapePath(numericId))/lyrics",
-                queryItems: queryItems
+                queryItems: queryItems,
+                cachePolicy: .reloadIgnoringLocalCacheData
             )
         } catch {
             return nil
@@ -913,7 +1033,7 @@ public actor YMNetworkClient {
         s3Request.timeoutInterval = 15
         let (data, response) = try await session.data(for: s3Request)
         guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200,
+              (200...299).contains(httpResponse.statusCode),
               let lrcContent = String(data: data, encoding: .utf8) else {
             return nil
         }
@@ -923,7 +1043,7 @@ public actor YMNetworkClient {
             lyricsLRCCache[numericId] = synced
             lyricsLRCCacheOrder.removeAll { $0 == numericId }
             lyricsLRCCacheOrder.append(numericId)
-            while lyricsLRCCacheOrder.count > 2 {
+            while lyricsLRCCacheOrder.count > 12 {
                 let evicted = lyricsLRCCacheOrder.removeFirst()
                 lyricsLRCCache.removeValue(forKey: evicted)
             }
@@ -944,6 +1064,57 @@ public actor YMNetworkClient {
         return response.similarTracks
     }
 
+    /// Internal helper performing unified search for page 0 once to eliminate duplicate network requests
+    private func fetchSearchAllPageZero(trimmed: String) async throws -> (response: YMSearchResponse, tracks: [YMTrack]) {
+        let queryItems = [
+            URLQueryItem(name: "text", value: trimmed),
+            URLQueryItem(name: "type", value: "all"),
+            URLQueryItem(name: "page", value: "0"),
+            URLQueryItem(name: "nocorrect", value: "false")
+        ]
+
+        let response: YMSearchResponse = try await request(endpoint: "/search", queryItems: queryItems)
+        let directTracks = response.tracks?.results ?? []
+
+        // Check if best match is an artist or if top artist closely matches query
+        var matchingArtistId: String? = nil
+        if response.best?.type == "artist", let artistId = response.best?.result?.id {
+            matchingArtistId = artistId
+        } else if let firstArtist = response.artists?.results.first {
+            let artistName = firstArtist.name.lowercased()
+            let q = trimmed.lowercased()
+            if artistName == q || artistName.contains(q) || q.contains(artistName) {
+                matchingArtistId = firstArtist.id
+            }
+        }
+
+        if let artistId = matchingArtistId {
+            // Fetch top tracks for matching artist
+            let artistTracks = (try? await fetchArtistTracks(artistId: artistId, page: 0, pageSize: 20)) ?? []
+            if !artistTracks.isEmpty {
+                var combined: [YMTrack] = []
+                var seenIds = Set<String>()
+                // Prepend artist's top tracks
+                for t in artistTracks {
+                    if !seenIds.contains(t.id) {
+                        seenIds.insert(t.id)
+                        combined.append(t)
+                    }
+                }
+                // Append direct matching tracks
+                for t in directTracks {
+                    if !seenIds.contains(t.id) {
+                        seenIds.insert(t.id)
+                        combined.append(t)
+                    }
+                }
+                return (response, combined)
+            }
+        }
+
+        return (response, directTracks)
+    }
+
     /// Comprehensive unified search returning tracks, artists, and albums:
     /// GET /search?text={query}&type=all&page={page}&nocorrect=false
     public func searchAll(query: String, page: Int = 0) async throws -> YMFullSearchResult {
@@ -952,19 +1123,10 @@ public actor YMNetworkClient {
             return YMFullSearchResult(tracks: [], artists: [], albums: [])
         }
 
-        let tracks = try await searchTracks(query: trimmed, page: page)
-
         if page == 0 {
-            let queryItems = [
-                URLQueryItem(name: "text", value: trimmed),
-                URLQueryItem(name: "type", value: "all"),
-                URLQueryItem(name: "page", value: "0"),
-                URLQueryItem(name: "nocorrect", value: "false")
-            ]
-
-            let response: YMSearchResponse? = try? await request(endpoint: "/search", queryItems: queryItems)
-            var directAlbums = response?.albums?.results ?? []
-            var directArtists = response?.artists?.results ?? []
+            let (response, tracks) = try await fetchSearchAllPageZero(trimmed: trimmed)
+            var directAlbums = response.albums?.results ?? []
+            var directArtists = response.artists?.results ?? []
 
             // Extract unique albums from tracks if directAlbums has few/none
             var seenAlbumIds = Set(directAlbums.map(\.id))
@@ -992,6 +1154,7 @@ public actor YMNetworkClient {
                 albums: Array(directAlbums.prefix(16))
             )
         } else {
+            let tracks = try await searchTracks(query: trimmed, page: page)
             return YMFullSearchResult(tracks: tracks, artists: [], albums: [])
         }
     }
@@ -1003,54 +1166,8 @@ public actor YMNetworkClient {
         guard !trimmed.isEmpty else { return [] }
 
         if page == 0 {
-            // First page uses type=all to discover both matching tracks and artist matches
-            let queryItems = [
-                URLQueryItem(name: "text", value: trimmed),
-                URLQueryItem(name: "type", value: "all"),
-                URLQueryItem(name: "page", value: "0"),
-                URLQueryItem(name: "nocorrect", value: "false")
-            ]
-
-            let response: YMSearchResponse = try await request(endpoint: "/search", queryItems: queryItems)
-            let directTracks = response.tracks?.results ?? []
-
-            // Check if best match is an artist or if top artist closely matches query
-            var matchingArtistId: String? = nil
-            if response.best?.type == "artist", let artistId = response.best?.result?.id {
-                matchingArtistId = artistId
-            } else if let firstArtist = response.artists?.results.first {
-                let artistName = firstArtist.name.lowercased()
-                let q = trimmed.lowercased()
-                if artistName == q || artistName.contains(q) || q.contains(artistName) {
-                    matchingArtistId = firstArtist.id
-                }
-            }
-
-            if let artistId = matchingArtistId {
-                // Fetch top tracks for matching artist
-                let artistTracks = (try? await fetchArtistTracks(artistId: artistId, page: 0, pageSize: 20)) ?? []
-                if !artistTracks.isEmpty {
-                    var combined: [YMTrack] = []
-                    var seenIds = Set<String>()
-                    // Prepend artist's top tracks
-                    for t in artistTracks {
-                        if !seenIds.contains(t.id) {
-                            seenIds.insert(t.id)
-                            combined.append(t)
-                        }
-                    }
-                    // Append direct matching tracks
-                    for t in directTracks {
-                        if !seenIds.contains(t.id) {
-                            seenIds.insert(t.id)
-                            combined.append(t)
-                        }
-                    }
-                    return combined
-                }
-            }
-
-            return directTracks
+            let (_, tracks) = try await fetchSearchAllPageZero(trimmed: trimmed)
+            return tracks
         } else {
             // Subsequent pages paginate through tracks
             let queryItems = [
@@ -1061,6 +1178,38 @@ public actor YMNetworkClient {
             ]
             let response: YMSearchResponse = try await request(endpoint: "/search", queryItems: queryItems)
             return response.tracks?.results ?? []
+        }
+    }
+}
+
+// MARK: - XML Parser Delegate for Audio Storage Responses
+
+private final class YMStorageXMLParserDelegate: NSObject, XMLParserDelegate, @unchecked Sendable {
+    var host: String?
+    var path: String?
+    var ts: String?
+    var s: String?
+    var region: String?
+
+    private var currentText = ""
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
+        currentText = ""
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        currentText += string
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let trimmed = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch elementName {
+        case "host": host = trimmed
+        case "path": path = trimmed
+        case "ts": ts = trimmed
+        case "s": s = trimmed
+        case "region": region = trimmed
+        default: break
         }
     }
 }

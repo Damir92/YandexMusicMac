@@ -1,46 +1,167 @@
 import SwiftUI
 
+// MARK: - Wave Session Controller
+
+/// Centralized manager for "Моя волна" state and background queue expansion.
+/// Replaces temporary SwiftUI struct closures with strong/weak lifecycle hooks,
+/// allowing custom waves (by artist, playlist, track) and background pagination to work seamlessly from any view.
+@Observable
+@MainActor
+public final class WaveSessionController {
+    public static let shared = WaveSessionController()
+
+    public var waveTracks: [YMTrack] = []
+    public var dashboardStations: [YMPersonalWaveStation] = []
+    public var isLoadingDashboard = false
+    public var isLoadingWave = false
+    public var isLoadingMoreWave = false
+    public var errorMessage: String? = nil
+    public var toastMessage: String? = nil
+
+    private var toastDismissTask: Task<Void, Never>? = nil
+    private var waveStartTask: Task<Void, Never>? = nil
+    private var lastEmptyMoreTracksAt: Date? = nil
+
+    private init() {
+        installAudioEngineHooks()
+    }
+
+    public var displayedWaveTracks: [YMTrack] {
+        let engine = AudioPlayerEngine.shared
+        if engine.isWaveMode && !engine.queue.isEmpty {
+            return engine.queue
+        }
+        return waveTracks
+    }
+
+    public func installAudioEngineHooks() {
+        let engine = AudioPlayerEngine.shared
+        engine.onQueueNeedsMoreTracks = { [weak self] in
+            Task { @MainActor in
+                await self?.loadMoreTracks()
+            }
+        }
+
+        engine.onStartCustomWaveRequested = { [weak self] context, vibe in
+            Task { @MainActor in
+                self?.startWave(context: context, vibe: vibe ?? .defaultWave)
+            }
+        }
+    }
+
+    public func loadDashboardStationsIfNeeded() async {
+        guard dashboardStations.isEmpty && !isLoadingDashboard else { return }
+        isLoadingDashboard = true
+        let fetched = await RotorService.shared.fetchRecommendedWaves()
+        self.dashboardStations = fetched
+        self.isLoadingDashboard = false
+    }
+
+    public func startWave(context: YMWaveContext, vibe: YMWaveVibePreset) {
+        waveStartTask?.cancel()
+        isLoadingWave = true
+        errorMessage = nil
+        lastEmptyMoreTracksAt = nil
+
+        waveStartTask = Task {
+            do {
+                let initialTracks = try await RotorService.shared.startWave(context: context, vibe: vibe)
+                guard !Task.isCancelled else { return }
+                self.waveTracks = initialTracks
+                self.isLoadingWave = false
+                let engine = AudioPlayerEngine.shared
+                engine.activeWaveContext = context
+                engine.activeWaveVibe = vibe
+                engine.isWaveMode = true
+                engine.setQueue(initialTracks, startingAt: 0)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.isLoadingWave = false
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    public func loadMoreTracks() async {
+        let currentList = displayedWaveTracks
+        guard !isLoadingMoreWave, let lastTrack = currentList.last else { return }
+
+        // Short cooldown (2 seconds) if server returned an empty batch, avoiding scroll spam
+        if let lastEmpty = lastEmptyMoreTracksAt, Date().timeIntervalSince(lastEmpty) < 2.0 {
+            return
+        }
+
+        isLoadingMoreWave = true
+        defer { isLoadingMoreWave = false }
+
+        do {
+            let queueIds = currentList.suffix(25).map(\.rotorTrackIdentifier)
+            let nextBatch = try await RotorService.shared.fetchNextBatch(
+                lastTrackId: lastTrack.rotorTrackIdentifier,
+                queueHistory: queueIds
+            )
+            if nextBatch.isEmpty {
+                lastEmptyMoreTracksAt = Date()
+            } else {
+                lastEmptyMoreTracksAt = nil
+                let engine = AudioPlayerEngine.shared
+                if engine.isWaveMode {
+                    engine.appendToQueue(nextBatch)
+                    waveTracks = engine.queue
+                } else {
+                    waveTracks.append(contentsOf: nextBatch)
+                }
+            }
+        } catch {
+            print("[WaveSessionController] Error loading more wave tracks: \(error)")
+        }
+    }
+
+    public func showToast(_ message: String) {
+        toastDismissTask?.cancel()
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            toastMessage = message
+        }
+        toastDismissTask = Task {
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                self.toastMessage = nil
+            }
+        }
+    }
+}
+
+// MARK: - Modern Monolithic "Моя волна" View
+
 /// Modern, monolithic "Моя волна" hub.
 /// Combines an atmospheric glass Hero Stage with a single unified adaptive grid for
 /// the base wave, mood/tempo modifiers, and personalized Rotor dashboard stations,
 /// plus on-demand full genre catalog search and infinite track queue.
 /// Does NOT auto-play on navigation.
 public struct MyWaveView: View {
-    @UIState private var waveTracks: [YMTrack] = []
-    @UIState private var rotorService = RotorService.shared
+    @UIState private var waveController = WaveSessionController.shared
     @UIState private var audioEngine = AudioPlayerEngine.shared
     @UIState private var windowState = WindowState.shared
     @UIState private var coordinator = NavigationCoordinator.shared
-    @UIState private var likesService = LikesService.shared
     @UIState private var authService = AuthService.shared
     @UIState private var rotorDiagnosticsStore = RotorDiagnosticsStore.shared
 
     @UIState private var selectedFilter: YMWaveCategoryFilter = .forYou
-    @UIState private var dashboardStations: [YMPersonalWaveStation] = []
-    @UIState private var isLoadingDashboard = false
     @UIState private var isCatalogSheetPresented = false
-
-    @UIState private var isLoadingWave = false
-    @UIState private var isLoadingMoreWave = false
-    @UIState private var errorMessage: String? = nil
-    @UIState private var toastMessage: String? = nil
-    @UIState private var toastDismissTask: Task<Void, Never>? = nil
-    @UIState private var waveStartTask: Task<Void, Never>? = nil
-
-    @UIState private var isFlameActive: Bool = false
     @UIState private var isScrolled: Bool = false
+    @Namespace private var filterTabNamespace
+
+    private let rotorService = RotorService.shared
 
     public init() {}
 
     private var displayedWaveTracks: [YMTrack] {
-        if audioEngine.isWaveMode && !audioEngine.queue.isEmpty {
-            return audioEngine.queue
-        }
-        return waveTracks
+        waveController.displayedWaveTracks
     }
 
     private var unifiedItems: [YMUnifiedWaveItem] {
-        YMUnifiedWaveItem.items(for: selectedFilter, dashboardStations: dashboardStations)
+        YMUnifiedWaveItem.items(for: selectedFilter, dashboardStations: waveController.dashboardStations)
     }
 
     public var body: some View {
@@ -55,7 +176,7 @@ public struct MyWaveView: View {
                 }
 
                 // Tuning / Wave Feedback Toast
-                if let toast = toastMessage {
+                if let toast = waveController.toastMessage {
                     HStack(spacing: 8) {
                         Image(systemName: "sparkles")
                             .foregroundColor(YMTheme.accent)
@@ -78,7 +199,7 @@ public struct MyWaveView: View {
                 }
 
                 // Error Banner
-                if let error = errorMessage {
+                if let error = waveController.errorMessage {
                     HStack(spacing: 12) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
@@ -87,7 +208,7 @@ public struct MyWaveView: View {
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("Повторить") {
-                            startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
+                            waveController.startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
                         }
                         .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 28))
                     }
@@ -108,13 +229,16 @@ public struct MyWaveView: View {
             }
             .padding(.bottom, 80)
             .background(alignment: .top) {
-                YMScrollTopSentinel(
-                    coordinateSpaceName: "mywave_scroll",
-                    threshold: 64,
-                    isScrolled: $isScrolled
-                )
+                if #unavailable(macOS 15.0) {
+                    YMScrollTopSentinel(
+                        coordinateSpaceName: "mywave_scroll",
+                        threshold: 64,
+                        isScrolled: $isScrolled
+                    )
+                }
             }
         }
+        .ymTrackScrollOffset(threshold: 64, isScrolled: $isScrolled)
         .coordinateSpace(name: "mywave_scroll")
         .overlay(alignment: .top) {
             YMStickyTopBar(
@@ -130,20 +254,19 @@ public struct MyWaveView: View {
                 activeContextSeeds: audioEngine.activeWaveContext.seeds,
                 onSelectStation: { station in
                     isCatalogSheetPresented = false
-                    startWave(context: station.toWaveContext(), vibe: audioEngine.activeWaveVibe)
-                    showToast("Запущена волна «\(station.title)»")
+                    waveController.startWave(context: station.toWaveContext(), vibe: audioEngine.activeWaveVibe)
+                    waveController.showToast("Запущена волна «\(station.title)»")
                 }
             )
         }
         .task {
-            await loadDashboardStationsIfNeeded()
+            await waveController.loadDashboardStationsIfNeeded()
         }
         .onAppear {
-            // NEVER auto-start playback on navigation
             if audioEngine.isWaveMode && !audioEngine.queue.isEmpty {
-                waveTracks = audioEngine.queue
+                waveController.waveTracks = audioEngine.queue
             }
-            setupWaveChangeHooks()
+            waveController.installAudioEngineHooks()
         }
     }
 
@@ -174,7 +297,7 @@ public struct MyWaveView: View {
             // Central Glass Stage Card
             Group {
                 if let track = activeTrack {
-                    activeGlassStageCard(track: track)
+                    ActiveGlassStageCard(track: track, aiInsight: aiInsightText(for: track), onToast: waveController.showToast)
                 } else {
                     idleGlassStageCard
                 }
@@ -190,7 +313,18 @@ public struct MyWaveView: View {
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(YMTheme.border, lineWidth: 1)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(YMTheme.isLight ? 0.65 : 0.14),
+                                YMTheme.border,
+                                YMTheme.border.opacity(0.6)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
             )
             .shadow(color: YMTheme.shadowColor, radius: 14, y: 5)
         }
@@ -227,6 +361,11 @@ public struct MyWaveView: View {
                     .padding(.vertical, 3)
                     .background(Capsule().fill(YMTheme.accent.opacity(0.15)))
                 }
+
+                if waveController.isLoadingWave {
+                    ProgressView()
+                        .controlSize(.small)
+                }
             }
 
             Text(audioEngine.activeWaveContext.subtitle)
@@ -241,15 +380,15 @@ public struct MyWaveView: View {
         HStack(spacing: 8) {
             if audioEngine.activeWaveContext != .myWaveDefault {
                 removableFilterChip(title: audioEngine.activeWaveContext.title, icon: "waveform") {
-                    startWave(context: .myWaveDefault, vibe: audioEngine.activeWaveVibe)
-                    showToast("Возврат к базовой «Моей волне»")
+                    waveController.startWave(context: .myWaveDefault, vibe: audioEngine.activeWaveVibe)
+                    waveController.showToast("Возврат к базовой «Моей волне»")
                 }
             }
 
             if audioEngine.activeWaveVibe != .defaultWave {
                 removableFilterChip(title: audioEngine.activeWaveVibe.title, icon: audioEngine.activeWaveVibe.iconName) {
-                    startWave(context: audioEngine.activeWaveContext, vibe: .defaultWave)
-                    showToast("Сброс характера звучания")
+                    waveController.startWave(context: audioEngine.activeWaveContext, vibe: .defaultWave)
+                    waveController.showToast("Сброс характера звучания")
                 }
             }
         }
@@ -284,240 +423,7 @@ public struct MyWaveView: View {
         .help("Сбросить фильтр «\(title)»")
     }
 
-    // MARK: - Glass Stage Card (Active & Idle)
-
-    @ViewBuilder
-    private func activeGlassStageCard(track: YMTrack) -> some View {
-        if windowState.isCompactWidth {
-            VStack(spacing: 14) {
-                HStack(spacing: 14) {
-                    activeTrackCoverButton(track: track, size: 64, cornerRadius: 10, eqMaxHeight: 20)
-                    activeTrackMeta(track: track)
-                    Spacer(minLength: 4)
-                }
-
-                activeTrackControls(
-                    track: track,
-                    playDiscSize: windowState.isMiniWidth ? 40 : 42,
-                    playIconSize: 15,
-                    spacing: windowState.isMiniWidth ? 8 : 12
-                )
-                .frame(maxWidth: .infinity, alignment: .center)
-            }
-            .padding(windowState.isMiniWidth ? 12 : 16)
-        } else {
-            HStack(spacing: 18) {
-                activeTrackCoverButton(track: track, size: 88, cornerRadius: 12, eqMaxHeight: 24)
-                activeTrackMeta(track: track)
-                Spacer(minLength: 12)
-                activeTrackControls(track: track, playDiscSize: 46, playIconSize: 17, spacing: 10)
-            }
-            .padding(16)
-        }
-    }
-
-    @ViewBuilder
-    private func activeTrackCoverButton(track: YMTrack, size: CGFloat, cornerRadius: CGFloat, eqMaxHeight: CGFloat) -> some View {
-        Button {
-            if let album = track.albums.first {
-                coordinator.navigate(to: .album(id: album.id, title: album.title))
-            }
-        } label: {
-            ZStack {
-                CachedCoverImage(
-                    coverUri: track.effectiveCoverUri,
-                    size: .medium,
-                    displaySize: size,
-                    cornerRadius: cornerRadius
-                )
-
-                if audioEngine.isPlaying {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: cornerRadius)
-                            .fill(Color.black.opacity(0.50))
-                            .frame(width: size, height: size)
-
-                        YMPlayingEqualizerView(
-                            color: YMTheme.accent,
-                            barWidth: 3,
-                            maxHeight: eqMaxHeight,
-                            isPlaying: true
-                        )
-                    }
-                    .frame(width: size, height: size)
-                }
-            }
-            .frame(width: size, height: size)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .shadow(color: YMTheme.shadowColor, radius: 10, y: 4)
-        }
-        .buttonStyle(.plain)
-        .help("Перейти к альбому")
-    }
-
-    @ViewBuilder
-    private func activeTrackMeta(track: YMTrack) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(track.displayTitle)
-                .font(.system(size: windowState.isCompactWidth ? 15 : 17, weight: .bold))
-                .foregroundStyle(YMTheme.fg)
-                .lineLimit(1)
-
-            if !track.artists.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(track.artists) { artist in
-                        MyWaveHeroArtistButton(artist: artist) {
-                            coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
-                        }
-
-                        if artist.id != track.artists.last?.id {
-                            Text("•")
-                                .font(.system(size: 8))
-                                .foregroundStyle(YMTheme.fg40)
-                        }
-                    }
-                }
-            } else {
-                Text(track.artistsString)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(YMTheme.fg60)
-                    .lineLimit(1)
-            }
-
-            HStack(spacing: 5) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(YMTheme.accent)
-                Text(aiInsightText(for: track))
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(YMTheme.fg40)
-                    .lineLimit(1)
-            }
-            .padding(.top, 2)
-        }
-        .layoutPriority(1)
-    }
-
-    @ViewBuilder
-    private func activeTrackControls(track: YMTrack, playDiscSize: CGFloat, playIconSize: CGFloat, spacing: CGFloat) -> some View {
-        let iconButtonSize: CGFloat = windowState.isMiniWidth ? 28 : 32
-
-        HStack(spacing: spacing) {
-            // 1. Dislike (Less Like This)
-            stageIconButton(
-                systemName: "hand.thumbsdown.fill",
-                color: YMTheme.fg60,
-                size: iconButtonSize,
-                help: "Меньше таких треков"
-            ) {
-                audioEngine.applyWaveTuning(.lessLikeThis)
-                showToast("Меньше таких треков в волне")
-            }
-
-            // 2. Previous
-            stageIconButton(
-                systemName: "backward.fill",
-                color: YMTheme.fg80,
-                size: iconButtonSize,
-                showBackground: false,
-                help: "Предыдущий трек"
-            ) {
-                audioEngine.previous()
-            }
-
-            // 3. Signature Golden Play / Pause Disc (46x46)
-            Button {
-                audioEngine.togglePlayPause()
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(YMTheme.accentFill)
-                        .frame(width: playDiscSize, height: playDiscSize)
-                        .shadow(color: YMTheme.accentFill.opacity(audioEngine.isPlaying ? 0.34 : 0.16), radius: 9, y: 2)
-
-                    Image(systemName: audioEngine.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: playIconSize, weight: .bold))
-                        .foregroundColor(Color.black)
-                        .offset(x: audioEngine.isPlaying ? 0 : 1)
-                }
-            }
-            .buttonStyle(.plain)
-            .help(audioEngine.isPlaying ? "Пауза" : "Воспроизведение")
-
-            // 4. Next
-            stageIconButton(
-                systemName: "forward.fill",
-                color: YMTheme.fg80,
-                size: iconButtonSize,
-                showBackground: false,
-                help: "Следующий трек"
-            ) {
-                audioEngine.next()
-            }
-
-            // 5. Flame (More Like This)
-            stageIconButton(
-                systemName: "flame.fill",
-                color: isFlameActive ? Color.orange : YMTheme.accent,
-                size: iconButtonSize,
-                help: "Больше таких треков"
-            ) {
-                audioEngine.applyWaveTuning(.moreLikeThis)
-                isFlameActive = true
-                showToast("Больше треков в стиле «\(track.displayTitle)»")
-                Task {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    await MainActor.run { isFlameActive = false }
-                }
-            }
-
-            // 6. Shake / Diversity ("Встряхнуть")
-            stageIconButton(
-                systemName: "sparkles",
-                color: YMTheme.fg80,
-                size: iconButtonSize,
-                help: "Встряхнуть поток и добавить открытий"
-            ) {
-                audioEngine.applyWaveTuning(.moreDiversity)
-                showToast("Перенастройка волны: добавлено больше открытий")
-            }
-
-            // 7. Like (Heart)
-            stageIconButton(
-                systemName: likesService.isLiked(trackId: track.id) ? "heart.fill" : "heart",
-                color: likesService.isLiked(trackId: track.id) ? YMTheme.heartRed : YMTheme.fg60,
-                size: iconButtonSize,
-                help: likesService.isLiked(trackId: track.id) ? "Удалить из Мне нравится" : "Мне нравится"
-            ) {
-                Task {
-                    await likesService.toggleLike(track: track)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func stageIconButton(
-        systemName: String,
-        color: Color,
-        size: CGFloat,
-        showBackground: Bool = true,
-        help: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: windowState.isMiniWidth ? 12 : 13, weight: .semibold))
-                .foregroundStyle(color)
-                .frame(width: size, height: size)
-                .background(
-                    Circle().fill(showBackground ? YMTheme.surfaceComponent : Color.clear)
-                )
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
+    // MARK: - Glass Stage Card (Idle)
 
     @ViewBuilder
     private var idleGlassStageCard: some View {
@@ -538,7 +444,7 @@ public struct MyWaveView: View {
                 }
 
                 Button {
-                    startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
+                    waveController.startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "play.fill")
@@ -568,7 +474,7 @@ public struct MyWaveView: View {
                 Spacer(minLength: 12)
 
                 Button {
-                    startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
+                    waveController.startWave(context: audioEngine.activeWaveContext, vibe: audioEngine.activeWaveVibe)
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "play.fill")
@@ -642,7 +548,7 @@ public struct MyWaveView: View {
                         .foregroundStyle(YMTheme.fg)
                         .fixedSize(horizontal: true, vertical: false)
 
-                    categorySegmentedControl(compact: false)
+                    categorySegmentedControl(compact: false, scope: "wide")
 
                     Spacer(minLength: 8)
 
@@ -660,13 +566,13 @@ public struct MyWaveView: View {
                         allGenresButton
                     }
 
-                    categorySegmentedControl(compact: windowState.isMiniWidth)
+                    categorySegmentedControl(compact: windowState.isMiniWidth, scope: "stacked")
                 }
             }
             .padding(.horizontal, horizontalPad)
 
             // Single Adaptive Grid of Unified Wave Cards
-            if isLoadingDashboard && dashboardStations.isEmpty && selectedFilter == .genresAndArtists {
+            if waveController.isLoadingDashboard && waveController.dashboardStations.isEmpty && selectedFilter == .genresAndArtists {
                 HStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.small)
@@ -706,12 +612,12 @@ public struct MyWaveView: View {
     }
 
     @ViewBuilder
-    private func categorySegmentedControl(compact: Bool) -> some View {
+    private func categorySegmentedControl(compact: Bool, scope: String) -> some View {
         HStack(spacing: 4) {
             ForEach(YMWaveCategoryFilter.allCases) { filter in
                 let isSelected = selectedFilter == filter
                 Button {
-                    withAnimation(.easeOut(duration: 0.16)) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                         selectedFilter = filter
                     }
                 } label: {
@@ -721,10 +627,13 @@ public struct MyWaveView: View {
                         .fixedSize(horizontal: true, vertical: false)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(isSelected ? YMTheme.accentFill : Color.clear)
-                        )
+                        .background {
+                            if isSelected {
+                                Capsule(style: .continuous)
+                                    .fill(YMTheme.accentFill)
+                                    .matchedGeometryEffect(id: "wave_filter_capsule_\(scope)", in: filterTabNamespace)
+                            }
+                        }
                 }
                 .buttonStyle(.plain)
             }
@@ -779,27 +688,27 @@ public struct MyWaveView: View {
     private func handleUnifiedItemTap(_ item: YMUnifiedWaveItem) {
         switch item {
         case .baseWave:
-            startWave(context: .myWaveDefault, vibe: .defaultWave)
-            showToast("Запущена базовая «Моя волна»")
+            waveController.startWave(context: .myWaveDefault, vibe: .defaultWave)
+            waveController.showToast("Запущена базовая «Моя волна»")
 
         case .station(let station):
             let context = station.toWaveContext()
-            startWave(context: context, vibe: audioEngine.activeWaveVibe)
+            waveController.startWave(context: context, vibe: audioEngine.activeWaveVibe)
             if audioEngine.activeWaveVibe != .defaultWave {
-                showToast("Волна «\(station.title)» • \(audioEngine.activeWaveVibe.title)")
+                waveController.showToast("Волна «\(station.title)» • \(audioEngine.activeWaveVibe.title)")
             } else {
-                showToast("Запущена волна «\(station.title)»")
+                waveController.showToast("Запущена волна «\(station.title)»")
             }
 
         case .vibe(let preset):
             let nextVibe: YMWaveVibePreset = (audioEngine.activeWaveVibe == preset) ? .defaultWave : preset
-            startWave(context: audioEngine.activeWaveContext, vibe: nextVibe)
+            waveController.startWave(context: audioEngine.activeWaveContext, vibe: nextVibe)
             if nextVibe == .defaultWave {
-                showToast("Характер звучания сброшен на «По умолчанию»")
+                waveController.showToast("Характер звучания сброшен на «По умолчанию»")
             } else if audioEngine.activeWaveContext != .myWaveDefault {
-                showToast("«\(audioEngine.activeWaveContext.title)» • \(nextVibe.title)")
+                waveController.showToast("«\(audioEngine.activeWaveContext.title)» • \(nextVibe.title)")
             } else {
-                showToast("Характер волны: \(nextVibe.title)")
+                waveController.showToast("Характер волны: \(nextVibe.title)")
             }
         }
     }
@@ -880,14 +789,14 @@ public struct MyWaveView: View {
 
                 Spacer()
 
-                if isLoadingMoreWave {
+                if waveController.isLoadingMoreWave {
                     ProgressView()
                         .scaleEffect(0.8)
                 }
             }
             .padding(.horizontal, windowState.isMiniWidth ? 16 : 24)
 
-            if displayedWaveTracks.isEmpty && isLoadingWave {
+            if displayedWaveTracks.isEmpty && waveController.isLoadingWave {
                 VStack(spacing: 12) {
                     ProgressView()
                         .scaleEffect(1.1)
@@ -906,7 +815,7 @@ public struct MyWaveView: View {
                     },
                     onLoadMore: {
                         Task {
-                            await loadMoreTracks()
+                            await waveController.loadMoreTracks()
                         }
                     }
                 )
@@ -950,98 +859,6 @@ public struct MyWaveView: View {
         }
     }
 
-    // MARK: - Wave Logic & Telemetry
-
-    private func loadDashboardStationsIfNeeded() async {
-        guard dashboardStations.isEmpty && !isLoadingDashboard else { return }
-        isLoadingDashboard = true
-        let fetched = await rotorService.fetchRecommendedWaves()
-        await MainActor.run {
-            self.dashboardStations = fetched
-            self.isLoadingDashboard = false
-        }
-    }
-
-    private func startWave(context: YMWaveContext, vibe: YMWaveVibePreset) {
-        waveStartTask?.cancel()
-        isLoadingWave = true
-        errorMessage = nil
-
-        waveStartTask = Task {
-            do {
-                let initialTracks = try await rotorService.startWave(context: context, vibe: vibe)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self.waveTracks = initialTracks
-                    self.isLoadingWave = false
-                    self.audioEngine.activeWaveContext = context
-                    self.audioEngine.activeWaveVibe = vibe
-                    self.audioEngine.isWaveMode = true
-                    self.audioEngine.setQueue(initialTracks, startingAt: 0)
-                }
-            } catch {
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self.isLoadingWave = false
-                    self.errorMessage = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private func loadMoreTracks() async {
-        let currentList = displayedWaveTracks
-        guard !isLoadingMoreWave, let lastTrack = currentList.last else { return }
-        isLoadingMoreWave = true
-        defer { isLoadingMoreWave = false }
-
-        do {
-            let queueIds = currentList.suffix(25).map(\.rotorTrackIdentifier)
-            let nextBatch = try await rotorService.fetchNextBatch(
-                lastTrackId: lastTrack.rotorTrackIdentifier,
-                queueHistory: queueIds
-            )
-            if audioEngine.isWaveMode {
-                audioEngine.appendToQueue(nextBatch)
-                waveTracks = audioEngine.queue
-            } else {
-                waveTracks.append(contentsOf: nextBatch)
-            }
-        } catch {
-            print("[MyWaveView] Error loading more wave tracks: \(error)")
-        }
-    }
-
-    private func setupWaveChangeHooks() {
-        audioEngine.onQueueNeedsMoreTracks = {
-            Task {
-                await loadMoreTracks()
-            }
-        }
-
-        audioEngine.onStartCustomWaveRequested = { [self] context, vibe in
-            Task { @MainActor in
-                self.startWave(context: context, vibe: vibe ?? .defaultWave)
-            }
-        }
-    }
-
-    private func showToast(_ message: String) {
-        toastDismissTask?.cancel()
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            toastMessage = message
-        }
-        toastDismissTask = Task {
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                withAnimation(.easeInOut(duration: 0.3)) {
-                    self.toastMessage = nil
-                }
-            }
-        }
-    }
-
     fileprivate static func color(fromHex hex: String) -> Color? {
         let cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
         guard cleaned.count == 6, let value = UInt64(cleaned, radix: 16) else { return nil }
@@ -1053,6 +870,14 @@ public struct MyWaveView: View {
 }
 
 // MARK: - Unified Wave Item Card (Clean Single-Layer Hover)
+
+private struct UnifiedWaveCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
 
 private struct UnifiedWaveItemCard: View {
     let item: YMUnifiedWaveItem
@@ -1084,6 +909,10 @@ private struct UnifiedWaveItemCard: View {
                     }
                 }
                 .frame(width: 34, height: 34)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                )
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.title)
@@ -1136,8 +965,14 @@ private struct UnifiedWaveItemCard: View {
             .animation(.easeOut(duration: 0.14), value: isHovered)
             .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
-        .buttonStyle(.plain)
-        .onHover { isHovered = $0 }
+        .buttonStyle(UnifiedWaveCardButtonStyle())
+        .onHover { inside in
+            if inside && TrackHoverManager.shared.isScrollSuppressed { return }
+            if isHovered != inside { isHovered = inside }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false }
+        }
         .help(item.subtitle)
     }
 }
@@ -1153,6 +988,7 @@ private struct AllCatalogWavesSheet: View {
     @UIState private var catalogStations: [YMPersonalWaveStation] = []
     @UIState private var searchQuery: String = ""
     @UIState private var isLoading = true
+    @UIState private var loadError: String? = nil
 
     private var filteredStations: [YMPersonalWaveStation] {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1237,6 +1073,22 @@ private struct AllCatalogWavesSheet: View {
                         .foregroundStyle(YMTheme.fg40)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let error = loadError {
+                VStack(spacing: 12) {
+                    Image(systemName: "wifi.slash")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(YMTheme.fg)
+                    Button("Повторить") {
+                        Task {
+                            await loadCatalog()
+                        }
+                    }
+                    .buttonStyle(YMGlassPillButtonStyle(primary: true, height: 28))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if filteredStations.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "magnifyingglass")
@@ -1272,12 +1124,20 @@ private struct AllCatalogWavesSheet: View {
         .frame(width: 560, height: 480)
         .ymScreenBackground()
         .task {
-            let stations = await rotorService.fetchAllCatalogWaves()
-            await MainActor.run {
-                self.catalogStations = stations
-                self.isLoading = false
-            }
+            await loadCatalog()
         }
+    }
+
+    private func loadCatalog() async {
+        isLoading = true
+        loadError = nil
+        let stations = await rotorService.fetchAllCatalogWaves()
+        if stations.isEmpty {
+            self.loadError = "Не удалось загрузить каталог станций"
+        } else {
+            self.catalogStations = stations
+        }
+        self.isLoading = false
     }
 }
 
@@ -1322,5 +1182,293 @@ private struct YMPulsingWaveEmblem: View {
         }
         .animation(.easeInOut(duration: 0.2), value: isHovered)
         .onHover { isHovered = $0 }
+    }
+}
+
+// MARK: - Dedicated Glass Stage Card & Controls Components
+
+private struct StageIconButton: View {
+    let systemName: String
+    let color: Color
+    let size: CGFloat
+    var showBackground: Bool = true
+    let help: String
+    let action: () -> Void
+
+    @UIState private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: size <= 28 ? 12 : 13, weight: .semibold))
+                .foregroundStyle(isHovered ? (color == YMTheme.fg60 || color == YMTheme.fg80 ? YMTheme.fg : color) : color)
+                .frame(width: size, height: size)
+                .background(
+                    Circle().fill(isHovered ? YMTheme.surfaceComponentHover : (showBackground ? YMTheme.surfaceComponent : Color.clear))
+                )
+                .scaleEffect(isHovered ? 1.06 : 1.0)
+                .animation(.spring(response: 0.22, dampingFraction: 0.75), value: isHovered)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help(help)
+    }
+}
+
+private struct ActiveTrackLikeButton: View {
+    let track: YMTrack
+    let iconButtonSize: CGFloat
+    @UIState private var likesService = LikesService.shared
+
+    var body: some View {
+        let isLiked = likesService.isLiked(trackId: track.id)
+        StageIconButton(
+            systemName: isLiked ? "heart.fill" : "heart",
+            color: isLiked ? YMTheme.heartRed : YMTheme.fg60,
+            size: iconButtonSize,
+            help: isLiked ? "Удалить из Мне нравится" : "Мне нравится"
+        ) {
+            Task {
+                await likesService.toggleLike(track: track)
+            }
+        }
+    }
+}
+
+private struct ActiveTrackControls: View {
+    let track: YMTrack
+    let playDiscSize: CGFloat
+    let playIconSize: CGFloat
+    let spacing: CGFloat
+    let onToast: (String) -> Void
+
+    @UIState private var audioEngine = AudioPlayerEngine.shared
+    @UIState private var windowState = WindowState.shared
+    @UIState private var isFlameActive = false
+    @UIState private var flameResetTask: Task<Void, Never>? = nil
+
+    var body: some View {
+        let iconButtonSize: CGFloat = windowState.isMiniWidth ? 28 : 32
+
+        HStack(spacing: spacing) {
+            // 1. Dislike (Less Like This)
+            StageIconButton(
+                systemName: "hand.thumbsdown.fill",
+                color: YMTheme.fg60,
+                size: iconButtonSize,
+                help: "Меньше таких треков"
+            ) {
+                audioEngine.applyWaveTuning(.lessLikeThis)
+                onToast("Меньше таких треков в волне")
+            }
+
+            // 2. Previous
+            StageIconButton(
+                systemName: "backward.fill",
+                color: YMTheme.fg80,
+                size: iconButtonSize,
+                showBackground: false,
+                help: "Предыдущий трек"
+            ) {
+                audioEngine.previous()
+            }
+
+            // 3. Signature Golden Play / Pause Disc (46x46)
+            Button {
+                audioEngine.togglePlayPause()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(YMTheme.accentFill)
+                        .frame(width: playDiscSize, height: playDiscSize)
+                        .shadow(color: YMTheme.accentFill.opacity(audioEngine.isPlaying ? 0.34 : 0.16), radius: 9, y: 2)
+
+                    Image(systemName: audioEngine.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: playIconSize, weight: .bold))
+                        .foregroundColor(Color.black)
+                        .offset(x: audioEngine.isPlaying ? 0 : 1)
+                }
+            }
+            .buttonStyle(.plain)
+            .help(audioEngine.isPlaying ? "Пауза" : "Воспроизведение")
+
+            // 4. Next
+            StageIconButton(
+                systemName: "forward.fill",
+                color: YMTheme.fg80,
+                size: iconButtonSize,
+                showBackground: false,
+                help: "Следующий трек"
+            ) {
+                audioEngine.next()
+            }
+
+            // 5. Flame (More Like This)
+            StageIconButton(
+                systemName: "flame.fill",
+                color: isFlameActive ? Color.orange : YMTheme.accent,
+                size: iconButtonSize,
+                help: "Больше таких треков"
+            ) {
+                audioEngine.applyWaveTuning(.moreLikeThis)
+                flameResetTask?.cancel()
+                isFlameActive = true
+                onToast("Больше треков в стиле «\(track.displayTitle)»")
+                flameResetTask = Task {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run { isFlameActive = false }
+                }
+            }
+
+            // 6. Shake / Diversity ("Встряхнуть")
+            StageIconButton(
+                systemName: "sparkles",
+                color: YMTheme.fg80,
+                size: iconButtonSize,
+                help: "Встряхнуть поток и добавить открытий"
+            ) {
+                audioEngine.applyWaveTuning(.moreDiversity)
+                onToast("Перенастройка волны: добавлено больше открытий")
+            }
+
+            // 7. Like (Heart) - Isolated Observation
+            ActiveTrackLikeButton(track: track, iconButtonSize: iconButtonSize)
+        }
+        .onDisappear {
+            flameResetTask?.cancel()
+            flameResetTask = nil
+        }
+    }
+}
+
+private struct ActiveGlassStageCard: View {
+    let track: YMTrack
+    let aiInsight: String
+    let onToast: (String) -> Void
+
+    @UIState private var windowState = WindowState.shared
+    @UIState private var coordinator = NavigationCoordinator.shared
+    @UIState private var audioEngine = AudioPlayerEngine.shared
+
+    var body: some View {
+        if windowState.isCompactWidth {
+            VStack(spacing: 14) {
+                HStack(spacing: 14) {
+                    activeTrackCoverButton(size: 64, cornerRadius: 10, eqMaxHeight: 20)
+                    activeTrackMeta
+                    Spacer(minLength: 4)
+                }
+
+                ActiveTrackControls(
+                    track: track,
+                    playDiscSize: windowState.isMiniWidth ? 40 : 42,
+                    playIconSize: 15,
+                    spacing: windowState.isMiniWidth ? 8 : 12,
+                    onToast: onToast
+                )
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .padding(windowState.isMiniWidth ? 12 : 16)
+        } else {
+            HStack(spacing: 18) {
+                activeTrackCoverButton(size: 88, cornerRadius: 12, eqMaxHeight: 24)
+                activeTrackMeta
+                Spacer(minLength: 12)
+                ActiveTrackControls(
+                    track: track,
+                    playDiscSize: 46,
+                    playIconSize: 17,
+                    spacing: 10,
+                    onToast: onToast
+                )
+            }
+            .padding(16)
+        }
+    }
+
+    @ViewBuilder
+    private func activeTrackCoverButton(size: CGFloat, cornerRadius: CGFloat, eqMaxHeight: CGFloat) -> some View {
+        Button {
+            if let album = track.albums.first {
+                coordinator.navigate(to: .album(id: album.id, title: album.title))
+            }
+        } label: {
+            ZStack {
+                CachedCoverImage(
+                    coverUri: track.effectiveCoverUri,
+                    size: .medium,
+                    displaySize: size,
+                    cornerRadius: cornerRadius
+                )
+
+                if audioEngine.isPlaying {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: cornerRadius)
+                            .fill(Color.black.opacity(0.50))
+                            .frame(width: size, height: size)
+
+                        YMPlayingEqualizerView(
+                            color: YMTheme.accent,
+                            barWidth: 3,
+                            maxHeight: eqMaxHeight,
+                            isPlaying: true
+                        )
+                    }
+                    .frame(width: size, height: size)
+                }
+            }
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .shadow(color: YMTheme.shadowColor, radius: 10, y: 4)
+        }
+        .buttonStyle(.plain)
+        .help("Перейти к альбому")
+    }
+
+    @ViewBuilder
+    private var activeTrackMeta: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(track.displayTitle)
+                .font(.system(size: windowState.isCompactWidth ? 15 : 17, weight: .bold))
+                .foregroundStyle(YMTheme.fg)
+                .lineLimit(1)
+
+            if !track.artists.isEmpty {
+                let artistsToDisplay = Array(track.artists.prefix(4))
+                HStack(spacing: 4) {
+                    ForEach(artistsToDisplay) { artist in
+                        MyWaveHeroArtistButton(artist: artist) {
+                            coordinator.navigate(to: .artist(id: artist.id, name: artist.name))
+                        }
+
+                        if artist.id != artistsToDisplay.last?.id {
+                            Text("•")
+                                .font(.system(size: 8))
+                                .foregroundStyle(YMTheme.fg40)
+                        }
+                    }
+                }
+                .clipped()
+            } else {
+                Text(track.artistsString)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(YMTheme.fg60)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 5) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(YMTheme.accent)
+                Text(aiInsight)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(YMTheme.fg40)
+                    .lineLimit(1)
+            }
+            .padding(.top, 2)
+        }
+        .layoutPriority(1)
     }
 }

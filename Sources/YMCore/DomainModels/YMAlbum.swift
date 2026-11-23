@@ -36,6 +36,7 @@ public struct YMAlbum: Codable, Sendable, Identifiable, Hashable {
         case year
         case releaseDate
         case coverUri
+        case ogImage
         case genre
         case trackCount
         case artists
@@ -53,12 +54,17 @@ public struct YMAlbum: Codable, Sendable, Identifiable, Hashable {
         self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "Unknown Album"
         self.year = try? container.decodeIfPresent(Int.self, forKey: .year)
         self.releaseDate = try? container.decodeIfPresent(String.self, forKey: .releaseDate)
-        self.coverUri = try? container.decodeIfPresent(String.self, forKey: .coverUri)
+        self.coverUri = (try? container.decodeIfPresent(String.self, forKey: .coverUri))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .ogImage))
         self.genre = try? container.decodeIfPresent(String.self, forKey: .genre)
         self.trackCount = try? container.decodeIfPresent(Int.self, forKey: .trackCount)
-        // Memory Optimization: Do not decode nested artists inside album (saves thousands of duplicate structs).
-        // Artists are already preserved in parent YMTrack.
-        self.artists = nil
+
+        if container.contains(.artists) {
+            let decoded = FlexibleArrayDecoder.decodeLossy(YMArtist.self, from: container, forKey: .artists)
+            self.artists = decoded.isEmpty ? nil : decoded
+        } else {
+            self.artists = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {

@@ -90,6 +90,7 @@ public struct YMTrack: Codable, Sendable, Identifiable, Hashable {
         case artists
         case albums
         case coverUri
+        case ogImage
         case realId
         case lyricsAvailable
         case lyricsAvailableKebab = "lyrics-available"
@@ -113,13 +114,41 @@ public struct YMTrack: Codable, Sendable, Identifiable, Hashable {
 
         self.title = (try? container.decodeIfPresent(String.self, forKey: .title)) ?? "Unknown Track"
         self.version = try? container.decodeIfPresent(String.self, forKey: .version)
-        self.durationMs = try? container.decodeIfPresent(Int.self, forKey: .durationMs)
+
+        // durationMs: Int -> Double -> String
+        if let intMs = try? container.decodeIfPresent(Int.self, forKey: .durationMs) {
+            self.durationMs = intMs
+        } else if let doubleMs = try? container.decodeIfPresent(Double.self, forKey: .durationMs) {
+            self.durationMs = Int(doubleMs)
+        } else if let stringMs = try? container.decodeIfPresent(String.self, forKey: .durationMs) {
+            self.durationMs = Int(stringMs)
+        } else {
+            self.durationMs = nil
+        }
+
         self.available = try? container.decodeIfPresent(Bool.self, forKey: .available)
-        self.artists = (try? container.decodeIfPresent([YMArtist].self, forKey: .artists)) ?? []
-        // Memory Optimization: retain only the primary album (UI & Rotor only use albums.first)
-        let rawAlbums = (try? container.decodeIfPresent([YMAlbum].self, forKey: .albums)) ?? []
-        self.albums = rawAlbums.first.map { [$0] } ?? []
-        self.coverUri = try? container.decodeIfPresent(String.self, forKey: .coverUri)
+        self.artists = FlexibleArrayDecoder.decodeLossy(YMArtist.self, from: container, forKey: .artists)
+
+        // Memory Optimization: retain only the primary album with artists: nil (UI & Rotor only use albums.first, saves RAM budget)
+        let rawAlbums = FlexibleArrayDecoder.decodeLossy(YMAlbum.self, from: container, forKey: .albums)
+        if let first = rawAlbums.first {
+            let slimAlbum = YMAlbum(
+                id: first.id,
+                title: first.title,
+                year: first.year,
+                releaseDate: first.releaseDate,
+                coverUri: first.coverUri,
+                genre: first.genre,
+                trackCount: first.trackCount,
+                artists: nil
+            )
+            self.albums = [slimAlbum]
+        } else {
+            self.albums = []
+        }
+
+        self.coverUri = (try? container.decodeIfPresent(String.self, forKey: .coverUri))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .ogImage))
         self.realId = FlexibleIDDecoder.decodeStringIfPresent(from: container, forKey: .realId)
         self.lyricsAvailable = (try? container.decodeIfPresent(Bool.self, forKey: .lyricsAvailable))
             ?? (try? container.decodeIfPresent(Bool.self, forKey: .lyricsAvailableKebab))
@@ -161,8 +190,10 @@ public struct YMTrack: Codable, Sendable, Identifiable, Hashable {
         albums.first?.title
     }
 
-    /// Formatted track ID with album ID required by Rotor telemetry API: "{trackId}:{albumId}"
+    /// Formatted track ID with album ID required by Rotor telemetry API: "{trackId}:{albumId}".
+    /// Avoids duplicating :albumId if ID already contains a colon.
     public var rotorTrackIdentifier: String {
+        if id.contains(":") { return id }
         let albumId = primaryAlbumId ?? "0"
         return "\(id):\(albumId)"
     }
@@ -194,11 +225,12 @@ public struct YMTrack: Codable, Sendable, Identifiable, Hashable {
 
     /// Whether lyrics are available for this track
     public var hasLyrics: Bool {
+        if let info = lyricsInfo,
+           info.hasAvailableSyncLyrics == true || info.hasAvailableTextLyrics == true {
+            return true
+        }
         if let available = lyricsAvailable {
             return available
-        }
-        if let info = lyricsInfo {
-            return info.hasAvailableTextLyrics == true || info.hasAvailableSyncLyrics == true
         }
         return false
     }

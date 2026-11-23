@@ -104,6 +104,7 @@ public final class AudioQualitySettings {
     public func purgeUnusedMemory() {
         LikesService.shared.compressMemory()
         ImagePipeline.shared.clearMemoryCache()
+        YMBackdropBlurProcessor.shared.clearCache()
         Task {
             await YMNetworkClient.shared.clearCache()
         }

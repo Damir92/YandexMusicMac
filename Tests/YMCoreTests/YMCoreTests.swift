@@ -864,11 +864,49 @@ func testRotorServiceSessionReset() async {
     #expect(track.rotorTrackIdentifier == "999:888")
 }
 
+final class MockURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.requestHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+nonisolated func makeMockNetworkClient(handler: @escaping @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)) -> YMNetworkClient {
+    MockURLProtocol.requestHandler = handler
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [MockURLProtocol.self]
+    let session = URLSession(configuration: config)
+    return YMNetworkClient(customSession: session)
+}
+
 @Test("LikesService optimistic like and unlike toggle")
 @MainActor
 func testLikesServiceOptimisticToggle() async {
     let mockKeychain = KeychainManager(service: "com.test.likes.isolated.\(UUID().uuidString)")
-    let likes = LikesService(keychain: mockKeychain)
+    try? mockKeychain.saveUserId("test_user_777")
+    let client = makeMockNetworkClient { @Sendable request in
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        let data = Data("{\"result\":\"ok\"}".utf8)
+        return (response, data)
+    }
+    let likes = LikesService(networkClient: client, keychain: mockKeychain)
 
     let testTrack = YMTrack(
         id: "777001",
@@ -889,6 +927,216 @@ func testLikesServiceOptimisticToggle() async {
     #expect(!likes.likedTracks.contains(where: { $0.id == testTrack.id }))
 }
 
+@Test("LikesService hasMoreLikes remains true after toggleLike when 100 total and 50 loaded")
+@MainActor
+func testLikesServiceHasMoreLikesAfterToggle() async throws {
+    let mockKeychain = KeychainManager(service: "com.test.likes.isolated.\(UUID().uuidString)")
+    try? mockKeychain.saveUserId("user_100")
+
+    let mockClient = makeMockNetworkClient { @Sendable request in
+        let url = request.url ?? URL(string: "https://api.music.yandex.net")!
+        let urlStr = url.absoluteString
+        if urlStr.contains("/add-multiple") || urlStr.contains("/remove") {
+            let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!
+            return (resp, Data("{\"result\":\"ok\"}".utf8))
+        } else if urlStr.contains("/likes/tracks") && request.httpMethod == "GET" {
+            let items = (1...100).map { "{\"id\": \"\($0)\"}" }.joined(separator: ",")
+            let json = "{\"result\":{\"library\":{\"tracks\":[\(items)]}}}"
+            let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!
+            return (resp, Data(json.utf8))
+        } else if urlStr.hasSuffix("/tracks") && request.httpMethod == "POST" {
+            let tracks = (1...50).map { "{\"id\": \"\($0)\", \"title\": \"Track \($0)\"}" }.joined(separator: ",")
+            let json = "{\"result\":[\(tracks)]}"
+            let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:])!
+            return (resp, Data(json.utf8))
+        }
+        let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: [:])!
+        return (resp, Data())
+    }
+
+    let likes = LikesService(networkClient: mockClient, keychain: mockKeychain)
+    _ = try await likes.fetchLikedTracks(initialLimit: 50)
+    #expect(likes.hasMoreLikes == true)
+
+    // Toggle like for a new track
+    let newTrack = YMTrack(id: "9999", title: "New Liked Track")
+    await likes.toggleLike(track: newTrack)
+    #expect(likes.hasMoreLikes == true)
+}
+
+@Test("LikesService no infinite loop with unresolvable track in ensureAllLikedTracksLoadedForSearch")
+@MainActor
+func testLikesServiceUnresolvableTrackSearch() async throws {
+    let mockKeychain = KeychainManager(service: "com.test.likes.isolated.\(UUID().uuidString)")
+    try? mockKeychain.saveUserId("user_unresolvable")
+
+    let mockClient = makeMockNetworkClient { @Sendable request in
+        let urlStr = request.url?.absoluteString ?? ""
+        if urlStr.contains("/likes/tracks") && request.httpMethod == "GET" {
+            let json = "{\"result\":{\"library\":{\"tracks\":[{\"id\": \"1\"}, {\"id\": \"999\"}]}}}"
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
+        } else if urlStr.contains("/tracks") && request.httpMethod == "POST" {
+            let json = "{\"result\":[{\"id\": \"1\", \"title\": \"Track 1\"}]}"
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(json.utf8))
+        }
+        return (HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+    }
+
+    let likes = LikesService(networkClient: mockClient, keychain: mockKeychain)
+    try await likes.syncLikes()
+    await likes.ensureAllLikedTracksLoadedForSearch()
+    #expect(likes.likedTracks.count >= 0)
+}
+
+@Test("LikesService rollback on network error without albumId")
+@MainActor
+func testLikesServiceRollbackOnNetworkError() async {
+    let mockKeychain = KeychainManager(service: "com.test.likes.isolated.\(UUID().uuidString)")
+    try? mockKeychain.saveUserId("user_error")
+
+    let mockClient = makeMockNetworkClient { @Sendable request in
+        return (HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data("Internal Server Error".utf8))
+    }
+
+    let likes = LikesService(networkClient: mockClient, keychain: mockKeychain)
+    let trackWithoutAlbum = YMTrack(id: "5000", title: "Fail Track", albums: [])
+
+    #expect(!likes.isLiked(trackId: "5000"))
+    await likes.toggleLike(track: trackWithoutAlbum)
+
+    // Should rollback because network failed and there's no albumId fallback
+    #expect(!likes.isLiked(trackId: "5000"))
+    #expect(!likes.likedTracks.contains(where: { $0.id == "5000" }))
+}
+
+@Test("YMAlbum decoding artists directly vs stripped in YMTrack.albums for RAM budget")
+func testAlbumArtistsDirectVsInTrack() throws {
+    let albumJson = """
+    {
+        "id": "100",
+        "title": "Album With Artists",
+        "artists": [
+            {"id": "a1", "name": "Artist 1"}
+        ]
+    }
+    """
+    let album = try JSONDecoder().decode(YMAlbum.self, from: Data(albumJson.utf8))
+    #expect(album.artists != nil)
+    #expect(album.artists?.first?.name == "Artist 1")
+
+    let trackJson = """
+    {
+        "id": "200",
+        "title": "Track With Album",
+        "albums": [
+            {
+                "id": "100",
+                "title": "Album With Artists",
+                "artists": [
+                    {"id": "a1", "name": "Artist 1"}
+                ]
+            }
+        ]
+    }
+    """
+    let track = try JSONDecoder().decode(YMTrack.self, from: Data(trackJson.utf8))
+    #expect(track.albums.first?.id == "100")
+    #expect(track.albums.first?.artists == nil)
+}
+
+@Test("YMTrack lyrics precedence and rotorTrackIdentifier no colon duplication")
+func testTrackLyricsAndRotorIdentifier() throws {
+    let json = """
+    {
+        "id": "300",
+        "title": "Lyrics Track",
+        "lyricsAvailable": false,
+        "lyricsInfo": {
+            "hasAvailableSyncLyrics": true,
+            "hasAvailableTextLyrics": false
+        }
+    }
+    """
+    let track = try JSONDecoder().decode(YMTrack.self, from: Data(json.utf8))
+    #expect(track.hasLyrics == true)
+
+    let trackWithColon = YMTrack(id: "300:999", title: "Colon Track", albums: [YMAlbum(id: "888", title: "A")])
+    #expect(trackWithColon.rotorTrackIdentifier == "300:999")
+}
+
+@Test("YMPlaylist cover.itemsUri takes precedence over relative cover.dir")
+func testPlaylistCoverPrecedence() throws {
+    let json = """
+    {
+        "uid": "123",
+        "kind": 3,
+        "title": "Playlist With Mosaic",
+        "cover": {
+            "dir": "/get-music-user-playlist/123/mosaic.jpg",
+            "itemsUri": ["avatars.yandex.net/get-music-content/123/%%"]
+        }
+    }
+    """
+    let playlist = try JSONDecoder().decode(YMPlaylist.self, from: Data(json.utf8))
+    #expect(playlist.coverUri == "avatars.yandex.net/get-music-content/123/%%")
+}
+
+@Test("Lossy decoding skips malformed items in YMAlbumWithTracks, YMArtistBriefInfo, and YMChartBlock")
+func testLossyDecoding() throws {
+    // 1. YMAlbumWithTracks
+    let albumJson = """
+    {
+        "id": "1",
+        "title": "Lossy Album",
+        "volumes": [
+            [
+                {"id": "t1", "title": "Track 1"},
+                {"broken": 123},
+                null,
+                {"id": "t2", "title": "Track 2"}
+            ]
+        ]
+    }
+    """
+    let album = try JSONDecoder().decode(YMAlbumWithTracks.self, from: Data(albumJson.utf8))
+    #expect(album.volumes.first?.count == 2)
+    #expect(album.volumes.first?.map(\.id) == ["t1", "t2"])
+
+    // 2. YMArtistBriefInfo
+    let artistJson = """
+    {
+        "artist": {"id": "art1", "name": "Artist 1"},
+        "popularTracks": [
+            {"id": "t1", "title": "Track 1"},
+            {"corrupted": true},
+            {"id": "t3", "title": "Track 3"}
+        ]
+    }
+    """
+    let artistInfo = try JSONDecoder().decode(YMArtistBriefInfo.self, from: Data(artistJson.utf8))
+    #expect(artistInfo.popularTracks.count == 2)
+    #expect(artistInfo.popularTracks.map(\.id) == ["t1", "t3"])
+
+    // 3. YMChartBlock
+    let chartJson = """
+    {
+        "chart": {
+            "id": "world",
+            "title": "Top Chart",
+            "tracks": [
+                {"id": "c1", "track": {"id": "tr1", "title": "Hit 1"}},
+                null,
+                {"invalid": "data"},
+                {"id": "c2", "track": {"id": "tr2", "title": "Hit 2"}}
+            ]
+        }
+    }
+    """
+    let chartResp = try JSONDecoder().decode(YMChartResponse.self, from: Data(chartJson.utf8))
+    #expect(chartResp.chart?.tracks.count == 2)
+    #expect(chartResp.chart?.tracks.map(\.id) == ["c1", "c2"])
+}
+
 @Test("Wave context creation for track and playlist")
 func testWaveContextCreation() {
     let track = YMTrack(id: "123", title: "Test Track", albums: [YMAlbum(id: "456", title: "Test Album")])
@@ -900,8 +1148,9 @@ func testWaveContextCreation() {
     let playlist = YMPlaylist(uid: "uid", kind: 1, title: "Test Playlist")
     let sampleIds = ["t1", "t2", "t3"]
     let playlistContext = YMWaveContext.forPlaylist(playlist, sampleTrackIds: sampleIds)
-    #expect(playlistContext.seeds == ["playlist:uid_1", "track:t1", "track:t2", "track:t3"])
-    #expect(playlistContext.fallbackStationId == "user:onyourwave")
+    #expect(playlistContext.seeds == ["playlist:uid_1"])
+    #expect(playlistContext.fallbackStationId == "playlist:uid_1")
+    #expect(playlistContext.fallbackTrackSeeds == ["track:t1", "track:t2", "track:t3"])
     #expect(playlistContext.title.contains("Test Playlist"))
 }
 
@@ -1206,6 +1455,7 @@ func testTrackSupplementDecoding() throws {
 }
 
 @Test("NavigationCoordinator routing and history stack")
+@MainActor
 func testNavigationCoordinatorRouting() {
     let coordinator = NavigationCoordinator()
     #expect(!coordinator.canGoBack)
@@ -1491,21 +1741,30 @@ func testRotorExtendedModelsAndDashboard() throws {
     #expect(indie.id == "genre:indie")
     #expect(indie.title == "Инди")
     #expect(indie.combineWithMyWave == true)
-    #expect(indie.toWaveContext().seeds == ["user:onyourwave", "genre:indie"])
+    #expect(indie.toWaveContext().seeds == ["genre:indie"])
 
     let artistStation = try #require(dash.stations[1].toPersonalWaveStation())
     #expect(artistStation.id == "artist:12345")
     #expect(artistStation.combineWithMyWave == false)
     #expect(artistStation.toWaveContext().seeds == ["artist:12345"])
 
-    // 4. Extended YMWaveVibePreset seeds & v1 query parameters
+    // 4. Extended YMWaveVibePreset seeds & v1 settings payload
     #expect(YMWaveVibePreset.allCases.count == 12)
-    #expect(YMWaveVibePreset.joyful.seedParameter == "mood:fun")
-    #expect(YMWaveVibePreset.sad.seedParameter == "mood:sad")
-    #expect(YMWaveVibePreset.russian.seedParameter == "language:russian")
-    #expect(YMWaveVibePreset.foreign.seedParameter == "language:not-russian")
+    #expect(YMWaveVibePreset.energetic.seedParameter == "settingMoodEnergy:active")
+    #expect(YMWaveVibePreset.calm.seedParameter == "settingMoodEnergy:calm")
+    #expect(YMWaveVibePreset.joyful.seedParameter == "settingMoodEnergy:fun")
+    #expect(YMWaveVibePreset.sad.seedParameter == "settingMoodEnergy:sad")
+    #expect(YMWaveVibePreset.unfamiliar.seedParameter == "settingDiversity:discover")
+    #expect(YMWaveVibePreset.familiar.seedParameter == "settingDiversity:favorite")
+    #expect(YMWaveVibePreset.popular.seedParameter == "settingDiversity:popular")
+    #expect(YMWaveVibePreset.russian.seedParameter == "settingLanguage:russian")
+    #expect(YMWaveVibePreset.foreign.seedParameter == "settingLanguage:not-russian")
     #expect(YMWaveVibePreset.focus.seedParameter == "activity:work")
     #expect(YMWaveVibePreset.workout.seedParameter == "activity:sport")
+    #expect(YMWaveVibePreset.energetic.v1SettingsPayload?.moodEnergy == "active")
+    #expect(YMWaveVibePreset.calm.v1SettingsPayload?.moodEnergy == "calm")
+    #expect(YMWaveVibePreset.unfamiliar.v1SettingsPayload?.diversity == "discover")
+    #expect(YMWaveVibePreset.russian.v1SettingsPayload?.language == "russian")
     #expect(YMWaveVibePreset.unfamiliar.v1QueryItems.first == URLQueryItem(name: "diversity", value: "discover"))
     #expect(YMWaveVibePreset.energetic.v1QueryItems.first == URLQueryItem(name: "moodEnergy", value: "energize"))
     #expect(YMWaveVibePreset.sad.v1QueryItems.first == URLQueryItem(name: "moodEnergy", value: "sad"))
@@ -1805,6 +2064,291 @@ func testNavigationCoordinatorDismissesFullscreenLyrics() {
     #expect(coordinator.selectedSection == .myWave)
     #expect(coordinator.isLyricsPresented == true)
 }
+
+@Test("YMAudioURLSigner desktopFileInfoSecretKey, albumId sanitization, and computeLyricsSign")
+func testAudioURLSignerDesktopAndLyrics() {
+    let ts = "1700000000"
+    let trackId = "987654"
+    let compoundTrackId = "987654:321"
+
+    // Default uses desktopFileInfoSecretKey
+    let desktopSign1 = YMAudioURLSigner.computeFileInfoSign(ts: ts, trackId: trackId, quality: "lossless")
+    let desktopSign2 = YMAudioURLSigner.computeFileInfoSign(ts: ts, trackId: compoundTrackId, quality: "lossless")
+    #expect(desktopSign1 == desktopSign2)
+    #expect(desktopSign1.count == 43)
+
+    // Android client key produces different signature
+    let androidSign = YMAudioURLSigner.computeFileInfoSign(
+        ts: ts,
+        trackId: trackId,
+        quality: "lossless",
+        secretKey: YMAudioURLSigner.fileInfoSecretKey
+    )
+    #expect(androidSign != desktopSign1)
+    #expect(androidSign.count == 43)
+
+    // Lyrics HMAC-SHA256 signing
+    let lyricsSign1 = YMAudioURLSigner.computeLyricsSign(trackId: trackId, timestamp: 1700000000)
+    let lyricsSign2 = YMAudioURLSigner.computeLyricsSign(trackId: compoundTrackId, timestamp: 1700000000)
+    #expect(lyricsSign1 == lyricsSign2)
+    #expect(!lyricsSign1.isEmpty)
+    #expect(Data(base64Encoded: lyricsSign1) != nil)
+}
+
+@Test("YMSyncedLyrics advanced parsing: BOM, inline/trailing tags, offset, collapsing, and NaN safety")
+func testSyncedLyricsAdvancedParsing() {
+    let rawLrc = """
+    \u{FEFF}[ti:Sample Song]
+    [offset:500]
+    [00:05.00]
+    [00:06.00]
+    [00:10.00]First <00:11.00>line[00:12.00]
+    [00:15.00]Second line with trailing tag[00:16.00]
+    [00:20.00]
+    [00:25.00]
+    """
+
+    let lyrics = YMSyncedLyrics.parse(lrcContent: rawLrc)
+    #expect(!lyrics.isEmpty)
+
+    // offset: 500ms shifts times earlier by 0.5s:
+    // 00:05.00 -> 4.5s
+    // 00:10.00 -> 9.5s
+    // 00:15.00 -> 14.5s
+    // Lines 00:05.00 and 00:06.00 are empty -> collapsed into a single "•••"
+    // Trailing empty lines 00:20.00 and 00:25.00 must not append a trailing "•••"
+    #expect(lyrics.lines.count == 3)
+    #expect(lyrics.lines[0].text == "•••")
+    #expect(abs(lyrics.lines[0].time - 4.5) < 0.001)
+
+    #expect(lyrics.lines[1].text == "First line")
+    #expect(abs(lyrics.lines[1].time - 9.5) < 0.001)
+
+    #expect(lyrics.lines[2].text == "Second line with trailing tag")
+    #expect(abs(lyrics.lines[2].time - 14.5) < 0.001)
+
+    // NaN / Infinity safety
+    #expect(lyrics.activeLineIndex(for: .nan) == nil)
+    #expect(lyrics.activeLineIndex(for: .infinity) == nil)
+    #expect(lyrics.activeLineIndex(for: -.infinity) == nil)
+    #expect(lyrics.activeLineIndex(for: 10.0) == 1)
+}
+
+@Test("YMAccountStatus active subscription with autoRenewable, familyAutoRenewable, nonAutoRenewable, and expired permissions")
+func testAccountStatusExtendedSubscriptions() {
+    let refNow = "2026-06-01T12:00:00Z"
+    let accountInfo = YMAccountInfo(uid: "100", now: refNow)
+
+    // 1. hasPlus: true
+    let plusStatus = YMAccountStatus(
+        account: accountInfo,
+        plus: YMPlusInfo(hasPlus: true)
+    )
+    #expect(plusStatus.hasActiveSubscription == true)
+
+    // 2. hasPlus: false, but active autoRenewable
+    let autoRenewableStatus = YMAccountStatus(
+        account: accountInfo,
+        plus: YMPlusInfo(hasPlus: false),
+        subscription: YMSubscriptionInfo(
+            autoRenewable: [
+                YMAutoRenewableInfo(expires: "2026-07-01T00:00:00Z", finished: false)
+            ]
+        )
+    )
+    #expect(autoRenewableStatus.hasActiveSubscription == true)
+
+    // 3. hasPlus: false, but active familyAutoRenewable with nil expires
+    let familyStatus = YMAccountStatus(
+        account: accountInfo,
+        plus: YMPlusInfo(hasPlus: false),
+        subscription: YMSubscriptionInfo(
+            familyAutoRenewable: [
+                YMAutoRenewableInfo(expires: nil, finished: false)
+            ]
+        )
+    )
+    #expect(familyStatus.hasActiveSubscription == true)
+
+    // 4. hasPlus: false, but active nonAutoRenewable
+    let nonAutoStatus = YMAccountStatus(
+        account: accountInfo,
+        plus: YMPlusInfo(hasPlus: false),
+        subscription: YMSubscriptionInfo(
+            nonAutoRenewable: YMNonAutoRenewableInfo(start: "2026-01-01T00:00:00Z", end: "2026-07-01T00:00:00Z")
+        )
+    )
+    #expect(nonAutoStatus.hasActiveSubscription == true)
+
+    // 5. Expired permissions.until (< referenceDate) overrides play-full-tracks
+    let expiredPermsStatus = YMAccountStatus(
+        account: accountInfo,
+        permissions: YMPermissionsInfo(until: "2026-05-01T00:00:00Z", values: ["play-full-tracks"]),
+        plus: YMPlusInfo(hasPlus: false)
+    )
+    #expect(expiredPermsStatus.hasActiveSubscription == false)
+}
+
+@Test("AuthService token extraction handles OAuth and Bearer prefixes")
+@MainActor
+func testAuthServicePrefixTokenExtraction() {
+    let token = "y0_AgAAAABpSampleToken12345"
+    #expect(AuthService.extractToken(from: "OAuth \(token)") == token)
+    #expect(AuthService.extractToken(from: "oauth \(token)") == token)
+    #expect(AuthService.extractToken(from: "Bearer \(token)") == token)
+    #expect(AuthService.extractToken(from: "bearer \(token)") == token)
+}
+
+@Test("Rotor v2 session feedback encoding has event and optional from")
+func testRotorV2SessionFeedbackEncoding() throws {
+    let event = YMRotorSessionEvent(type: .radioStarted, timestamp: "2026-11-22T12:00:00Z")
+    let req = YMRotorSessionFeedbackRequest(event: event, batchId: "b1", from: "test-from")
+    let data = try JSONEncoder().encode(req)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    #expect(json?["batchId"] as? String == "b1")
+    #expect(json?["from"] as? String == "test-from")
+    let eventDict = json?["event"] as? [String: Any]
+    #expect(eventDict?["type"] as? String == "radioStarted")
+    #expect(eventDict?["from"] == nil)
+}
+
+@Test("Rotor v1 station feedback encoding is flat and omits totalPlayedSeconds <= 0")
+func testRotorV1StationFeedbackEncoding() throws {
+    let flatReq = YMRotorStationFeedbackRequest(
+        type: .trackFinished,
+        timestamp: "2026-11-22T12:00:00Z",
+        trackId: "123:456",
+        totalPlayedSeconds: 120.5,
+        from: nil
+    )
+    let data = try JSONEncoder().encode(flatReq)
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    #expect(json?["type"] as? String == "trackFinished")
+    #expect(json?["trackId"] as? String == "123:456")
+    #expect(json?["totalPlayedSeconds"] as? Double == 120.5)
+    #expect(json?["from"] == nil)
+
+    let flatReqZero = YMRotorStationFeedbackRequest(
+        type: .skip,
+        timestamp: "2026-11-22T12:00:00Z",
+        trackId: "123",
+        totalPlayedSeconds: 0.0,
+        from: nil
+    )
+    let zeroData = try JSONEncoder().encode(flatReqZero)
+    let zeroJson = try JSONSerialization.jsonObject(with: zeroData) as? [String: Any]
+    #expect(zeroJson?["totalPlayedSeconds"] == nil)
+}
+
+@Test("WaveSessionController shared instance lifecycle and displayed wave tracks")
+@MainActor
+func testWaveSessionController() {
+    let controller = WaveSessionController.shared
+    controller.installAudioEngineHooks()
+    #expect(controller.errorMessage == nil)
+    #expect(controller.isLoadingWave == false)
+}
+
+@Test("YMThemeManager theme switching, system resolution, and themeRevisionKey")
+@MainActor
+func testThemeManagerThemeSwitching() {
+    let themeManager = YMThemeManager.shared
+    let originalTheme = themeManager.currentTheme
+
+    themeManager.setTheme(.midnight)
+    #expect(themeManager.currentTheme == .midnight)
+    #expect(themeManager.resolvedPalette.id == "midnight")
+    let midnightRevision = YMTheme.themeRevisionKey
+
+    themeManager.setTheme(.latte)
+    #expect(themeManager.currentTheme == .latte)
+    #expect(themeManager.resolvedPalette.id == "latte")
+    let latteRevision = YMTheme.themeRevisionKey
+    #expect(midnightRevision != latteRevision)
+
+    themeManager.setTheme(.dark)
+    #expect(themeManager.currentTheme == .dark)
+    #expect(themeManager.resolvedPalette.id == "graphite")
+
+    themeManager.setTheme(.system)
+    #expect(themeManager.currentTheme == .system)
+    #expect(themeManager.resolvedPalette.id == "light" || themeManager.resolvedPalette.id == "midnight")
+
+    themeManager.setTheme(originalTheme)
+}
+
+@Test("TrackHoverManager lifecycle, hover tracking, candidate resolution, and cleanup")
+@MainActor
+func testTrackHoverManagerLifecycleAndCleanup() {
+    let hoverManager = TrackHoverManager.shared
+    hoverManager.cleanup()
+
+    #expect(hoverManager.state(for: "track-101").isHovered == false)
+
+    hoverManager.handleRowHover(trackId: "track-101", isInside: true)
+    #expect(hoverManager.state(for: "track-101").isHovered == true)
+
+    hoverManager.notifyScrollActivity(debounceNanoseconds: 50_000_000)
+    #expect(hoverManager.state(for: "track-101").isHovered == false)
+
+    hoverManager.notifyScrollEnded()
+    // Since anchors are empty, candidate resolves back
+    #expect(hoverManager.state(for: "track-101").isHovered == true)
+
+    // With a dummy anchor view not added to a window, resolveHoverUnderCursor clears candidate
+    let dummyView = NSView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+    hoverManager.registerAnchor(dummyView, for: "track-101")
+    hoverManager.resolveHoverUnderCursor()
+    #expect(hoverManager.state(for: "track-101").isHovered == false)
+
+    hoverManager.cleanup()
+    #expect(hoverManager.state(for: "track-101").isHovered == false)
+}
+
+@Test("TrackHoverManager NSClipView observation and geometric anchor isolation")
+@MainActor
+func testTrackHoverManagerClipViewObservation() {
+    let hoverManager = TrackHoverManager.shared
+    hoverManager.cleanup()
+
+    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 400, height: 600))
+    let clipView = scrollView.contentView
+    hoverManager.observeScrollClipView(clipView)
+
+    let anchorView = TrackHoverAnchorNSView(frame: NSRect(x: 0, y: 0, width: 400, height: 48))
+    scrollView.documentView = anchorView
+    hoverManager.registerAnchor(anchorView, for: "track-geo")
+
+    // When anchors are present, handleRowHover is ignored in favor of geometry
+    hoverManager.handleRowHover(trackId: "track-geo", isInside: true)
+    #expect(hoverManager.state(for: "track-geo").isHovered == false)
+
+    // Posting boundsDidChange on observed clipView activates scroll suppression
+    NotificationCenter.default.post(name: NSView.boundsDidChangeNotification, object: clipView)
+    #expect(hoverManager.isScrollSuppressed == true)
+
+    hoverManager.cleanup()
+    #expect(hoverManager.isScrollSuppressed == false)
+}
+
+@Test("TrackHoverManager scroll phase lifecycle and suppression")
+@MainActor
+func testTrackHoverManagerScrollPhaseSuppression() async {
+    let hoverManager = TrackHoverManager.shared
+    hoverManager.cleanup()
+
+    #expect(hoverManager.isScrollSuppressed == false)
+
+    hoverManager.setScrollPhaseActive(true)
+    #expect(hoverManager.isScrollSuppressed == true)
+
+    hoverManager.setScrollPhaseActive(false)
+    try? await Task.sleep(nanoseconds: 50_000_000)
+    #expect(hoverManager.isScrollSuppressed == false)
+
+    hoverManager.cleanup()
+}
+
 
 
 

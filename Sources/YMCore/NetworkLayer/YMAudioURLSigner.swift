@@ -6,26 +6,52 @@ public enum YMAudioURLSigner {
     /// Secret salt constant used by official Yandex Music clients
     public static let secretSalt = "XGRlBW9FXlekgbPrRHuSiA"
 
-    /// Secret key constant for HMAC-SHA256 signing of /get-file-info (Lossless / 320 kbps)
+    /// Android client key (используется для /tracks/{id}/lyrics и legacy Android /get-file-info).
     public static let fileInfoSecretKey = "p93jhgh689SBReK6ghtw62"
+    public static let lyricsSecretKey = "p93jhgh689SBReK6ghtw62"
+
+    /// Desktop client key + header (основной протокол для /get-file-info с raw lossless/HQ потоками).
+    public static let desktopFileInfoSecretKey = "kzqU4XhfCaY6B6JTHODeq5"
+    public static let desktopClientHeader = "YandexMusicDesktopAppWindows/5.95.0"
 
     /// Computes HMAC-SHA256 signature for GET /get-file-info
-    /// Formula: HMAC<SHA256>(secretKey, "\(ts)\(trackId)\(quality)\(codecsWithoutCommas)\(transportsWithoutCommas)")
+    /// Formula: HMAC<SHA256>(secretKey, "\(ts)\(cleanTrackId)\(quality)\(codecsWithoutCommas)\(transportsWithoutCommas)")
     /// Signature: Base64 representation without trailing '=' (first 43 characters).
     public static func computeFileInfoSign(
         ts: String,
         trackId: String,
         quality: String,
         codecs: String = "flac,flac-mp4,mp3,aac,he-aac,aac-mp4",
-        transports: String = "raw"
+        transports: String = "raw",
+        secretKey: String = YMAudioURLSigner.desktopFileInfoSecretKey
     ) -> String {
+        let cleanTrackId = trackId.components(separatedBy: ":").first ?? trackId
         let codecsWithoutCommas = codecs.replacingOccurrences(of: ",", with: "")
         let transportsWithoutCommas = transports.replacingOccurrences(of: ",", with: "")
-        let stringToSign = "\(ts)\(trackId)\(quality)\(codecsWithoutCommas)\(transportsWithoutCommas)"
-        let key = SymmetricKey(data: Data(fileInfoSecretKey.utf8))
+        let stringToSign = "\(ts)\(cleanTrackId)\(quality)\(codecsWithoutCommas)\(transportsWithoutCommas)"
+        let key = SymmetricKey(data: Data(secretKey.utf8))
         let signature = HMAC<SHA256>.authenticationCode(for: Data(stringToSign.utf8), using: key)
         let base64 = Data(signature).base64EncodedString()
         return String(base64.prefix(43))
+    }
+
+    /// Convenience overload for GET /get-file-info with default parameters
+    public static func computeFileInfoSign(
+        trackId: String,
+        quality: String = "lossless",
+        codecs: String = "flac",
+        transports: String = "direct",
+        ts: Int = Int(Date().timeIntervalSince1970),
+        secretKey: String = YMAudioURLSigner.desktopFileInfoSecretKey
+    ) -> String {
+        computeFileInfoSign(
+            ts: String(ts),
+            trackId: trackId,
+            quality: quality,
+            codecs: codecs,
+            transports: transports,
+            secretKey: secretKey
+        )
     }
 
     /// Computes HMAC-SHA256 signature for GET /tracks/{trackId}/lyrics?format=LRC
@@ -34,7 +60,7 @@ public enum YMAudioURLSigner {
     public static func computeLyricsSign(trackId: String, timestamp: Int) -> String {
         let numericTrackId = trackId.components(separatedBy: ":").first ?? trackId
         let message = "\(numericTrackId)\(timestamp)"
-        let key = SymmetricKey(data: Data(fileInfoSecretKey.utf8))
+        let key = SymmetricKey(data: Data(lyricsSecretKey.utf8))
         let signature = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
         return Data(signature).base64EncodedString()
     }
