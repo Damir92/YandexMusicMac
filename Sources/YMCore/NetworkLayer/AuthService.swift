@@ -21,10 +21,14 @@ public final class AuthService {
     @ObservationIgnored private var signOutTask: Task<Void, Never>?
 
     /// Official Yandex Music OAuth Client ID
-    public static let oauthClientID = "23cabbbdc6cd418abb4b39c32c41195d"
+    public static let oauthClientID = "97fe03033fa34407ac9bcf91d5afed5b"
+
+    /// Rights requested for the token. Without `scope` Yandex OAuth grants every right
+    /// registered for the client (Passport profile, Disk, etc.); the app only uses the Music API.
+    public static let oauthScopes = ["music:content", "music:read", "music:write"]
 
     /// Strict canonical OAuth authorization URL specified for Yandex Music
-    public static let oauthURLString = "https://oauth.yandex.ru/authorize?response_type=token&client_id=\(oauthClientID)"
+    public static let oauthURLString = "https://oauth.yandex.ru/authorize?response_type=token&client_id=\(oauthClientID)&scope=\(oauthScopes.joined(separator: "%20"))"
 
     public init(keychain: KeychainManager = .shared, networkClient: YMNetworkClient = .shared) {
         self.keychain = keychain

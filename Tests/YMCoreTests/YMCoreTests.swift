@@ -379,8 +379,8 @@ func testAuthServiceSignOut() {
 @Test("AuthService official client ID and canonical OAuth URL")
 @MainActor
 func testAuthServiceOfficialOAuthURL() {
-    #expect(AuthService.oauthClientID == "23cabbbdc6cd418abb4b39c32c41195d")
-    #expect(AuthService.oauthURLString == "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d")
+    #expect(AuthService.oauthClientID == "97fe03033fa34407ac9bcf91d5afed5b")
+    #expect(AuthService.oauthURLString == "https://oauth.yandex.ru/authorize?response_type=token&client_id=97fe03033fa34407ac9bcf91d5afed5b&scope=music:content%20music:read%20music:write")
 }
 
 @Test("AuthService token extraction from raw tokens and redirect URLs")
